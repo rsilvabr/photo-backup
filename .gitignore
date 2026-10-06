@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Logs written by the tool (LOG_DIR default)
+Logs/
+*.log
+
+# AI workflow documents (plan / report / review) — local only
+AI_tools/
+
+# Leftover temp copies (TEMP_SUFFIX) — only ever inside a destination, never here
+*.pbtmp
+
+# IDEs and tools
+.claude/
+.vscode/
+.idea/
+
+# System files
+.DS_Store
+Thumbs.db
