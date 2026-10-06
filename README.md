@@ -9,8 +9,9 @@ A selective backup for photographers' archives. It backs up **the photos you exp
 - [Why a selective backup?](#why-a-selective-backup)
 - [Features](#features)
 - [Requirements & Installation](#requirements--installation)
-- [Quick start](#quick-start)
-- [Interactive menu](#interactive-menu) · [Unattended runs](#unattended-runs-task-scheduler)
+- [Scripts](#scripts)
+- [Quick start — interactive menu](#quick-start--interactive-menu) · [Unattended runs](#unattended-runs-task-scheduler)
+- [Quick start — command line](#quick-start--command-line)
 - [Safety guarantees](#safety-guarantees)
 - [How a photo is selected](#how-a-photo-is-selected)
 - [Export formats](#export-formats)
@@ -64,8 +65,19 @@ A SQLite catalog on the destination records the SHA-256 of every file at copy ti
 ### 7. **Re-runs are incremental**
 Unchanged files are skipped by size and date; files copied by another tool (FreeFileSync, Explorer) are adopted into the catalog and hashed by the next `--verify full`.
 
-### 8. **A menu, if you prefer** *(v0.3.0)*
-`python photo_backup_menu.py`: answer a few questions (Enter keeps your last choice), read the dry-run, confirm the copy. Save presets and run them from the Task Scheduler. [Details](#interactive-menu).
+### 8. **An interactive menu** *(v0.3.0)*
+`python photo_backup.py`: answer a few questions (Enter keeps your last choice), read the dry-run, confirm the copy. Save presets and run them from the Task Scheduler. [Details](#quick-start--interactive-menu).
+
+---
+
+## Scripts
+
+| Script | What it does |
+|---|---|
+| `photo_backup.py` | **Start here.** Interactive menu: back up (dry-run first, then copy), verify, presets, unattended runs. Runs the scripts below for you. |
+| `selective_backup.py` | The selective backup itself, from the command line: plan, copy, catalog, verify. Everything the menu does goes through it. |
+
+The menu never copies anything itself — it runs `selective_backup.py` with the options you confirmed, so every [safety guarantee](#safety-guarantees) holds either way.
 
 ---
 
@@ -77,36 +89,17 @@ Unchanged files are skipped by size and date; files copied by another tool (Free
 ```console
 git clone https://github.com/rsilvabr/photo-backup.git
 cd photo-backup
-python photo_backup.py --help
+python photo_backup.py
 ```
 
-Optional, to run the tests: `python -m pip install pytest`, then `python -m pytest tests`.
+Optional: [rich](https://github.com/Textualize/rich) (`python -m pip install rich`) gives the menu colours. To run the tests: `python -m pip install pytest`, then `python -m pytest tests`.
 
 ---
 
-## Quick start
+## Quick start — interactive menu
 
 ```console
-:: 1. See what a backup would do (writes only logs, no destination)
-python photo_backup.py --source "G:\2025" --dest "H:\BACKUP" --dry-run
-
-:: 2. Back up for real (shows the summary and asks for confirmation)
-python photo_backup.py --source "G:\2025" --dest "H:\BACKUP"
-
-:: 3. Verify the backup another day
-python photo_backup.py --source "G:\2025" --dest "H:\BACKUP" --verify full
-```
-
-> **Tip:** always start with `--dry-run`. The summary lists what would be copied, what would not (and why), and whether it fits. The full lists are in the CSVs next to the log.
-
----
-
-## Interactive menu
-
-Prefer answering questions to typing command lines? Run the menu:
-
-```console
-python photo_backup_menu.py
+python photo_backup.py
 ```
 
 ```
@@ -122,26 +115,43 @@ python photo_backup_menu.py
 - Your choices are remembered: the next time, it shows them and asks **"Use these settings?"** — Enter, and the dry-run starts.
 - **[2] Verify** runs `--verify quick` or `--verify full` on a backup.
 - **[3] Presets**: after a backup the menu offers to save its settings under a name. A preset runs from the menu (dry-run first) or unattended.
-- **[4] Settings** shows where the remembered choices live (`~/.photo_backup_config.json`, or `$PHOTOBACKUP_CONFIG`) and the defaults of `photo_backup.py`. The menu reads those defaults from `photo_backup.py` itself: edit the top of that file and the menu follows.
+- **[4] Settings** shows where the remembered choices live (`~/.photo_backup_config.json`, or `$PHOTOBACKUP_CONFIG`) and the defaults of `selective_backup.py`. The menu reads those defaults from `selective_backup.py` itself: edit the top of that file and the menu follows.
 
-The value in `[brackets]` is the default — press Enter to accept it. The menu never copies anything itself: it runs `photo_backup.py` with the options you confirmed, so every safety rule above applies unchanged. If [rich](https://github.com/Textualize/rich) is installed, it uses colours; it is not required.
+> **Tip:** The value shown in `[brackets]` is the default — just press Enter to accept it.
 
 ### Unattended runs (Task Scheduler)
 
 ```console
-python photo_backup_menu.py --list-presets
-python photo_backup_menu.py --run-preset "NIGHTLY"
+python photo_backup.py --list-presets
+python photo_backup.py --run-preset "NIGHTLY"
 ```
 
-`--run-preset` runs a saved preset without questions and without the dry-run step; `photo_backup.py` still refuses to start when the destination drive is missing or too full (exit 2). For the Task Scheduler, run it through `cmd /k` so the window stays open with the result:
+`--run-preset` runs a saved preset without questions and without the dry-run step; `selective_backup.py` still refuses to start when the destination drive is missing or too full (exit 2). For the Task Scheduler, run it through `cmd /k` so the window stays open with the result:
 
 ```
 Program:   cmd
-Arguments: /k python photo_backup_menu.py --run-preset "NIGHTLY"
+Arguments: /k python photo_backup.py --run-preset "NIGHTLY"
 Start in:  C:\path\to\photo-backup
 ```
 
 The exit code is the backend's (see [Exit codes](#exit-codes)).
+
+---
+
+## Quick start — command line
+
+```console
+:: 1. See what a backup would do (writes only logs, no destination)
+python selective_backup.py --source "G:\2025" --dest "H:\BACKUP" --dry-run
+
+:: 2. Back up for real (shows the summary and asks for confirmation)
+python selective_backup.py --source "G:\2025" --dest "H:\BACKUP"
+
+:: 3. Verify the backup another day
+python selective_backup.py --source "G:\2025" --dest "H:\BACKUP" --verify full
+```
+
+> **Tip:** always start with `--dry-run`. The summary lists what would be copied, what would not (and why), and whether it fits. The full lists are in the CSVs next to the log. Every option is in [Every option](#every-option).
 
 ---
 
@@ -318,7 +328,7 @@ errors; the real check of the media is a `--verify full` on another day.
 ## Every option
 
 ```text
-photo_backup.py --source PATH [--source PATH ...] --dest PATH [options]
+selective_backup.py --source PATH [--source PATH ...] --dest PATH [options]
 ```
 
 | Option | Description |
@@ -348,7 +358,7 @@ photo_backup.py --source PATH [--source PATH ...] --dest PATH [options]
 
 ## Settings
 
-Every user-editable setting lives at the top of `photo_backup.py` and is read
+Every user-editable setting lives at the top of `selective_backup.py` and is read
 by the code and by the argparse defaults; editing the constant changes the
 default everywhere.
 
@@ -413,7 +423,7 @@ Japanese file names.
 
 **v0.3.0** (2026-10-07) — first release.
 
-- An interactive menu (`photo_backup_menu.py`): dry-run first, then copy; remembered choices; presets, also unattended for the Task Scheduler.
+- An interactive menu, `photo_backup.py` (the backup engine is `selective_backup.py`): dry-run first, then copy; remembered choices; presets, also unattended for the Task Scheduler.
 - Selective backup by export: exports in the formats you choose, plus the originals, sidecars, Capture One and NX Studio edits of the exported photos.
 - Read-only source, nothing deleted on the destination, space checked before the first byte, `--dry-run` summary with every "not copied" reason.
 - SQLite catalog with SHA-256; `--verify quick|full` on any later day.
@@ -424,7 +434,8 @@ Japanese file names.
 ## Changelog
 
 ### v0.3.0 (2026-10-07)
-- New `photo_backup_menu.py`: interactive menu over `photo_backup.py` — every backup is a dry-run first and copies only after a yes; choices remembered in `~/.photo_backup_config.json`; connected drives listed with their free space; presets, runnable unattended with `--run-preset` (`--list-presets` lists them). Defaults are read from `photo_backup.py`.
+- **Scripts renamed:** `photo_backup.py` is now the interactive menu (the project's entry point); the backup engine of v0.2.0 is `selective_backup.py`, with the same options.
+- New `photo_backup.py`: interactive menu over `selective_backup.py` — every backup is a dry-run first and copies only after a yes; choices remembered in `~/.photo_backup_config.json`; connected drives listed with their free space; presets, runnable unattended with `--run-preset` (`--list-presets` lists them). Defaults are read from `selective_backup.py`.
 
 ### v0.2.0 (2026-10-07)
 - A folder that holds an export folder but no original beside it (a year folder holding a `Lightroom_Export`, or a drive root) no longer hides its subfolders: they keep their own classification and folders without an export below it are listed again.

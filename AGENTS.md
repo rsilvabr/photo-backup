@@ -8,14 +8,19 @@ NX Studio TIFF, sidecars), the Capture One settings and the NX Studio
 verify that the backup still matches.
 
 ## Scripts
-- `photo_backup.py` — the backend: planner, copy, catalog, verify. Every
+Same layout as the sibling `jxl-photo`: `photo_backup.py` is the entry point
+(the menu), each job is a standalone backend script that also works on its own
+from the command line. A future job (e.g. a full mirror) is a new
+`<job>_backup.py` run by the menu — never folded into `selective_backup.py`.
+
+- `selective_backup.py` — the backend: planner, copy, catalog, verify. Every
   safety rule below lives here.
-- `photo_backup_menu.py` — interactive menu + presets (`--run-preset`). It
-  never copies by itself: it builds an argv and runs `photo_backup.py` as a
+- `photo_backup.py` — interactive menu + presets (`--run-preset`). It
+  never copies by itself: it builds an argv and runs `selective_backup.py` as a
   child process (`run_backend`). It reads the backend's defaults by importing
   it (`_setting`) and always passes every selection option explicitly — a
   default repeated as a literal in the menu would silently override the
-  owner's edit of `photo_backup.py` (the bug class of jxl-photo round 43).
+  owner's edit of `selective_backup.py` (the bug class of jxl-photo round 43).
   Its own settings (`CONFIG_PATH`, `VERIFY_MODE`, `FORMAT_ALTERNATIVES`) are
   at its top; tests set `CONFIG_PATH` to a temp file.
 
@@ -35,7 +40,7 @@ verify that the backup still matches.
   `os.replace`d — a crash never leaves a half file under the final name.
 
 ## Settings are never hardcoded
-Every user-editable setting lives at the TOP of `photo_backup.py`
+Every user-editable setting lives at the TOP of `selective_backup.py`
 (`EXPORT_NAME_CONTAINS`, `EXPORT_FORMATS`, `CAPTUREONE_FOLDER_NAMES`,
 `SPACE_MARGIN_GB`, ...). Code and argparse defaults READ those constants —
 never repeat a default as a literal (`"export"`, `"Cache"`, `"jxl>tif>jpg"`).
@@ -61,7 +66,7 @@ files):
   260, so all file I/O uses Windows extended paths.
 
 ## Verification
-- After editing: `python -m py_compile photo_backup.py`.
+- After editing: `python -m py_compile photo_backup.py selective_backup.py`.
 - Tests: `python -m pytest tests/` (pytest lives in the `python` 3.12
   interpreter; `py` is 3.13 without pytest). Tests build synthetic trees in
   `tmp_path` and set `PHOTOBACKUP_LOG_DIR`, so no test writes to `Logs\`.
@@ -70,7 +75,7 @@ files):
   to `E:\temp_jxl\photo_backup_test` (scratch). The plan lists the exact
   commands and expected results — paste their output into the report.
 - When fixing a bug, prove the new test **fails against the pre-fix code**:
-  `git show HEAD:photo_backup.py > <tmpdir>/photo_backup.py` and run the test
+  `git show HEAD:selective_backup.py > <tmpdir>/selective_backup.py` and run the test
   there. Do **not** use `git stash`.
 - Changing a function's signature or return shape: grep every caller and
   every test double first; new parameters go last, with a default.

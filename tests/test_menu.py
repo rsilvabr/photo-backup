@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-import photo_backup
-import photo_backup_menu as menu
+import selective_backup
+import photo_backup as menu
 
 from conftest import build_base_tree, dest_files
 
@@ -116,7 +116,7 @@ def test_choices_are_remembered(tmp_path, monkeypatch, menu_config):
 
 
 def test_defaults_come_from_the_backend(tmp_path, monkeypatch):
-    """The menu must read photo_backup.py's settings, never repeat them."""
+    """The menu must read selective_backup.py's settings, never repeat them."""
     monkeypatch.setattr(menu._backend(), "EXPORT_FORMATS", "jxl+png")
     monkeypatch.setattr(menu._backend(), "UNEXPORTED", "copy")
     source = tmp_path / "G"
@@ -170,5 +170,5 @@ def test_real_backup_through_the_menu(tmp_path, monkeypatch):
 
 def test_menu_flags_are_documented():
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
-    for flag in ("--run-preset", "--list-presets", "photo_backup_menu.py"):
+    for flag in ("--run-preset", "--list-presets", "photo_backup.py"):
         assert flag in readme

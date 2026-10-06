@@ -7,14 +7,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import photo_backup  # noqa: E402
+import selective_backup  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def photobackup_log_dir(tmp_path, monkeypatch):
     log_dir = tmp_path / "logs"
     monkeypatch.setenv("PHOTOBACKUP_LOG_DIR", str(log_dir))
-    monkeypatch.setattr(photo_backup, "LOG_DIR", str(log_dir))
+    monkeypatch.setattr(selective_backup, "LOG_DIR", str(log_dir))
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
 
@@ -54,7 +54,7 @@ def argv_for(source, dest, base, *extra):
 
 
 def parse_args(source, dest, base, *extra):
-    return photo_backup._build_parser().parse_args(argv_for(source, dest, base, *extra))
+    return selective_backup._build_parser().parse_args(argv_for(source, dest, base, *extra))
 
 
 def planned_rels(planned):
