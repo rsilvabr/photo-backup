@@ -7,6 +7,18 @@ NX Studio TIFF, sidecars), the Capture One settings and the NX Studio
 `NKSC_PARAM`, mirroring the folder tree on the destination. A later run can
 verify that the backup still matches.
 
+## Scripts
+- `photo_backup.py` — the backend: planner, copy, catalog, verify. Every
+  safety rule below lives here.
+- `photo_backup_menu.py` — interactive menu + presets (`--run-preset`). It
+  never copies by itself: it builds an argv and runs `photo_backup.py` as a
+  child process (`run_backend`). It reads the backend's defaults by importing
+  it (`_setting`) and always passes every selection option explicitly — a
+  default repeated as a literal in the menu would silently override the
+  owner's edit of `photo_backup.py` (the bug class of jxl-photo round 43).
+  Its own settings (`CONFIG_PATH`, `VERIFY_MODE`, `FORMAT_ALTERNATIVES`) are
+  at its top; tests set `CONFIG_PATH` to a temp file.
+
 ## Safety rules (these are the product)
 - **The source is READ-ONLY.** No code path may open a source file for
   writing, rename, delete, touch or set attributes on anything under a
