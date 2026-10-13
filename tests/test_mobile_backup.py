@@ -64,7 +64,7 @@ def test_album_is_the_dated_event_folder(tmp_path):
     assert mb.album_folder(str(undated), str(root)) == str(root / "Misc")
 
 
-def test_first_run_numbers_in_shot_order_across_cameras(archive, tmp_path, monkeypatch):
+def test_first_run_numbers_camera_by_camera(archive, tmp_path, monkeypatch):
     monkeypatch.setattr(mb, "read_shot_times", fake_shots(SHOTS))
     dest = tmp_path / "H" / "MOBILE"
     before = snapshot(archive)
@@ -72,12 +72,12 @@ def test_first_run_numbers_in_shot_order_across_cameras(archive, tmp_path, monke
     rel = str(archive.relative_to(Path(archive.anchor))).replace("\\", "/")
     album = f"{rel}/260620-23_Kyoto"
     assert listing(dest) == [
-        f"{album}/0000__DSC_0001_sRGB_v1.jxl",
-        f"{album}/0001_DSC_0100_sRGB_v1.jxl",
+        f"{album}/0000_DSC_0100_sRGB_v1.jxl",       # camera 1 first, although shot later
+        f"{album}/0001__DSC_0001_sRGB_v1.jxl",
         f"{album}/0002__DSC_0002_sRGB_v1.jxl",
     ]
     assert snapshot(archive) == before          # the source is read-only
-    assert (dest / f"{album}/0001_DSC_0100_sRGB_v1.jxl").stat().st_size == 300
+    assert (dest / f"{album}/0000_DSC_0100_sRGB_v1.jxl").stat().st_size == 300
 
 
 def _album(dest):
@@ -107,10 +107,10 @@ def test_new_photo_in_the_middle_renumbers_by_rename(archive, tmp_path, monkeypa
     assert run(archive, dest) == 0
     make_tree(archive, {"260620-23_Kyoto/2_Z8/_EXPORT/JXL_mobile/_DSC_0003_sRGB_v1.jxl": 400})
     assert run(archive, dest) == 0
-    assert _album(dest) == {"0000__DSC_0001_sRGB_v1.jxl", "0001__DSC_0003_sRGB_v1.jxl",
-                            "0002_DSC_0100_sRGB_v1.jxl", "0003__DSC_0002_sRGB_v1.jxl"}
+    assert _album(dest) == {"0000_DSC_0100_sRGB_v1.jxl", "0001__DSC_0001_sRGB_v1.jxl",
+                            "0002__DSC_0003_sRGB_v1.jxl", "0003__DSC_0002_sRGB_v1.jxl"}
     by_name = {p.name: p.stat().st_size for p in dest.rglob("*.jxl")}
-    assert by_name["0002_DSC_0100_sRGB_v1.jxl"] == 300     # the renamed file is the right photo
+    assert by_name["0003__DSC_0002_sRGB_v1.jxl"] == 200     # the renamed file is the right photo
     assert not [p for p in dest.rglob("*") if p.name.endswith((mb.TEMP_SUFFIX, mb.RENAME_SUFFIX))]
 
 
@@ -141,20 +141,20 @@ def test_changed_source_is_copied_again(archive, tmp_path, monkeypatch):
     src = archive / "260620-23_Kyoto/1_Z8/_EXPORT/JXL_mobile/DSC_0100_sRGB_v1.jxl"
     src.write_bytes(b"x" * 333)
     assert run(archive, dest) == 0
-    assert {p.name: p.stat().st_size for p in dest.rglob("*.jxl")}["0001_DSC_0100_sRGB_v1.jxl"] == 333
+    assert {p.name: p.stat().st_size for p in dest.rglob("*.jxl")}["0000_DSC_0100_sRGB_v1.jxl"] == 333
 
 
 def test_foreign_file_in_the_way_skips_the_album(archive, tmp_path, monkeypatch):
     monkeypatch.setattr(mb, "read_shot_times", fake_shots(SHOTS))
     dest = tmp_path / "H"
     rel = archive.relative_to(Path(archive.anchor))
-    blocker = dest / rel / "260620-23_Kyoto" / "0001_DSC_0100_sRGB_v1.jxl"
+    blocker = dest / rel / "260620-23_Kyoto" / "0001__DSC_0001_sRGB_v1.jxl"
     other = dest / rel / "260620-23_Kyoto" / "my_note.txt"
     make_tree(blocker.parent, {blocker.name: "mine", other.name: "keep me"})
     assert run(archive, dest) == 1
     assert blocker.read_text() == "mine"
     assert other.read_text() == "keep me"
-    assert sorted(p.name for p in blocker.parent.iterdir()) == ["0001_DSC_0100_sRGB_v1.jxl", "my_note.txt"]
+    assert sorted(p.name for p in blocker.parent.iterdir()) == ["0001__DSC_0001_sRGB_v1.jxl", "my_note.txt"]
 
 
 def test_files_we_did_not_write_are_never_deleted(archive, tmp_path, monkeypatch):
@@ -176,6 +176,26 @@ def test_photos_without_a_date_come_last(archive, tmp_path, monkeypatch):
     assert run(archive, dest) == 0
     assert _album(dest) == {"0000_DSC_0100_sRGB_v1.jxl", "0001__DSC_0002_sRGB_v1.jxl",
                             "0002__DSC_0001_sRGB_v1.jxl"}
+
+
+def test_cameras_are_never_interleaved_by_their_clocks(tmp_path, monkeypatch):
+    src = tmp_path / "G" / "2025"
+    make_tree(src, {
+        "251219_Trip/10_W70/_EXPORT/JXL_mobile/W1.jpg": 10,     # clock reset to 2006
+        "251219_Trip/2_D200/_EXPORT/JXL_mobile/D1.jpg": 10,
+        "251219_Trip/2_D200/_EXPORT/JXL_mobile/D2.jpg": 10,
+        "251219_Trip/1_D810/_EXPORT/JXL_mobile/N1.jpg": 10,     # home time zone: hours later
+        "251219_Trip/1_D810/_EXPORT/JXL_mobile/N2.jpg": 10,
+    })
+    monkeypatch.setattr(mb, "read_shot_times", fake_shots({
+        "W1.jpg": "2006:01:01 00:00:00.000000",
+        "D1.jpg": "2025:12:19 08:00:00.000000", "D2.jpg": "2025:12:19 09:00:00.000000",
+        "N1.jpg": "2025:12:19 21:00:00.000000", "N2.jpg": "2025:12:19 20:00:00.000000",
+    }))
+    dest = tmp_path / "H"
+    assert run(src, dest) == 0
+    assert sorted(_album(dest)) == ["0000_N2.jpg", "0001_N1.jpg", "0002_D1.jpg",
+                                    "0003_D2.jpg", "0004_W1.jpg"]
 
 
 def test_dry_run_changes_nothing(archive, tmp_path, monkeypatch):

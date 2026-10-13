@@ -10,9 +10,11 @@ and putting the photos directly in it:
     G:\\2026\\260620_Kyoto\\2_Z8\\_EXPORT\\JXL_mobile\\_DSC_0001_sRGB_v1.jxl
       -> H:\\MOBILE\\2026\\260620_Kyoto\\0000__DSC_0001_sRGB_v1.jxl
 
-Every photo gets a number in shot order (DateTimeOriginal + SubSecTimeOriginal,
-read with exiftool), so the album sorts by name the way it was shot, across
-cameras. Photos without a date come last, by name.
+Every photo gets a number, camera by camera: the mobile folders in the
+natural order of their paths (1_Z8, 2_Z8, ...), and inside each one in shot
+order (DateTimeOriginal + SubSecTimeOriginal, read with exiftool); photos
+without a date close their camera, by name. Cameras are never interleaved by
+their clocks, which disagree.
 
 The destination is a MIRROR of the sources, kept in sync: a new photo is
 copied, a changed one is re-copied, a renumbered one is renamed, a photo gone
@@ -32,7 +34,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # ---- Sources and destination ---------------------------------------------------
 SOURCES = ""                        # ';'-separated default for --source (e.g. r"G:\2024;G:\2025;G:\2026")
@@ -237,9 +239,23 @@ def save_state(dest, files):
 
 # ---- Plan -------------------------------------------------------------------------------------
 
+def _natural(text):
+    """'2_Z8' < '10_Z8': digit runs compare as numbers."""
+    return [(0, int(part), "") if part.isdigit() else (1, 0, part)
+            for part in re.split(r"(\d+)", text.lower()) if part]
+
+
 def numbered_names(entries):
-    """entries: [(source, shot)] of one album -> {source: numbered file name}."""
-    ordered = sorted(entries, key=lambda e: (e[1] is None, e[1] or "",
+    """entries: [(source, shot)] of one album -> {source: numbered file name}.
+
+    Camera by camera: the mobile folders in the natural order of their paths
+    (1_Z8 before 2_Z8, the folder numbers the owner gives his cameras), and
+    inside each one by shot time. Cameras are never interleaved by their
+    clocks — even two bodies of the same model drift minutes apart, and old
+    ones carry 1970/2006 dates or the home time zone.
+    """
+    ordered = sorted(entries, key=lambda e: (_natural(os.path.dirname(e[0])),
+                                             e[1] is None, e[1] or "",
                                              os.path.basename(e[0]).lower(), e[0].lower()))
     width = max(NUMBER_DIGITS, len(str(len(ordered) - 1)))
     return {source: f"{index:0{width}d}{NUMBER_SEPARATOR}{os.path.basename(source)}"

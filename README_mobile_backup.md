@@ -3,17 +3,17 @@
 A phone gallery shows every folder as an album, with only the folder's name.
 An archive laid out as `<event>\<camera>\_EXPORT\JXL_mobile\` therefore turns
 into dozens of albums all called `JXL_mobile`. `mobile_backup.py` mirrors those
-folders to another disk with **one album per event**, the photos numbered in
-the order they were shot:
+folders to another disk with **one album per event**, the photos numbered
+camera by camera, each camera in the order it shot:
 
 ```text
 G:\2026\260620-23_Kyoto\1_Z8\_EXPORT\JXL_mobile\DSC_0100_sRGB_v1.jxl
 G:\2026\260620-23_Kyoto\2_Z8\_EXPORT\JXL_mobile\_DSC_0001_sRGB_v1.jxl
 G:\2026\260620-23_Kyoto\2_Z8\_EXPORT\JXL_mobile\_DSC_0002_sRGB_v1.jxl
 
-H:\MOBILE\2026\260620-23_Kyoto\0000__DSC_0001_sRGB_v1.jxl   12:26:19
-H:\MOBILE\2026\260620-23_Kyoto\0001_DSC_0100_sRGB_v1.jxl    12:28:00
-H:\MOBILE\2026\260620-23_Kyoto\0002__DSC_0002_sRGB_v1.jxl   12:30:00
+H:\MOBILE\2026\260620-23_Kyoto\0000_DSC_0100_sRGB_v1.jxl     1_Z8
+H:\MOBILE\2026\260620-23_Kyoto\0001__DSC_0001_sRGB_v1.jxl    2_Z8
+H:\MOBILE\2026\260620-23_Kyoto\0002__DSC_0002_sRGB_v1.jxl    2_Z8
 ```
 
 Then sync the mirror to the phone with FreeFileSync (or anything else).
@@ -46,10 +46,14 @@ not enough space), `130` interrupted.
   (`251219-31_TRIP\251231_Teresina\01_D810`) the album is the inner one. A
   folder without a date falls back to the folder above the export folder. The
   mirror keeps the album's full path below the drive (`2026\<event>`).
-- **Number**: shot order inside the album, across cameras, from
-  `DateTimeOriginal` + `SubSecTimeOriginal`; same time → by file name; no date →
-  last, by name. Four digits (`NUMBER_DIGITS`), more for an album of 10 000+.
-  Cameras whose clocks disagree sort by their own clocks.
+- **Number**: camera by camera — the mobile folders in the natural order of
+  their paths (`1_Z8` before `2_Z8` before `10_…`), so the folder numbers you
+  give your cameras set the order. Inside each camera: `DateTimeOriginal` +
+  `SubSecTimeOriginal`; same time → by file name; no date → last of that
+  camera, by name. Four digits (`NUMBER_DIGITS`), more for an album of 10 000+.
+- **Why not interleave the cameras by time?** Their clocks disagree: even two
+  bodies of the same model drift minutes apart, old cameras carry 1970/2006
+  dates, and a body still on the home time zone is hours off on a trip.
 
 ## Sync rules
 
