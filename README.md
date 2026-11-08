@@ -651,33 +651,14 @@ Compared file by file with v0.4.0 on a 1.6 TB archive: only the derivatives leav
 
 ## Changelog
 
-### v0.5.0 (2026-11-08)
-- **jxl-photo derivatives are skipped** when the master of the same photo is copied in the same run: a JXL is left out only when its XMP says `jxlphoto-derived:` and a selected JXL of that photo says `jxlphoto-src:`; anything unreadable or uncertain is copied. New `--derivatives` / `COPY_JXLPHOTO_DERIVATIVES` to copy them; the summary counts them.
-- **The duplicate counter is part of the photo key**: an export `DSC_0001 (2)_x` belongs to the original `DSC_0001 (2)` when there is one, not to `DSC_0001` — before, its format choice was made together with the other photo, and a JPEG of `(2)` could be dropped because `DSC_0001` had a JXL. Which originals are copied does not shrink: a selected `X (2)` still brings `X` along (film rescans).
+| Version | Date | What it added |
+|---------|------|---------------|
+| **v0.5.0** | 2026-11-08 | Leaves out the sRGB/resized JXL copies jxl-photo made from a master that is backed up; `DSC_0001 (2)` treated as its own photo |
+| v0.4.0 | 2026-11-08 | Renamed folders moved instead of copied again; orphans listed; a backup ID per disk; verify in slices; `restore_backup.py` |
+| v0.3.0 | 2026-10-07 | The interactive menu (dry-run first, then the copy after a yes) and unattended presets |
+| v0.2.0 | 2026-10-07 | First release: exported photos with their originals and edits, SHA-256 catalog, verify, space check |
 
-### v0.4.0 (2026-11-08)
-- **Moved and renamed folders** are moved inside the backup after the content is confirmed by SHA-256, instead of being copied again; the folders the move leaves empty are removed (`--no-detect-moves` turns it off). Backup files whose source is gone are reported in `<log>_orphans.csv`; `--move-orphans` moves the `source_missing` ones to `_photo_backup\orphans\<stamp>`.
-- **Backup identity**: `_photo_backup\volume.json` with a random ID; `--expect-backup-id` refuses the wrong disk; presets find the backup on another drive letter by ID.
-- **Rolling verify**: `--verify full --max-gb N` checks at most N GB per run, oldest verification first; `source_missing` files whose copy is verified still advance the wheel.
-- **Restore**: new `restore_backup.py` and menu item `[5] Restore` — restore under a folder or to the original places, never overwriting a target and never writing to the backup.
-- The summary now shows a per-folder table of what will be copied (with cumulative sizes) and the orphan/move lines; `<log>_by_folder.csv` has the full table.
-- The menu asks for the max GB when the verify mode is `full` and saves the backup ID with each preset.
-- The restore never overwrites a target even when it appears while the file is being restored (the final rename refuses an existing target; reported as `CONFLICT`).
-
-### v0.3.0 (2026-10-07)
-- **Scripts renamed:** `photo_backup.py` is now the interactive menu (the project's entry point); the backup engine of v0.2.0 is `selective_backup.py`, with the same options.
-- New `photo_backup.py`: interactive menu over `selective_backup.py` — every backup is a dry-run first and copies only after a yes; choices remembered in `~/.photo_backup_config.json`; connected drives listed with their free space; presets, runnable unattended with `--run-preset` (`--list-presets` lists them). Defaults are read from `selective_backup.py`.
-
-### v0.2.0 (2026-10-07)
-- A folder that holds an export folder but no original beside it (a year folder holding a `Lightroom_Export`, or a drive root) no longer hides its subfolders: they keep their own classification and folders without an export below it are listed again.
-- `--verify full` hashes the backup copy before looking at the source: a corrupted copy of a deleted original is reported as `DEST_CORRUPT`.
-- The catalog records the size and date the source had when it was copied; a file saved by your editor during the backup no longer reports a false `DEST_SIZE`. Stale rows are refreshed on the next run.
-- Unreadable folders and files are shown on the console (`Errors: N ... NOT backed up`) and fail the run, a dry-run too.
-- A destination drive that is not connected is a clean abort (exit 2).
-- Changed edit settings and sidecars are updated automatically (`AUTO_UPDATE_EXTENSIONS`, `--no-auto-update`).
-
-### v0.1.0 (2026-10-06)
-- First implementation (not released).
+What each version changed, in detail: [docs/version_history.md](docs/version_history.md).
 
 ---
 
