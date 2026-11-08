@@ -39,6 +39,13 @@ from the command line. A future job (e.g. a full mirror) is a new
   without Python: robocopy `/XC /XN /XO` only, no `call` and no `( )` block
   around a path (both break on `%`/`)` in the backup's path). Tests point
   `PHOTOBACKUP_C1_*` (conftest) away from the real Capture One folders.
+  `--force` is the ONE path that replaces a target file: the current file is
+  copied to `%LOCALAPPDATA%\CaptureOne_old\old_<time>` and journaled before an
+  atomic swap, with Capture One known to be closed (cannot tell = refuse).
+  Without a catalog hash, a file is not replaced. Factory profiles need
+  `--force-installed`; a monitor calibration (`mntr` + `vcgt`, or a file that
+  cannot be read as ICC) never. `--revert-last` picks only `old_*` not ending
+  in `_not`; its own snapshots are `revert_old_*`, same journal format.
 
 ## Safety rules (these are the product)
 - **The source is READ-ONLY.** No code path may open a source file for

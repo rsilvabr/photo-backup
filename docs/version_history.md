@@ -9,7 +9,8 @@ releases are also published as
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **[v0.6.0](#v060)** | 2026-11-08 | Keeps what Capture One needs to show your edits on another computer: profiles, styles, defaults and settings, with a double-click restore |
+| **[v0.7.0](#v070)** | 2026-11-08 | Capture One alone to a folder you choose; a force restore that keeps the old files, and undo |
+| [v0.6.0](#v060) | 2026-11-08 | Keeps what Capture One needs to show your edits on another computer: profiles, styles, defaults and settings, with a double-click restore |
 | [v0.5.0](#v050) | 2026-11-08 | Leaves out what jxl-photo can make again: an sRGB/resized JXL copy is not backed up when its master is. `DSC_0001 (2)` is treated as its own photo |
 | [v0.4.0](#v040) | 2026-11-08 | A renamed folder is moved inside the backup instead of copied again; orphans listed; each backup knows which disk it is; verify a big backup in slices; restore files from a backup |
 | [v0.3.0](#v030) | 2026-10-07 | An interactive menu: questions, a dry-run, then the copy after a yes; presets that run unattended |
@@ -17,6 +18,24 @@ releases are also published as
 | v0.1.0 | 2026-10-06 | First implementation, not released |
 
 `mobile_backup.py` has its own version: [see the end of this page](#mobile_backuppy).
+
+---
+
+## v0.7.0
+
+**Released 2026-11-08.** Nothing to do when upgrading.
+
+- **Capture One alone.** Menu `[6]` backs up just Capture One to a folder you
+  choose and restores from one.
+- **Force restore.** `--force` also replaces files that differ, after keeping
+  each current one in `%LOCALAPPDATA%\CaptureOne_old\old_<date>_<time>_<ms>`.
+  The swap is atomic and happens only after the old file is safe.
+- **Undo.** `--revert-last` puts back the newest `old_` folder and takes out
+  what the force added, keeping what it replaces in `revert_old_<...>`. A folder
+  renamed to end with `_not` is skipped.
+- **Limits.** Factory profiles need `--force-installed`, because an older copy
+  on a newer Capture One changes the colour of every photo from that camera. A
+  monitor calibration (a display profile with a `vcgt` tag) is never replaced.
 
 ---
 

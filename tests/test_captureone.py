@@ -1,7 +1,11 @@
 """captureone_backup.py. Every folder here is a synthetic tree in tmp_path, inside
 a hostile path (Japanese, brackets, spaces, %); the real Capture One is never read."""
+import json
 import os
+import re
+import struct
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -413,7 +417,407 @@ def test_restore_script_is_not_written_on_a_dry_run(machine):
     assert not (machine["backup"] / c1.RESTORE_SCRIPT).exists()
 
 
+# ---- Force restore and revert ----------------------------------------------------------
+STYLE = "Styles50/D200_standard.costyle"
+SNAPSHOT_NAME = re.compile(r"^(revert_)?old_\d{8}_\d{6}_\d{3}(_not)?$")
+
+
+def snapshots(machine):
+    parent = machine["appdata"] / c1.OLD_PARENT_FOLDER
+    return sorted(p.name for p in parent.iterdir()) if parent.exists() else []
+
+
+def force(machine, *extra):
+    return restore(machine, "--force", *extra)
+
+
+def revert(*extra):
+    return c1.main(["--revert-last", "--yes", *extra])
+
+
+def fake_icc(device_class, tags=()):
+    table = struct.pack(">I", len(tags)) + b"".join(t + b"\0" * 8 for t in tags)
+    return b"\0" * 12 + device_class + b"\0" * 20 + b"acsp" + b"\0" * 88 + table
+
+
+def test_force_replaces_and_keeps_the_old_file(machine):
+    assert backup(machine) == 0
+    style = machine["user"] / STYLE
+    wanted = style.read_bytes()
+    style.write_bytes(b"newer work")
+    assert force(machine) == 0
+    assert style.read_bytes() == wanted
+    names = snapshots(machine)
+    assert len(names) == 1 and SNAPSHOT_NAME.match(names[0])
+    kept = machine["appdata"] / c1.OLD_PARENT_FOLDER / names[0] / "UserData" / STYLE
+    assert kept.read_bytes() == b"newer work"
+
+
+def test_force_keeps_only_what_really_differs(machine):
+    assert backup(machine) == 0
+    (machine["user"] / STYLE).write_bytes(b"newer work")
+    assert force(machine) == 0
+    folder = machine["appdata"] / c1.OLD_PARENT_FOLDER / snapshots(machine)[0]
+    assert [r for r in rels(folder) if r != c1.JOURNAL_FILE] == [f"UserData/{STYLE}"]
+
+
+def test_force_with_nothing_to_do_leaves_no_snapshot(machine):
+    assert backup(machine) == 0
+    assert force(machine) == 0
+    assert snapshots(machine) == []
+
+
+def test_snapshot_is_outside_capture_one_and_not_backed_up(machine):
+    assert backup(machine) == 0
+    (machine["user"] / STYLE).write_bytes(b"newer work")
+    assert force(machine) == 0
+    assert backup(machine) == 0
+    assert not any(c1.OLD_PREFIX in rel for rel in rels(machine["backup"] / "UserData"))
+
+
+def test_force_dry_run_changes_nothing(machine):
+    assert backup(machine) == 0
+    style = machine["user"] / STYLE
+    style.write_bytes(b"newer work")
+    assert c1.main(["--restore-from", str(machine["dest"]), "--force", "--dry-run"]) == 0
+    assert style.read_bytes() == b"newer work"
+    assert snapshots(machine) == []
+
+
+def test_without_force_nothing_is_replaced(machine):
+    assert backup(machine) == 0
+    style = machine["user"] / STYLE
+    style.write_bytes(b"newer work")
+    assert restore(machine) == 1
+    assert style.read_bytes() == b"newer work"
+    assert snapshots(machine) == []
+
+
+def test_force_leaves_factory_profiles_alone(machine):
+    assert backup(machine) == 0
+    profile = machine["install"] / "Color Profiles" / "DSLR" / "NikonD200-Generic.icm"
+    profile.write_bytes(b"from a newer Capture One")
+    assert force(machine) == 0
+    assert profile.read_bytes() == b"from a newer Capture One"
+
+
+def test_force_installed_needs_admin(machine):
+    assert backup(machine) == 0
+    profile = machine["install"] / "Color Profiles" / "DSLR" / "NikonD200-Generic.icm"
+    profile.write_bytes(b"from a newer Capture One")
+    assert force(machine, "--force-installed") == 1
+    assert profile.read_bytes() == b"from a newer Capture One"
+
+
+def test_force_installed_as_admin_replaces_and_keeps(machine, monkeypatch):
+    assert backup(machine) == 0
+    monkeypatch.setattr(c1, "_is_admin", lambda: True)
+    profile = machine["install"] / "Color Profiles" / "DSLR" / "NikonD200-Generic.icm"
+    wanted = profile.read_bytes()
+    profile.write_bytes(b"from a newer Capture One")
+    assert force(machine, "--force-installed") == 0
+    assert profile.read_bytes() == wanted
+    assert revert() == 0
+    assert profile.read_bytes() == b"from a newer Capture One"
+
+
+def test_monitor_calibration_is_never_forced(machine, monkeypatch):
+    calibration = machine["color"] / "CS2730(21778116)04CAL1.icc"
+    calibration.write_bytes(fake_icc(b"mntr", [b"vcgt", b"desc"]) + b"old")
+    working = machine["color"] / "LargeRGB-elle-V2-g22.icc"
+    working.write_bytes(fake_icc(b"mntr", [b"desc"]) + b"old")
+    assert backup(machine) == 0
+    monkeypatch.setattr(c1, "_is_admin", lambda: True)
+    calibration.write_bytes(fake_icc(b"mntr", [b"vcgt", b"desc"]) + b"this week")
+    working.write_bytes(fake_icc(b"mntr", [b"desc"]) + b"other")
+    assert force(machine, "--force-installed") == 0
+    assert calibration.read_bytes().endswith(b"this week")
+    assert working.read_bytes().endswith(b"old")
+
+
+@pytest.mark.parametrize("data, expected", [
+    (fake_icc(b"mntr", [b"desc", b"vcgt"]), True),
+    (fake_icc(b"mntr", [b"desc"]), False),
+    (fake_icc(b"scnr", [b"vcgt"]), False),
+    (fake_icc(b"prtr"), False),
+    (b"not a profile", True),
+    (b"", True),
+])
+def test_calibration_detection(tmp_path, data, expected):
+    path = tmp_path / "プロファイル [x].icc"
+    path.write_bytes(data)
+    assert c1._is_monitor_calibration(str(path)) is expected
+
+
+def test_calibration_detection_unreadable_is_kept(tmp_path):
+    assert c1._is_monitor_calibration(str(tmp_path / "missing.icc")) is True
+
+
+def test_force_corrupt_backup_keeps_the_current_file(machine):
+    assert backup(machine) == 0
+    copy = machine["backup"] / "UserData" / STYLE
+    data = bytearray(copy.read_bytes())
+    data[0] ^= 0xFF
+    copy.write_bytes(bytes(data))
+    style = machine["user"] / STYLE
+    style.write_bytes(b"newer work")
+    assert force(machine) == 1
+    assert style.read_bytes() == b"newer work"
+
+
+@pytest.mark.parametrize("state", [True, None])
+def test_force_refused_unless_capture_one_is_known_closed(machine, monkeypatch, state):
+    assert backup(machine) == 0
+    style = machine["user"] / STYLE
+    style.write_bytes(b"newer work")
+    monkeypatch.setattr(c1, "_captureone_running", lambda: state)
+    assert force(machine) == 2
+    assert style.read_bytes() == b"newer work"
+
+
+@pytest.mark.parametrize("extra", [
+    ["--force", "--to", "x"],
+    ["--force-installed"],
+])
+def test_force_flag_combinations_refused(machine, extra):
+    assert backup(machine) == 0
+    assert c1.main(["--restore-from", str(machine["dest"]), "--yes", *extra]) == 2
+
+
+def test_force_only_on_a_restore(machine):
+    assert c1.main(["--dest", str(machine["dest"]), "--force", "--yes"]) == 2
+    assert not machine["dest"].exists()
+
+
+def test_snapshot_names_are_unique_within_one_millisecond(machine, monkeypatch):
+    moments = iter([1000.5, 1000.5, 1000.501, 1000.501])
+    real = time.time
+    monkeypatch.setattr(c1.time, "time", lambda: next(moments, real()))
+    first, second = c1._Snapshot(c1.OLD_PREFIX), c1._Snapshot(c1.OLD_PREFIX)
+    first._open()
+    second._open()
+    assert first.folder != second.folder
+
+
+def test_revert_puts_the_old_file_back(machine):
+    assert backup(machine) == 0
+    style = machine["user"] / STYLE
+    style.write_bytes(b"newer work")
+    assert force(machine) == 0
+    assert style.read_bytes() != b"newer work"
+    assert revert() == 0
+    assert style.read_bytes() == b"newer work"
+
+
+def test_revert_takes_out_what_the_force_added_without_losing_it(machine):
+    assert backup(machine) == 0
+    added = machine["user"] / "Recipes165" / "sRGB.xml"
+    added.unlink()
+    assert force(machine) == 0
+    assert added.exists()
+    assert revert() == 0
+    assert not added.exists()
+    parent = machine["appdata"] / c1.OLD_PARENT_FOLDER
+    folder = [n for n in snapshots(machine) if n.startswith(c1.REVERT_PREFIX)][0]
+    assert (parent / folder / "UserData" / "Recipes165" / "sRGB.xml").exists()
+
+
+def test_revert_keeps_what_it_replaces_in_revert_old(machine):
+    assert backup(machine) == 0
+    style = machine["user"] / STYLE
+    style.write_bytes(b"newer work")
+    assert force(machine) == 0
+    restored = style.read_bytes()
+    assert revert() == 0
+    names = [n for n in snapshots(machine) if n.startswith(c1.REVERT_PREFIX)]
+    assert len(names) == 1 and SNAPSHOT_NAME.match(names[0])
+    kept = machine["appdata"] / c1.OLD_PARENT_FOLDER / names[0] / "UserData" / STYLE
+    assert kept.read_bytes() == restored
+
+
+def test_second_revert_changes_nothing(machine):
+    assert backup(machine) == 0
+    style = machine["user"] / STYLE
+    style.write_bytes(b"newer work")
+    assert force(machine) == 0
+    assert revert() == 0
+    count = len(snapshots(machine))
+    assert revert() == 0
+    assert style.read_bytes() == b"newer work"
+    assert len(snapshots(machine)) == count
+
+
+def test_revert_uses_the_newest_and_skips_not(machine):
+    assert backup(machine) == 0
+    style = machine["user"] / STYLE
+    style.write_bytes(b"first")
+    assert force(machine) == 0
+    style.write_bytes(b"second")
+    assert force(machine) == 0
+    parent = machine["appdata"] / c1.OLD_PARENT_FOLDER
+    newest = max(snapshots(machine))
+    (parent / newest).rename(parent / (newest + c1.DISABLED_SUFFIX))
+    assert revert() == 0
+    assert style.read_bytes() == b"first"
+
+
+def test_revert_picks_the_newest(machine):
+    assert backup(machine) == 0
+    style = machine["user"] / STYLE
+    style.write_bytes(b"first")
+    assert force(machine) == 0
+    style.write_bytes(b"second")
+    assert force(machine) == 0
+    assert revert() == 0
+    assert style.read_bytes() == b"second"
+
+
+def test_revert_old_renamed_to_old_redoes(machine):
+    assert backup(machine) == 0
+    style = machine["user"] / STYLE
+    style.write_bytes(b"newer work")
+    assert force(machine) == 0
+    restored = style.read_bytes()
+    assert revert() == 0
+    parent = machine["appdata"] / c1.OLD_PARENT_FOLDER
+    name = [n for n in snapshots(machine) if n.startswith(c1.REVERT_PREFIX)][0]
+    (parent / name).rename(parent / name.replace(c1.REVERT_PREFIX, c1.OLD_PREFIX + "9"))
+    assert revert() == 0
+    assert style.read_bytes() == restored
+
+
+def test_revert_dry_run_changes_nothing(machine):
+    assert backup(machine) == 0
+    style = machine["user"] / STYLE
+    style.write_bytes(b"newer work")
+    assert force(machine) == 0
+    restored = style.read_bytes()
+    count = len(snapshots(machine))
+    assert c1.main(["--revert-last", "--dry-run"]) == 0
+    assert style.read_bytes() == restored
+    assert len(snapshots(machine)) == count
+
+
+def test_revert_with_nothing_to_undo(machine):
+    assert revert() == 2
+
+
+@pytest.mark.parametrize("state", [True, None])
+def test_revert_refused_unless_capture_one_is_known_closed(machine, monkeypatch, state):
+    assert backup(machine) == 0
+    style = machine["user"] / STYLE
+    style.write_bytes(b"newer work")
+    assert force(machine) == 0
+    restored = style.read_bytes()
+    monkeypatch.setattr(c1, "_captureone_running", lambda: state)
+    assert revert() == 2
+    assert style.read_bytes() == restored
+
+
+def test_revert_refuses_a_path_out_of_the_snapshot(machine):
+    assert backup(machine) == 0
+    (machine["user"] / STYLE).write_bytes(b"newer work")
+    assert force(machine) == 0
+    folder = machine["appdata"] / c1.OLD_PARENT_FOLDER / snapshots(machine)[0]
+    line = json.dumps({"op": "added", "rel": "UserData\\..\\..\\evil.txt"})
+    (folder / c1.JOURNAL_FILE).write_text(line + "\n" + line + "\n", encoding="utf-8")
+    assert revert() == 2
+
+
+def test_journal_cut_by_a_crash_is_still_usable(machine):
+    assert backup(machine) == 0
+    style = machine["user"] / STYLE
+    style.write_bytes(b"newer work")
+    assert force(machine) == 0
+    folder = machine["appdata"] / c1.OLD_PARENT_FOLDER / snapshots(machine)[0]
+    with open(folder / c1.JOURNAL_FILE, "a", encoding="utf-8") as handle:
+        handle.write('{"op": "repl')
+    assert revert() == 0
+    assert style.read_bytes() == b"newer work"
+
+
+def test_chosen_folder_works_given_either_way(machine, tmp_path):
+    chosen = tmp_path / "選んだ [C1] 100%"
+    assert c1.main(["--dest", str(chosen), "--yes"]) == 0
+    wipe_user_folder(machine)
+    direct = chosen / c1.BACKUP_SUBFOLDER
+    assert not (direct / c1.BACKUP_SUBFOLDER).exists()
+    assert c1.main(["--restore-from", str(direct), "--yes"]) == 0
+    assert (machine["user"] / "Color Profiles" / ICC).exists()
+
+
+def test_backup_into_the_subfolder_is_not_nested(machine, tmp_path):
+    direct = tmp_path / "x" / c1.BACKUP_SUBFOLDER
+    assert c1.main(["--dest", str(direct), "--yes"]) == 0
+    assert (direct / "UserData").is_dir()
+    assert not (direct / c1.BACKUP_SUBFOLDER).exists()
+
+
 # ---- Menu ---------------------------------------------------------------------------
+def answer_with(monkeypatch, answers):
+    answers = iter(answers)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+
+
+@pytest.fixture
+def c1_menu(monkeypatch, tmp_path):
+    monkeypatch.setattr(menu, "CONFIG_PATH", str(tmp_path / "config.json"))
+    calls = []
+    monkeypatch.setattr(menu, "run_captureone", lambda argv: calls.append(argv) or 0)
+    return calls
+
+
+def test_menu_backs_up_only_capture_one_to_a_chosen_folder(monkeypatch, tmp_path, c1_menu):
+    answer_with(monkeypatch, ["1", str(tmp_path), "y", "0"])
+    menu.captureone_menu(menu.load_config())
+    assert c1_menu == [["--dest", str(tmp_path), "--dry-run"], ["--dest", str(tmp_path), "--yes"]]
+
+
+def test_menu_remembers_the_chosen_folder(monkeypatch, tmp_path, c1_menu):
+    answer_with(monkeypatch, ["1", str(tmp_path), "y", "0"])
+    menu.captureone_menu(menu.load_config())
+    assert menu.load_config()["captureone_folder"] == str(tmp_path)
+
+
+def test_menu_restore_passes_the_extras(monkeypatch, tmp_path, c1_menu):
+    answer_with(monkeypatch, ["2", str(tmp_path), "_Instalador; Preferences", "y", "0"])
+    menu.captureone_menu(menu.load_config())
+    assert c1_menu[-1] == ["--restore-from", str(tmp_path), "--also", "_Instalador",
+                           "--also", "Preferences", "--yes"]
+
+
+def test_menu_force_leaves_factory_profiles_by_default(monkeypatch, tmp_path, c1_menu):
+    answer_with(monkeypatch, ["3", str(tmp_path), "", "", "y", "0"])
+    menu.captureone_menu(menu.load_config())
+    assert c1_menu[-1] == ["--restore-from", str(tmp_path), "--force", "--yes"]
+
+
+def test_menu_force_installed_only_when_asked(monkeypatch, tmp_path, c1_menu):
+    answer_with(monkeypatch, ["3", str(tmp_path), "", "y", "y", "0"])
+    menu.captureone_menu(menu.load_config())
+    assert c1_menu[-1] == ["--restore-from", str(tmp_path), "--force", "--force-installed", "--yes"]
+
+
+def test_menu_undo(monkeypatch, c1_menu):
+    answer_with(monkeypatch, ["4", "y", "0"])
+    menu.captureone_menu(menu.load_config())
+    assert c1_menu == [["--revert-last", "--dry-run"], ["--revert-last", "--yes"]]
+
+
+def test_menu_no_means_only_the_dry_run(monkeypatch, c1_menu):
+    answer_with(monkeypatch, ["4", "n", "0"])
+    menu.captureone_menu(menu.load_config())
+    assert c1_menu == [["--revert-last", "--dry-run"]]
+
+
+def test_every_menu_flag_exists_in_the_script():
+    parser = c1.build_parser()
+    known = {option for action in parser._actions for option in action.option_strings}
+    for flag in ("--dest", "--restore-from", "--also", "--force", "--force-installed",
+                 "--revert-last", "--dry-run", "--yes"):
+        assert flag in known
+
+
 def session_for(dest, **changes):
     session = menu.default_session()
     session.update(sources=["G:\\x"], dest=str(dest))

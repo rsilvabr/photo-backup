@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder

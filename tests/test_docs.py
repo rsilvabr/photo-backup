@@ -13,5 +13,5 @@ def test_docs_cover_the_flags():
             for option in action.option_strings:
                 if option.startswith("--"):
                     assert option in readme, f"{option} is missing from README.md"
-    for text in ("restore_backup.py", "[5] Restore", "captureone_backup.py", "[6] Restore"):
+    for text in ("restore_backup.py", "[5] Restore", "captureone_backup.py", "[6] Capture One only"):
         assert text in readme, f"{text} is missing from README.md"

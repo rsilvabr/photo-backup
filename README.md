@@ -132,7 +132,7 @@ python photo_backup.py
   [3] Presets
   [4] Settings
   [5] Restore from a backup
-  [6] Restore Capture One's profiles, styles and settings
+  [6] Capture One only (back up, restore, force, undo)
   [0] Exit
 ```
 
@@ -142,7 +142,7 @@ python photo_backup.py
 - **[3] Presets**: after a backup the menu offers to save its settings (and the backup's ID) under a name. A preset runs from the menu (dry-run first) or unattended; if the drive letter changed, the menu finds the backup by its ID.
 - **[4] Settings** shows where the remembered choices live (`~/.photo_backup_config.json`, or `$PHOTOBACKUP_CONFIG`) and the defaults of `selective_backup.py`. The menu reads those defaults from `selective_backup.py` itself: edit the top of that file and the menu follows.
 - **[5] Restore** lists the backup's top folders, asks what to restore and where to (the original places or another folder), runs a dry-run and then restores after a yes.
-- **[6] Restore Capture One's…** puts its profiles, styles and settings back; see [Capture One's own files](#capture-ones-own-files-captureone_backuppy-v060).
+- **[6] Capture One only** backs up just Capture One to a folder you choose, restores from one, force-restores and undoes the last force restore; see [Capture One's own files](#capture-ones-own-files-captureone_backuppy-v060).
 
 > **Tip:** The value shown in `[brackets]` is the default — just press Enter to accept it.
 
@@ -359,7 +359,11 @@ python captureone_backup.py --dest H:\BACKUP [--dry-run] [--yes]
 python captureone_backup.py --verify H:\BACKUP
 python captureone_backup.py --restore-from H:\BACKUP [--dry-run] [--yes]
 python captureone_backup.py --restore-from H:\BACKUP --also _Instalador --also Preferences --to D:\Out
+python captureone_backup.py --restore-from H:\BACKUP --force [--force-installed]
+python captureone_backup.py --revert-last
 ```
+
+`PATH` can be any folder, for a backup of Capture One alone: the files go to `PATH\_captureone`, and giving that folder itself works too.
 
 | Option | Meaning |
 |---|---|
@@ -368,12 +372,23 @@ python captureone_backup.py --restore-from H:\BACKUP --also _Instalador --also P
 | `--restore-from PATH` | restore from the backup under `PATH` |
 | `--also NAME` | restore this part too: `Preferences`, or a folder of `UserData` (`_Instalador`, `Batch*`); repeatable |
 | `--to PATH` | restore under `PATH` instead of the original places |
+| `--force` | with `--restore-from`: also replace files that differ, in your own folders; the current ones are kept first |
+| `--force-installed` | with `--force`: also the install folder's profiles and the Windows colour folder's, as administrator. Never a monitor calibration |
+| `--revert-last` | undo the last `--force` |
 | `--install-folder PATH` | Capture One's install folder (default: read from Windows) |
 | `--space-margin-gb N` | free space kept on the target drive |
 | `--dry-run` | plan and report, write nothing |
 | `--yes` | do not ask for confirmation |
 
 A restore brings back the profiles, styles, defaults, presets, recipes, shortcuts and workspaces, plus any missing file of `Installed` and `WindowsColor`. The batch queue, `ImageCore`, plugins, `Preferences` and your own folders stay in the backup unless you name them with `--also`. It refuses to run while Capture One is open, and reports what needs an administrator instead of failing half-way. As everywhere in this tool, nothing in the backup is deleted: the old copy of a file that really changed goes to the versions folder.
+
+**Force restore and undo** *(v0.7.0)*. A normal restore only adds what is missing. `--force` also replaces what differs, after keeping the current file in `%LOCALAPPDATA%\CaptureOne_old\old_<date>_<time>_<ms>`; only files that really differ go there, and they are never removed for you. `--revert-last` puts the newest `old_` folder back and takes out what the force added. It keeps what it replaces in a `revert_old_…` folder, which is never taken for the last one.
+
+- To make `--revert-last` skip a folder, rename it so it ends with `_not`.
+- To redo a force you undid, rename its `revert_old_…` folder to `old_…` (remove the `revert_`) and run `--revert-last` again.
+- `--force` leaves factory profiles alone: on a newer Capture One, an older copy would change the colour of every photo from that camera. `--force-installed` includes them.
+- A monitor calibration (a display profile with a video-card table) is never replaced, even with `--force-installed`.
+- Both refuse to run unless Windows confirms Capture One is closed.
 
 The settings are at the top of `captureone_backup.py`; `COPY_CAPTUREONE_SETTINGS` at the top of `photo_backup.py` turns the step off.
 
@@ -692,10 +707,12 @@ Japanese file names.
 
 ## Current version
 
-**v0.6.0** (2026-11-08).
+**v0.7.0** (2026-11-08).
 
-- Every backup from the menu also keeps what Capture One needs to show your edits: the ICC profiles, styles, defaults and settings, read from where it really has them. About 1.8 GB.
-- On a new computer, install Capture One and double-click `RESTORE_CAPTUREONE.cmd` in the backup. It needs no Python and never overwrites a file. [Details](#capture-ones-own-files-captureone_backuppy-v060).
+- Menu `[6]`: back up only Capture One to a folder you choose, and restore from one.
+- A force restore replaces what differs and keeps the current files first; one command undoes it. Factory profiles need a separate option, and a monitor calibration is never replaced. [Details](#capture-ones-own-files-captureone_backuppy-v060).
+
+**v0.6.0** added the backup of Capture One's profiles, styles and settings, with a double-click restore for a new computer.
 
 **106 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
 
@@ -703,7 +720,8 @@ Japanese file names.
 
 | Version | Date | What it added |
 |---------|------|---------------|
-| **v0.6.0** | 2026-11-08 | Keeps Capture One's own profiles, styles and settings; double-click restore for a new computer |
+| **v0.7.0** | 2026-11-08 | Capture One alone to a folder you choose; force restore that keeps the old files, and undo |
+| v0.6.0 | 2026-11-08 | Keeps Capture One's own profiles, styles and settings; double-click restore for a new computer |
 | v0.5.0 | 2026-11-08 | Leaves out the sRGB/resized JXL copies jxl-photo made from a master that is backed up; `DSC_0001 (2)` treated as its own photo |
 | v0.4.0 | 2026-11-08 | Renamed folders moved instead of copied again; orphans listed; a backup ID per disk; verify in slices; `restore_backup.py` |
 | v0.3.0 | 2026-10-07 | The interactive menu (dry-run first, then the copy after a yes) and unattended presets |

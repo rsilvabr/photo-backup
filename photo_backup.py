@@ -24,7 +24,7 @@ import string
 import subprocess
 import sys
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
@@ -644,29 +644,69 @@ def restore_flow(config):
     return rc
 
 
-def captureone_restore_flow(config):
-    title("Restore Capture One's profiles, styles and settings")
-    say("  Close Capture One first. Nothing that already exists is overwritten.")
-    backup = ask("Backup folder", config["last"].get("dest", "")).strip().strip('"')
-    if not backup:
+def _captureone_folder(config, must_exist):
+    """The folder of a Capture One job; the last one is offered again."""
+    folder = ask_dest(config.get("captureone_folder") or config["last"].get("dest", ""), must_exist)
+    config["captureone_folder"] = folder
+    save_config(config)
+    return folder
+
+
+def _captureone_job(argv, what):
+    """Dry-run, then the real thing after a yes."""
+    title("Step 1/2 - dry-run, nothing is written")
+    rc = run_captureone(argv + ["--dry-run"])
+    if rc in (2, 130):
+        say(f"{what}: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "red")
+        return rc
+    if not yes_no("Step 2/2 - do it now?", True):
+        say("Nothing changed.")
         return 0
-    say("  Also restore (optional, separated with ';'): _Instalador, Preferences, a folder like Batch*.")
+    title(what)
+    rc = run_captureone(argv + ["--yes"])
+    say(f"{what}: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "green" if rc == 0 else "yellow")
+    return rc
+
+
+def _captureone_restore_argv(config):
+    backup = _captureone_folder(config, must_exist=True)
+    say("  Also restore (optional, separated with ';'): "
+        f"{_captureone_setting('INSTALLER_FOLDER')}, Preferences, a folder like Batch*.")
     extras = [part.strip() for part in ask("Also restore", "").split(";") if part.strip()]
     argv = ["--restore-from", backup]
     for name in extras:
         argv += ["--also", name]
-    title("Step 1/2 - what would be restored (dry-run, nothing is written)")
-    rc = run_captureone(argv + ["--dry-run"])
-    if rc in (2, 130):
-        say(f"Restore: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "red")
-        return rc
-    if not yes_no("Step 2/2 - restore now?", True):
-        say("Nothing restored.")
-        return 0
-    title("Restoring")
-    rc = run_captureone(argv + ["--yes"])
-    say(f"Restore: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "green" if rc == 0 else "yellow")
-    return rc
+    return argv
+
+
+def captureone_menu(config):
+    while True:
+        title("Capture One only")
+        say("  [1] Back up only Capture One, to a folder you choose")
+        say("  [2] Restore from a folder (only adds what is missing)")
+        say("  [3] Force restore (also replaces files that differ; the current ones are kept)")
+        say("  [4] Undo the last force restore")
+        say("  [0] Back")
+        answer = ask("Choose", "0")
+        if answer == "0":
+            return
+        if answer == "1":
+            _captureone_job(["--dest", _captureone_folder(config, must_exist=False)], "Capture One backup")
+        elif answer == "2":
+            say("  Close Capture One first. Nothing that already exists is overwritten.")
+            _captureone_job(_captureone_restore_argv(config), "Restore")
+        elif answer == "3":
+            say("  Close Capture One first. What gets replaced is kept and can be undone with [4].")
+            argv = _captureone_restore_argv(config) + ["--force"]
+            if yes_no("Also replace the factory profiles of the installed Capture One "
+                      "(needs administrator; a newer version's would be replaced by older ones)?",
+                      False):
+                argv.append("--force-installed")
+            _captureone_job(argv, "Force restore")
+        elif answer == "4":
+            say("  To skip a snapshot, rename its folder so it ends with "
+                f"{_captureone_setting('DISABLED_SUFFIX')}.")
+            _captureone_job(["--revert-last"], "Undo")
 
 
 def settings_menu(config):
@@ -696,7 +736,7 @@ def interactive():
         say("  [3] Presets")
         say("  [4] Settings")
         say("  [5] Restore from a backup")
-        say("  [6] Restore Capture One's profiles, styles and settings")
+        say("  [6] Capture One only (back up, restore, force, undo)")
         say("  [0] Exit")
         answer = ask("Choose", "1")
         if answer == "0":
@@ -712,7 +752,7 @@ def interactive():
         elif answer == "5":
             restore_flow(config)
         elif answer == "6":
-            captureone_restore_flow(config)
+            captureone_menu(config)
 
 
 def run_preset(name):
