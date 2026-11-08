@@ -16,13 +16,18 @@ from the command line. A future job (e.g. a full mirror) is a new
 - `selective_backup.py` — the backend: planner, copy, catalog, verify. Every
   safety rule below lives here.
 - `photo_backup.py` — interactive menu + presets (`--run-preset`). It
-  never copies by itself: it builds an argv and runs `selective_backup.py` as a
-  child process (`run_backend`). It reads the backend's defaults by importing
+  never copies by itself: it builds an argv and runs `selective_backup.py` (or
+  `restore_backup.py`, via `run_restore`) as a child process (`run_backend`).
+  It reads the backend's defaults by importing
   it (`_setting`) and always passes every selection option explicitly — a
   default repeated as a literal in the menu would silently override the
   owner's edit of `selective_backup.py` (the bug class of jxl-photo round 43).
-  Its own settings (`CONFIG_PATH`, `VERIFY_MODE`, `FORMAT_ALTERNATIVES`) are
-  at its top; tests set `CONFIG_PATH` to a temp file.
+  Its own settings (`CONFIG_PATH`, `VERIFY_MODE`, `FORMAT_ALTERNATIVES`,
+  `RESTORE`) are at its top; tests set `CONFIG_PATH` to a temp file.
+- `restore_backup.py` — restores files out of a backup (`--to` /
+  `--to-original`). A backend may import the catalog and the copier from
+  `selective_backup.py` (`import selective_backup as sb`); never duplicate
+  the catalog format or the copy routine — they exist once.
 
 ## Safety rules (these are the product)
 - **The source is READ-ONLY.** No code path may open a source file for
@@ -32,7 +37,13 @@ from the command line. A future job (e.g. a full mirror) is a new
 - **Nothing on the destination is ever deleted.** A file whose source changed
   is reported; with `--update-changed` the old copy is MOVED to the versions
   folder first, never overwritten in place. The only file the tool removes is
-  its own temp file (`*` + `TEMP_SUFFIX`) after a failed copy.
+  its own temp file (`*` + `TEMP_SUFFIX`) after a failed copy. The one
+  exception: a folder left empty by one of our own moves (a detected
+  move/rename, or `--move-orphans`) is removed with `os.rmdir` — never a
+  file, and never anything inside `CATALOG_FOLDER`.
+- **The restore never writes to the backup.** `restore_backup.py` opens the
+  catalog read-only, never writes, moves or deletes anything under `--backup`,
+  and never overwrites a target file that already exists.
 - **Fail closed.** Not enough space, an unreadable catalog, a closed stdin
   without `--yes`, a destination inside a source (or the reverse): abort
   BEFORE the first byte is copied, exit code 2.
@@ -66,7 +77,8 @@ files):
   260, so all file I/O uses Windows extended paths.
 
 ## Verification
-- After editing: `python -m py_compile photo_backup.py selective_backup.py`.
+- After editing: `python -m py_compile photo_backup.py selective_backup.py
+  restore_backup.py`.
 - Tests: `python -m pytest tests/` (pytest lives in the `python` 3.12
   interpreter; `py` is 3.13 without pytest). Tests build synthetic trees in
   `tmp_path` and set `PHOTOBACKUP_LOG_DIR`, so no test writes to `Logs\`.

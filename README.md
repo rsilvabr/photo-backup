@@ -19,10 +19,13 @@ A selective backup for photographers' archives. It backs up **the photos you exp
 - [Folders without an export](#folders-without-an-export)
 - [Capture One and NX Studio](#capture-one-and-nx-studio)
 - [Re-runs, changed files and the versions folder](#re-runs-changed-files-and-the-versions-folder)
-- [Verifying a backup](#verifying-a-backup)
+- [Moved and renamed folders](#moved-and-renamed-folders)
+- [Verifying a backup](#verifying-a-backup) · [Rolling verify](#rolling-verify)
+- [Which disk is this? (backup ID)](#which-disk-is-this-backup-id)
+- [Restoring](#restoring)
 - [Every option](#every-option) · [Settings](#settings) · [Logs](#logs) · [Exit codes](#exit-codes)
 - [Current version](#current-version) · [Changelog](#changelog)
-- [Related project: jxl-photo](#related-project-jxl-photo)
+- [Run it after jxl-photo](#run-it-after-jxl-photo) · [Related project: jxl-photo](#related-project-jxl-photo)
 - [Disclaimer](#disclaimer) · [License](#license) · [Acknowledgments](#acknowledgments)
 
 ---
@@ -68,16 +71,29 @@ Unchanged files are skipped by size and date; files copied by another tool (Free
 ### 8. **An interactive menu** *(v0.3.0)*
 `python photo_backup.py`: answer a few questions (Enter keeps your last choice), read the dry-run, confirm the copy. Save presets and run them from the Task Scheduler. [Details](#quick-start--interactive-menu).
 
+### 9. **Moved and renamed folders are moved, not copied again** *(v0.4.0)*
+Renaming a session (`250129_Flores` → `250129_Flores [FINAL]`) used to copy everything again and leave the old copy behind forever. Now the backup copy is **moved** to the new path after the content is confirmed by SHA-256; anything in the backup whose source is gone is listed as an **orphan**, and `--move-orphans` parks it under `_photo_backup\orphans\`. [Details](#moved-and-renamed-folders).
+
+### 10. **A backup identifies itself** *(v0.4.0)*
+The first copy writes `_photo_backup\volume.json` with a random backup ID and the volume label. `--expect-backup-id` refuses the wrong disk, and a preset finds its backup even when the drive letter changed. [Details](#which-disk-is-this-backup-id).
+
+### 11. **Verify a big backup in slices** *(v0.4.0)*
+`--verify full --max-gb N` hashes at most N GB per run, oldest verification first, so a huge backup is checked over several nights. [Details](#rolling-verify).
+
+### 12. **Restore** *(v0.4.0)*
+`restore_backup.py` copies files back from a backup — under a new folder or to the original places — never overwriting anything and never writing to the backup. [Details](#restoring).
+
 ---
 
 ## Scripts
 
 | Script | What it does |
 |---|---|
-| `photo_backup.py` | **Start here.** Interactive menu: back up (dry-run first, then copy), verify, presets, unattended runs. Runs the scripts below for you. |
+| `photo_backup.py` | **Start here.** Interactive menu: back up (dry-run first, then copy), verify, presets, unattended runs, restore. Runs the scripts below for you. |
 | `selective_backup.py` | The selective backup itself, from the command line: plan, copy, catalog, verify. Everything the menu does goes through it. |
+| `restore_backup.py` | Restores files from a backup: under a new folder (`--to`) or to the original places (`--to-original`). It imports the catalog and the copier from `selective_backup.py`, so the catalog format exists in one place only. |
 
-The menu never copies anything itself — it runs `selective_backup.py` with the options you confirmed, so every [safety guarantee](#safety-guarantees) holds either way.
+The menu never copies anything itself — it runs `selective_backup.py` (or `restore_backup.py`) with the options you confirmed, so every [safety guarantee](#safety-guarantees) holds either way.
 
 ---
 
@@ -108,14 +124,16 @@ python photo_backup.py
   [2] Verify a backup
   [3] Presets
   [4] Settings
+  [5] Restore from a backup
   [0] Exit
 ```
 
 - **[1] Back up** asks for the folders to back up, the destination (it lists the connected drives with their free space), the export formats, the subfolders to skip and the other options — then runs a **dry-run** with those choices. You read what would be copied, what would not, and whether it fits; only then it asks **"copy now?"**. If some folders could not be read, it says so and asks again before copying the rest.
 - Your choices are remembered: the next time, it shows them and asks **"Use these settings?"** — Enter, and the dry-run starts.
-- **[2] Verify** runs `--verify quick` or `--verify full` on a backup.
-- **[3] Presets**: after a backup the menu offers to save its settings under a name. A preset runs from the menu (dry-run first) or unattended.
+- **[2] Verify** runs `--verify quick` or `--verify full` on a backup. With `full` it also asks **"Max GB to verify in this run (0 = everything)"** — see [Rolling verify](#rolling-verify).
+- **[3] Presets**: after a backup the menu offers to save its settings (and the backup's ID) under a name. A preset runs from the menu (dry-run first) or unattended; if the drive letter changed, the menu finds the backup by its ID.
 - **[4] Settings** shows where the remembered choices live (`~/.photo_backup_config.json`, or `$PHOTOBACKUP_CONFIG`) and the defaults of `selective_backup.py`. The menu reads those defaults from `selective_backup.py` itself: edit the top of that file and the menu follows.
+- **[5] Restore** lists the backup's top folders, asks what to restore and where to (the original places or another folder), runs a dry-run and then restores after a yes.
 
 > **Tip:** The value shown in `[brackets]` is the default — just press Enter to accept it.
 
@@ -299,6 +317,43 @@ copy and remembers the size, mtime and sha256 of every copied file — the size
 and mtime the source had at the moment it was copied (a file saved by your
 editor while the backup runs is recorded as copied, not as planned).
 
+## Moved and renamed folders
+
+When you rename a session (`250129_Flores` → `250129_Flores [FINAL]`), every
+file appears at a new relative path and looks `NEW`. Instead of copying
+everything again and leaving the old copy behind, the tool:
+
+1. looks for a catalogued backup file with the same file name and size whose
+   **source is gone** (`possible moves: N files` in the summary — a dry-run
+   writes nothing);
+2. before moving anything, hashes the new source file and the old backup copy
+   and compares them with the SHA-256 recorded at copy time: only a full match
+   moves (`MOVE old\path -> new\path`);
+3. moves it into the new place, updates the catalog and removes the folders
+   that the move left empty — up to (not including) the destination root.
+   This is the **only** case where the tool removes a folder on the
+   destination, and it never removes a file; anything that does not match is
+   copied as new (`MOVE REJECTED ...: content differs`).
+
+`--no-detect-moves` turns the whole detection off (everything is copied
+again), and `DETECT_MOVES = False` does the same by default.
+
+A backup file whose source no longer exists is an **orphan** (an original you
+deleted after it was exported). Every run writes `<log>_orphans.csv` with the
+reason for each:
+
+- `source_missing` — the original is gone;
+- `not_selected` — the original still exists, but the current selection does
+  not include it any more (for example you changed `--export-formats`).
+
+Orphans are only reported by default. `--move-orphans` (real copies only)
+moves the `source_missing` ones to
+`<dest>\_photo_backup\orphans\<YYMMDD_HHMMSS>\<rel>`, removes their catalog
+rows and cleans the folders the move left empty; `not_selected` files are
+never touched. Since the old copy is only moved inside the backup, the space
+does not shrink until you delete the orphans folder yourself — that is
+outside this tool's scope.
+
 ## Verifying a backup
 
 `--verify quick` checks that each catalogued file still exists with the
@@ -325,6 +380,108 @@ Note: the `hash` mode of `--verify-copy` re-reads the temp file right after
 writing, which the OS cache usually serves from memory. It catches write
 errors; the real check of the media is a `--verify full` on another day.
 
+## Rolling verify
+
+A `--verify full` over a multi-terabyte backup takes hours. `--max-gb N`
+limits a run to at most N GB, hashing first the files that were verified
+longest ago (files never verified, then the oldest `verified_at`; ties go to
+the oldest `copied_at`). The run prints:
+
+```
+Rolling verify: checked 250 files / 100.0 GB, deferred 900 files / 350.0 GB (oldest verification first; the next run continues)
+```
+
+The deferred files are not checked and do not affect the exit code; the next
+run picks them up. A corrupted backup copy is still reported immediately. A
+file whose source is gone but whose copy is intact gets its `verified_at`
+advanced too, so the wheel keeps turning. `--max-gb` only applies to
+`--verify full`; with `quick` it is ignored (the log says so). The default is
+`VERIFY_MAX_GB` (0 = verify everything).
+
+## Which disk is this? (backup ID)
+
+The first real copy writes `_photo_backup\volume.json`:
+
+```json
+{
+  "backup_id": "9f2c...",
+  "created": "2026-10-07T22:10:05",
+  "label": "PHOTOS",
+  "path": "BACKUP"
+}
+```
+
+The summary's `Destination:` line then ends with `backup ID 9f2c0031` (the
+first 8 characters), so a glance tells you whether the disk in front of you
+is the right one. A destination with no catalog yet says `NEW BACKUP`; a
+backup made before v0.4.0 (catalog but no `volume.json`) says
+`backup ID (none yet; created on the next copy)`.
+
+`--expect-backup-id ID` makes it strict: the run (copy, dry-run or verify)
+aborts with exit 2 before planning anything unless the destination holds
+exactly that ID. The menu saves the ID with every preset, and a preset run
+looks for the same relative path on every connected drive: when found, it
+says `Backup found on D:\BACKUP (the preset says H:\BACKUP)` and runs there;
+when not, it says the backup is not on any connected drive and exits 2.
+
+## Restoring
+
+`restore_backup.py` copies files **out of** a backup. The backup is
+read-only; a target file that already exists is never overwritten.
+
+```
+restore_backup.py --backup PATH (--to PATH | --to-original) [options]
+```
+
+| Option | Description |
+|---|---|
+| `--backup PATH` | backup root (the folder that holds `_photo_backup`); required |
+| `--to PATH` | restore each file under `PATH\<rel>` |
+| `--to-original` | restore each file to the `source_path` recorded in the catalog |
+| `--only REL` | restore only this folder or file (repeatable, case-insensitive); default: everything |
+| `--expect-backup-id ID` | abort unless the backup holds this backup ID |
+| `--space-margin-gb N` | free space kept on each target drive, in GB (default `5.0`) |
+| `--dry-run` | plan and report, restore nothing |
+| `--yes` | do not ask for confirmation |
+| `--version` | print the version and exit |
+| `--help` | print the usage and exit |
+
+Exactly one of `--to` and `--to-original` is required. Outcomes per file, in
+the console, in the log and in `<log>_restore.csv`:
+
+- `RESTORED` — copied from the backup and verified against the catalog
+  SHA-256 (`RESTORED_UNVERIFIED` when the catalog had no hash yet);
+- `ALREADY_THERE` — the target exists with the same content (size and hash);
+- `CONFLICT` — the target exists with different content; it is left alone and
+  the run exits 1;
+- `CORRUPT_IN_BACKUP` — the backup copy does not match the catalog hash;
+  nothing is written to the target and the run exits 1;
+- `MISSING_IN_BACKUP`, `REFUSED`, `ERROR` — the backup file is gone, the
+  `source_path` would land inside the backup (`--to-original`), or another
+  error; all exit 1.
+
+Exit codes: 0 (everything restored or already there), 1 (any of the above),
+2 (aborted before restoring: no catalog, wrong backup ID, `--to` inside the
+backup or the backup inside `--to`, not enough space, no confirmation),
+130 (Ctrl+C).
+
+## Run it after jxl-photo
+
+The smooth nightly order is: jxl-photo converts the new TIFF exports into JXL
+masters, then photo-backup runs and picks up those masters the same night
+(`jxl>tif>jpg` finds the JXL first). One `.cmd` chains both:
+
+```bat
+@echo off
+cd /d C:\path\to\jxl-photo
+py jxl_photo.py --run-preset "SYNC PHOTOS"
+cd /d C:\path\to\photo-backup
+py photo_backup.py --run-preset "NIGHTLY"
+```
+
+In the Task Scheduler, use `cmd /k` with that `.cmd` so the window stays open
+with the result. Nothing here edits your existing scheduled tasks.
+
 ## Every option
 
 ```text
@@ -347,14 +504,19 @@ selective_backup.py --source PATH [--source PATH ...] --dest PATH [options]
 | `--verify-copy {none,size,hash}` | verification of each copy (default `hash`) |
 | `--update-changed` | move a changed destination file to the versions folder before copying the new one |
 | `--no-auto-update` | do not update changed edit settings/sidecars (`AUTO_UPDATE_EXTENSIONS`) unless `--update-changed` is given |
+| `--no-detect-moves` | copy a moved/renamed file again instead of moving its backup copy |
+| `--move-orphans` | move backup files whose source is gone into `_photo_backup\orphans\<stamp>` (real copies only) |
+| `--expect-backup-id ID` | abort (exit 2) unless the destination holds this backup ID; also applies to `--verify` and `--dry-run` |
 | `--space-margin-gb N` | free space kept on the destination, in GB (default `20.0`) |
 | `--dry-run` | plan, print the summary and write the logs/CSVs; copy nothing |
 | `--verify {quick,full}` | verify an existing backup; no copy |
+| `--max-gb N` | with `--verify full`: verify at most N GB, oldest verification first (default `0.0` = everything) |
 | `--yes` | do not ask for confirmation |
 | `--version` | print the version and exit |
 | `--help` | print the usage and exit |
 
-`--verify` cannot be combined with `--dry-run` or `--update-changed` (exit 2).
+`--verify` cannot be combined with `--dry-run`, `--update-changed` or
+`--move-orphans` (exit 2); a negative `--max-gb` is a usage error too.
 
 ## Settings
 
@@ -390,7 +552,18 @@ default everywhere.
 | `PROGRESS_EVERY_S` | `5.0` | console progress interval |
 | `AUTO_UPDATE` | `True` | changed edit settings/sidecars are updated without `--update-changed` (`--no-auto-update` turns it off) |
 | `AUTO_UPDATE_EXTENSIONS` | `.xmp`, `.dop`, `.pp3`, `.cos`, `.comask`, `.nksc` | extensions treated that way |
+| `DETECT_MOVES` | `True` | detect moved/renamed catalogued files and move their backup copy (`--no-detect-moves`) |
+| `ORPHANS_FOLDER` | `orphans` | under `CATALOG_FOLDER`: where `--move-orphans` puts files whose source is gone |
+| `BACKUP_ID_FILE` | `volume.json` | under `CATALOG_FOLDER`: the backup identity (F2) |
+| `VERIFY_MAX_GB` | `0.0` | default `--max-gb` for `--verify full` (0 = everything) |
+| `SUMMARY_FOLDER_LINES` | `25` | lines of the per-folder table in the summary (the CSV has all) |
 | `LOG_DIR` | `$PHOTOBACKUP_LOG_DIR` or `Logs\` next to the script | where the logs are written |
+
+`restore_backup.py` has its own setting at the top:
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `SPACE_MARGIN_GB` | `5.0` | free space kept on each restore target drive (default `--space-margin-gb`) |
 
 ## Logs
 
@@ -403,7 +576,15 @@ Every run writes `<LOG_DIR>\<YYMMDD_HHMMSS>_backup` (or `_verify`) plus:
 - `_unexported.csv` — `folder,files,bytes,c1_bytes,nx_bytes` (always written,
   even with `--unexported skip`);
 - `_unmatched.csv` — `session,export_file`;
+- `_by_folder.csv` — `folder,files,bytes,cumulative_bytes` for what would be
+  copied, by top folder (always written; the summary shows at most
+  `SUMMARY_FOLDER_LINES` of them);
+- `_orphans.csv` — `reason,rel,size,source_path,copied_at` (always written,
+  header only when there is no catalog);
 - `_verify.csv` — `status,rel,source_path,detail` (verify runs only).
+
+`restore_backup.py` writes its own `<YYMMDD_HHMMSS>_restore.log` and
+`<YYMMDD_HHMMSS>_restore.csv` (`status,rel,target,detail`).
 
 CSVs are UTF-8 with BOM (`utf-8-sig`), which opens correctly in Excel with
 Japanese file names.
@@ -421,17 +602,26 @@ Japanese file names.
 
 ## Current version
 
-**v0.3.0** (2026-10-07) — first release.
+**v0.4.0** (2026-11-08).
 
-- An interactive menu, `photo_backup.py` (the backup engine is `selective_backup.py`): dry-run first, then copy; remembered choices; presets, also unattended for the Task Scheduler.
-- Selective backup by export: exports in the formats you choose, plus the originals, sidecars, Capture One and NX Studio edits of the exported photos.
-- Read-only source, nothing deleted on the destination, space checked before the first byte, `--dry-run` summary with every "not copied" reason.
-- SQLite catalog with SHA-256; `--verify quick|full` on any later day.
-- Edit settings and sidecars (`.xmp`, `.cos`, `.comask`, `.nksc`) are kept current automatically, previous versions in `versions\`.
+- Moved/renamed folders are moved inside the backup instead of copied again; orphans are reported and `--move-orphans` parks the ones whose source is gone.
+- `_photo_backup\volume.json` identifies the backup; `--expect-backup-id`, and presets find the disk even when the letter changed.
+- `--verify full --max-gb N` verifies a big backup in slices, oldest verification first.
+- `restore_backup.py` and the menu's `[5] Restore`: restore to a folder or to the original places, never overwriting and never writing to the backup.
+- The dry-run summary gains a per-folder table with cumulative sizes.
 
-**54 tests**, plus a dry-run over a real 9 TB archive and real copies verified with `--verify full`.
+**94 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
 
 ## Changelog
+
+### v0.4.0 (2026-11-08)
+- **Moved and renamed folders** are moved inside the backup after the content is confirmed by SHA-256, instead of being copied again; the folders the move leaves empty are removed (`--no-detect-moves` turns it off). Backup files whose source is gone are reported in `<log>_orphans.csv`; `--move-orphans` moves the `source_missing` ones to `_photo_backup\orphans\<stamp>`.
+- **Backup identity**: `_photo_backup\volume.json` with a random ID; `--expect-backup-id` refuses the wrong disk; presets find the backup on another drive letter by ID.
+- **Rolling verify**: `--verify full --max-gb N` checks at most N GB per run, oldest verification first; `source_missing` files whose copy is verified still advance the wheel.
+- **Restore**: new `restore_backup.py` and menu item `[5] Restore` — restore under a folder or to the original places, never overwriting a target and never writing to the backup.
+- The summary now shows a per-folder table of what will be copied (with cumulative sizes) and the orphan/move lines; `<log>_by_folder.csv` has the full table.
+- The menu asks for the max GB when the verify mode is `full` and saves the backup ID with each preset.
+- The restore never overwrites a target even when it appears while the file is being restored (the final rename refuses an existing target; reported as `CONFLICT`).
 
 ### v0.3.0 (2026-10-07)
 - **Scripts renamed:** `photo_backup.py` is now the interactive menu (the project's entry point); the backup engine of v0.2.0 is `selective_backup.py`, with the same options.

@@ -16,15 +16,17 @@ sidecars (AUTO_UPDATE_EXTENSIONS) are updated that way on every run.
 import argparse
 import csv
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -75,6 +77,12 @@ PROGRESS_EVERY_S = 5.0
 AUTO_UPDATE = True                  # default: changed edit settings/sidecars are updated without --update-changed
 AUTO_UPDATE_EXTENSIONS = (".xmp", ".dop", ".pp3", ".cos", ".comask", ".nksc")  # small files rewritten by every edit
 
+DETECT_MOVES = True                 # default: a NEW file that is a moved/renamed catalogued file is moved inside the backup (--no-detect-moves)
+ORPHANS_FOLDER = "orphans"          # under CATALOG_FOLDER: where --move-orphans puts backup files whose source is gone
+BACKUP_ID_FILE = "volume.json"      # under CATALOG_FOLDER: the identity of this backup (F2)
+VERIFY_MAX_GB = 0.0                 # default --max-gb for --verify full: 0 = verify everything
+SUMMARY_FOLDER_LINES = 25           # lines of the per-folder table in the summary (the CSV has all)
+
 # ---- Logs ---------------------------------------------------------------------------
 LOG_DIR = os.environ.get("PHOTOBACKUP_LOG_DIR") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "Logs")
@@ -90,6 +98,7 @@ CAT_UNEXPORTED = "unexported"
 ST_NEW = "NEW"
 ST_CHANGED = "CHANGED"
 ST_UP_TO_DATE = "UP_TO_DATE"
+ST_MOVED = "MOVED"
 
 SCHEMA_VERSION = "1"
 
@@ -236,6 +245,7 @@ class VerifyResult:
     source_path: str
     detail: str = ""
     new_hash: str = None
+    dest_verified: bool = False
 
 
 class _Planner:
@@ -559,6 +569,10 @@ def _validate_usage(args):
         errors.append("--verify cannot be combined with --dry-run")
     if args.verify and args.update_changed:
         errors.append("--verify cannot be combined with --update-changed")
+    if args.verify and args.move_orphans:
+        errors.append("--move-orphans cannot be combined with --verify")
+    if args.max_gb < 0:
+        errors.append("--max-gb cannot be negative")
     sources = [os.path.abspath(source) for source in args.source]
     for source in sources:
         if not os.path.isdir(_io(source)):
@@ -604,40 +618,111 @@ def _existing_ancestor(path):
         path = parent
 
 
+def _source_prefixes(planned):
+    prefixes = []
+    for source, base in planned.sources:
+        relative = os.path.relpath(source, base).casefold().rstrip("\\/")
+        prefixes.append("" if relative == "." else relative)
+    return prefixes
+
+
+def _volume_label(root):
+    """The volume label of a drive root ('' on non-Windows or unnamed drives)."""
+    if os.name != "nt":
+        return ""
+    import ctypes
+    buffer = ctypes.create_unicode_buffer(261)
+    ok = ctypes.windll.kernel32.GetVolumeInformationW(
+        ctypes.c_wchar_p(root), buffer, 261, None, None, None, None, 0)
+    return buffer.value if ok else ""
+
+
+def read_backup_id(dest):
+    """The backup_id recorded in <dest>/CATALOG_FOLDER/BACKUP_ID_FILE, or None."""
+    path = os.path.join(os.path.abspath(dest), CATALOG_FOLDER, BACKUP_ID_FILE)
+    try:
+        with open(_io(path), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    value = data.get("backup_id") if isinstance(data, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def _ensure_backup_id(dest, log):
+    """Create the backup identity file on the first copy; return the id."""
+    existing = read_backup_id(dest)
+    if existing:
+        return existing
+    backup_id = uuid.uuid4().hex
+    drive = os.path.splitdrive(os.path.abspath(dest))[0]
+    data = {
+        "backup_id": backup_id,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "label": _volume_label(drive + os.sep) if drive else "",
+        "path": os.path.splitdrive(os.path.abspath(dest))[1].lstrip("\\/"),
+    }
+    folder = os.path.join(os.path.abspath(dest), CATALOG_FOLDER)
+    os.makedirs(_io(folder), exist_ok=True)
+    target = os.path.join(folder, BACKUP_ID_FILE)
+    tmp = target + TEMP_SUFFIX
+    with open(_io(tmp), "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+    os.replace(_io(tmp), _io(target))
+    log.log(f"Backup ID {backup_id} (new)")
+    return backup_id
+
+
 class _Catalog:
-    def __init__(self, dest, create):
+    def __init__(self, dest, create, readonly=False):
         self.dir = os.path.join(os.path.abspath(dest), CATALOG_FOLDER)
         self.path = os.path.join(self.dir, "catalog.sqlite")
-        if not create and not _exists(self.path):
+        if (readonly or not create) and not _exists(self.path):
             raise FileNotFoundError(f"catalog does not exist: {self.path}")
-        if create:
+        if create and not readonly:
             os.makedirs(_io(self.dir), exist_ok=True)
         try:
             self.conn = sqlite3.connect(_io(self.path))
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS files ("
-                "key TEXT PRIMARY KEY, rel TEXT NOT NULL, size INTEGER NOT NULL, "
-                "mtime_ns INTEGER NOT NULL, sha256 TEXT, source_path TEXT NOT NULL, "
-                "copied_at TEXT, verified_at TEXT)")
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
-            row = self.conn.execute(
-                "SELECT v FROM meta WHERE k='schema_version'").fetchone()
-            if row is None:
+            if readonly:
+                try:
+                    row = self.conn.execute(
+                        "SELECT v FROM meta WHERE k='schema_version'").fetchone()
+                except sqlite3.OperationalError as exc:
+                    raise RuntimeError(f"not a photo-backup catalog: {self.path}") from exc
+                if row is None:
+                    raise RuntimeError(f"not a photo-backup catalog: {self.path}")
+                if row[0] != SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"catalog schema_version {row[0]} != {SCHEMA_VERSION}: {self.path}")
+            else:
                 self.conn.execute(
-                    "INSERT OR REPLACE INTO meta(k, v) VALUES('schema_version', ?)",
-                    (SCHEMA_VERSION,))
-                self.conn.commit()
-            elif row[0] != SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"catalog schema_version {row[0]} != {SCHEMA_VERSION}: {self.path}")
+                    "CREATE TABLE IF NOT EXISTS files ("
+                    "key TEXT PRIMARY KEY, rel TEXT NOT NULL, size INTEGER NOT NULL, "
+                    "mtime_ns INTEGER NOT NULL, sha256 TEXT, source_path TEXT NOT NULL, "
+                    "copied_at TEXT, verified_at TEXT)")
+                self.conn.execute(
+                    "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+                row = self.conn.execute(
+                    "SELECT v FROM meta WHERE k='schema_version'").fetchone()
+                if row is None:
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO meta(k, v) VALUES('schema_version', ?)",
+                        (SCHEMA_VERSION,))
+                    self.conn.commit()
+                elif row[0] != SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"catalog schema_version {row[0]} != {SCHEMA_VERSION}: {self.path}")
         except sqlite3.Error as exc:
             raise RuntimeError(f"cannot open catalog {self.path}: {exc}")
 
     def all_rows(self):
         cursor = self.conn.execute(
-            "SELECT key, rel, size, mtime_ns, sha256, source_path FROM files")
+            "SELECT key, rel, size, mtime_ns, sha256, source_path, "
+            "copied_at, verified_at FROM files")
         return [_Row(*row) for row in cursor.fetchall()]
+
+    def delete(self, key):
+        self.conn.execute("DELETE FROM files WHERE key=?", (key,))
 
     def adopt(self, planned):
         """Record an up-to-date destination file. A row whose size/mtime no
@@ -697,6 +782,8 @@ class _Row:
     mtime_ns: int
     sha256: str
     source_path: str
+    copied_at: str = None
+    verified_at: str = None
 
 
 class _Logger:
@@ -741,7 +828,10 @@ def _move_to_versions(dest, stamp, status, log):
     log.log(f"VERSION {status.planned.rel}")
 
 
-def _copy_file(planned, dst, verify):
+def _copy_file(planned, dst, verify, expected_sha256=None, no_clobber=False):
+    """Copy to a temp file next to `dst`, verify, then move it into place.
+    no_clobber: a `dst` that exists at that last step is never replaced
+    (FileExistsError, nothing written) -- the restore's rule."""
     tmp = dst + TEMP_SUFFIX
     os.makedirs(_io(os.path.dirname(dst)), exist_ok=True)
     try:
@@ -762,6 +852,8 @@ def _copy_file(planned, dst, verify):
         stat1 = os.stat(_io(planned.src), follow_symlinks=False)
         if (stat1.st_size, stat1.st_mtime_ns) != (stat0.st_size, stat0.st_mtime_ns):
             raise RuntimeError("source changed during copy")
+        if expected_sha256 is not None and hasher.hexdigest() != expected_sha256:
+            raise RuntimeError("content differs from the catalog sha256 (backup copy corrupt?)")
         shutil.copystat(_io(planned.src), _io(tmp))
         if verify == "size":
             if os.stat(_io(tmp)).st_size != stat0.st_size:
@@ -769,7 +861,16 @@ def _copy_file(planned, dst, verify):
         elif verify == "hash":
             if _sha256_file(tmp) != hasher.hexdigest():
                 raise RuntimeError("hash mismatch after copy")
-        os.replace(_io(tmp), _io(dst))
+        if no_clobber:
+            # Atomic "only if absent": Windows' rename refuses an existing
+            # target; elsewhere a hard link does (rename would overwrite).
+            if os.name == "nt":
+                os.rename(_io(tmp), _io(dst))
+            else:
+                os.link(_io(tmp), _io(dst))
+                os.remove(_io(tmp))
+        else:
+            os.replace(_io(tmp), _io(dst))
         return hasher.hexdigest(), stat0.st_size, stat0.st_mtime_ns
     except BaseException:
         try:
@@ -797,6 +898,193 @@ def _adopt_rows(catalog, statuses):
         if status.status == ST_UP_TO_DATE:
             catalog.adopt(status.planned)
     catalog.commit()
+
+
+def _find_move_candidates(statuses, rows, dest):
+    """NEW statuses whose name+size match a catalogued backup file whose source
+    is gone. Returns {id(status): (status, [row, ...])} — confirmed by hash
+    later. (The plan wrote {id(status): [row, ...]}; the status object travels
+    with its rows because _apply_moves receives only this mapping.)"""
+    planned_keys = {status.planned.rel.casefold() for status in statuses}
+    index = {}
+    for row in rows:
+        if row.key in planned_keys:
+            continue
+        index.setdefault((os.path.basename(row.rel).casefold(), row.size), []).append(row)
+    candidates = {}
+    for status in statuses:
+        if status.status != ST_NEW:
+            continue
+        matches = index.get((os.path.basename(status.planned.rel).casefold(),
+                             status.planned.size))
+        if not matches:
+            continue
+        accepted = []
+        for row in matches:
+            if _exists(row.source_path):
+                continue
+            old = os.path.join(dest, row.rel)
+            try:
+                if os.stat(_io(old), follow_symlinks=False).st_size != row.size:
+                    continue
+            except OSError:
+                continue
+            accepted.append(row)
+        if accepted:
+            candidates[id(status)] = (status, accepted)
+    return candidates
+
+
+def _prune_empty_parents(path, stop, log):
+    """Remove the folders left empty by one of our own moves, from `path` up to
+    (not including) `stop`. This is the only place a folder is removed on the
+    destination — never a file, and never anything inside CATALOG_FOLDER. It
+    stops at the first folder that is not empty."""
+    stop = os.path.abspath(stop)
+    catalog_dir = os.path.join(stop, CATALOG_FOLDER)
+    current = os.path.abspath(path)
+    while True:
+        if os.path.normcase(current) == os.path.normcase(stop):
+            return
+        if _is_under(current, catalog_dir):
+            return
+        parent = os.path.dirname(current)
+        if parent == current:
+            return
+        try:
+            os.rmdir(_io(current))
+        except OSError:
+            return
+        log.log(f"RMDIR {os.path.relpath(current, stop)}")
+        current = parent
+
+
+def _apply_moves(candidates, dest, catalog, log):
+    """Move each confirmed candidate inside the backup; returns
+    (moved, moved_bytes, move_errors, interrupted)."""
+    moved = 0
+    moved_bytes = 0
+    move_errors = 0
+    interrupted = False
+    now = datetime.now().isoformat(timespec="seconds")
+    for status, rows in candidates.values():
+        try:
+            sha_src = _sha256_file(status.planned.src)
+            stat0 = os.stat(_io(status.planned.src), follow_symlinks=False)
+            chosen = None
+            for row in rows:
+                old = os.path.join(dest, row.rel)
+                try:
+                    sha_old = _sha256_file(old)
+                except OSError:
+                    continue
+                if sha_old != sha_src:
+                    continue
+                if row.sha256 is not None and row.sha256 != sha_old:
+                    continue
+                chosen = row
+                break
+            if chosen is None:
+                log.log(f"MOVE REJECTED {status.planned.rel}: content differs")
+                continue
+            new = status.dst
+            if _exists(new):
+                move_errors += 1
+                log.log(f"ERROR MOVE {status.planned.rel}: destination exists")
+                continue
+            old = os.path.join(dest, chosen.rel)
+            old_dir = os.path.dirname(old)
+            os.makedirs(_io(os.path.dirname(new)), exist_ok=True)
+            os.replace(_io(old), _io(new))
+            os.utime(_io(new), ns=(stat0.st_atime_ns, stat0.st_mtime_ns))
+            catalog.delete(chosen.key)
+            catalog.upsert(status.planned, sha_src, stat0.st_size, stat0.st_mtime_ns)
+            catalog.set_verified(status.planned.rel.casefold(), now)
+            status.status = ST_MOVED
+            moved += 1
+            moved_bytes += stat0.st_size
+            log.log(f"MOVE {chosen.rel} -> {status.planned.rel}")
+            _prune_empty_parents(old_dir, dest, log)
+            if moved % 50 == 0:
+                catalog.commit()
+        except KeyboardInterrupt:
+            catalog.commit()
+            return moved, moved_bytes, move_errors, True
+        except Exception as exc:
+            move_errors += 1
+            log.log(f"ERROR MOVE {status.planned.rel}: {exc}")
+    catalog.commit()
+    return moved, moved_bytes, move_errors, interrupted
+
+
+def _find_orphans(rows, statuses, prefixes, used_keys):
+    """Catalogued files under the verified prefixes that are neither planned
+    now nor consumed by a move. Returns [(reason, row), ...]."""
+    planned_keys = {status.planned.rel.casefold() for status in statuses}
+    orphans = []
+    for row in rows:
+        if not _key_under_prefixes(row.key, prefixes):
+            continue
+        if row.key in planned_keys or row.key in used_keys:
+            continue
+        reason = "source_missing" if not _exists(row.source_path) else "not_selected"
+        orphans.append((reason, row))
+    return orphans
+
+
+def _move_orphans(dest, stamp, orphans, catalog, log):
+    """Move source_missing orphans into CATALOG_FOLDER/ORPHANS_FOLDER/<stamp>;
+    never a not_selected one."""
+    target_root = os.path.join(dest, CATALOG_FOLDER, ORPHANS_FOLDER, stamp)
+    moved = 0
+    for reason, row in orphans:
+        if reason != "source_missing":
+            continue
+        src = os.path.join(dest, row.rel)
+        if _exists(src):
+            target = os.path.join(target_root, row.rel)
+            os.makedirs(_io(os.path.dirname(target)), exist_ok=True)
+            os.replace(_io(src), _io(target))
+            catalog.delete(row.key)
+            log.log(f"ORPHAN {row.rel}")
+            _prune_empty_parents(os.path.dirname(src), dest, log)
+            moved += 1
+        else:
+            catalog.delete(row.key)
+            log.log(f"ORPHAN (missing) {row.rel}")
+    catalog.commit()
+    return moved
+
+
+def _folder_rows(to_copy):
+    """(folder, files, bytes) of what will be copied, grouped by top folder:
+    the first rel segment, or the first two when everything shares one."""
+    firsts = {status.planned.rel.split("\\")[0] for status in to_copy}
+    depth = 2 if len(firsts) == 1 and to_copy else 1
+    groups = {}
+    for status in to_copy:
+        parts = status.planned.rel.split("\\")[:-1]
+        folder = "\\".join(parts[:depth]) if parts else ""
+        count, nbytes = groups.get(folder, (0, 0))
+        groups[folder] = (count + 1, nbytes + status.planned.size)
+    return sorted((folder, count, nbytes) for folder, (count, nbytes) in groups.items())
+
+
+def _folder_summary_lines(folder_rows):
+    """The 'to copy by folder' table lines (capped) and how many went to the CSV."""
+    lines = []
+    cumulative = 0
+    width = min(40, max([12] + [len(folder) for folder, _count, _nbytes in folder_rows]))
+    for folder, _count, nbytes in folder_rows:
+        cumulative += nbytes
+        lines.append(f"    {folder:<{width}}{_gb(nbytes):>12}   ({_gb(cumulative)})")
+    more = max(0, len(lines) - SUMMARY_FOLDER_LINES)
+    return lines[:SUMMARY_FOLDER_LINES], more
+
+
+def _orphan_csv_rows(orphans):
+    return [(reason, row.rel, row.size, row.source_path, row.copied_at)
+            for reason, row in orphans]
 
 
 def _copy_all(args, statuses, dest, stamp, catalog, log):
@@ -840,7 +1128,7 @@ def _copy_all(args, statuses, dest, stamp, catalog, log):
 
 
 def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_paths,
-                   dest_error=None):
+                   dest_error=None, extra_lines=()):
     new = [status for status in statuses if status.status == ST_NEW]
     changed = [status for status in statuses if status.status == ST_CHANGED]
     auto = [status for status in changed if _auto_updated(status, args)]
@@ -852,7 +1140,15 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
     ]
     bases = {base for _, base in planned.sources}
     suffix = f"   (base {', '.join(sorted(bases))})" if bases else ""
-    lines.append(f"Destination:  {os.path.abspath(args.dest)}{suffix}")
+    dest = os.path.abspath(args.dest)
+    catalog_path = os.path.join(dest, CATALOG_FOLDER, "catalog.sqlite")
+    if not _exists(catalog_path):
+        id_note = f"   NEW BACKUP (no {CATALOG_FOLDER} here yet)"
+    else:
+        backup_id = read_backup_id(dest)
+        id_note = (f"   backup ID {backup_id[:8]}" if backup_id
+                   else "   backup ID (none yet; created on the next copy)")
+    lines.append(f"Destination:  {dest}{suffix}{id_note}")
     lines.append(f"Sessions: {_num(planned.stats.shoots)}   "
                  f"export folders: {_num(planned.stats.export_folders)}   "
                  f"export formats: {args.export_formats}")
@@ -868,6 +1164,7 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
             parts.append(f"{category} {_num(len(selected))} / "
                          f"{_gb(sum(s.planned.size for s in selected))}")
     lines.append("  " + "   ".join(parts) if parts else "  (nothing to copy)")
+    lines.extend(extra_lines)
     lines.append("Not copied:")
     lines.append(f"  export files filtered (formats / excluded subfolders): "
                  f"{_num(planned.stats.export_filtered + planned.stats.export_excluded)} / "
@@ -898,6 +1195,14 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
 
 def _run_backup(args, log, stamp):
     dest = os.path.abspath(args.dest)
+    if args.expect_backup_id:
+        found = read_backup_id(dest)
+        if found != args.expect_backup_id:
+            print(f"Destination {dest} is not the expected backup "
+                  f"(expected {args.expect_backup_id}, found {found or 'no backup here'})",
+                  file=sys.stderr)
+            log.log("ERROR expected backup ID does not match")
+            return 2
     planned = plan(args)
     for error in planned.errors:
         log.log(error)
@@ -919,9 +1224,55 @@ def _run_backup(args, log, stamp):
         "plan": log.prefix + "_plan.csv",
         "unexported": log.prefix + "_unexported.csv",
         "unmatched": log.prefix + "_unmatched.csv",
+        "orphans_csv": log.prefix + "_orphans.csv",
+        "by_folder_csv": log.prefix + "_by_folder.csv",
     }
+    rows = []
+    candidates = {}
+    try:
+        read_only_catalog = _Catalog(dest, create=False, readonly=True)
+    except (RuntimeError, FileNotFoundError):
+        read_only_catalog = None
+    if read_only_catalog is not None:
+        try:
+            rows = read_only_catalog.all_rows()
+        finally:
+            read_only_catalog.close()
+        if args.detect_moves:
+            candidates = _find_move_candidates(statuses, rows, dest)
+    prefixes = _source_prefixes(planned)
+    tentative_used = set()
+    for _status, matches in candidates.values():
+        tentative_used.update(row.key for row in matches)
+    tentative_orphans = _find_orphans(rows, statuses, prefixes, tentative_used) if rows else []
+    extra_lines = []
+    folder_rows = _folder_rows(to_copy)
+    if len(folder_rows) >= 2:
+        extra_lines.append("  to copy by folder (cumulative):")
+        folder_lines, more = _folder_summary_lines(folder_rows)
+        extra_lines.extend(folder_lines)
+        if more:
+            extra_lines.append(f"    ... {more} more -> {log_paths['by_folder_csv']}")
+    possible = [status for status, _matches in candidates.values()]
+    if possible:
+        extra_lines.append(
+            f"  possible moves: {_num(len(possible))} files / "
+            f"{_gb(sum(status.planned.size for status in possible))} "
+            f"(same name and size as backup files whose source is gone; "
+            f"confirmed by hash before moving)")
+    gone = [row for reason, row in tentative_orphans if reason == "source_missing"]
+    unselected = [row for reason, row in tentative_orphans if reason == "not_selected"]
+    extra_lines.append(
+        f"  orphans (in the backup, not in the source): "
+        f"{_num(len(gone))} files / {_gb(sum(row.size for row in gone))} source gone, "
+        f"{_num(len(unselected))} files / {_gb(sum(row.size for row in unselected))} "
+        f"no longer selected -> {log_paths['orphans_csv']}")
+    if args.move_orphans and args.dry_run:
+        extra_lines.append(
+            f"  --move-orphans: {_num(len(gone))} files would be moved to "
+            f"{os.path.join(dest, CATALOG_FOLDER, ORPHANS_FOLDER, stamp)}")
     for line in _summary_lines(args, planned, statuses, needed, free, margin, fits, log_paths,
-                               dest_error):
+                               dest_error, extra_lines):
         log.out(line)
     read_errors = 1 if planned.errors else 0
     log.csv("_plan.csv", ["action", "category", "size", "mtime", "src", "rel"],
@@ -934,6 +1285,15 @@ def _run_backup(args, log, stamp):
              for folder in planned.unexported_folders])
     log.csv("_unmatched.csv", ["session", "export_file"],
             [(session, path) for session, path in planned.unmatched])
+    cumulative = 0
+    by_folder_csv = []
+    for folder, count, nbytes in folder_rows:
+        cumulative += nbytes
+        by_folder_csv.append((folder, count, nbytes, cumulative))
+    log.csv("_by_folder.csv", ["folder", "files", "bytes", "cumulative_bytes"],
+            by_folder_csv)
+    log.csv("_orphans.csv", ["reason", "rel", "size", "source_path", "copied_at"],
+            _orphan_csv_rows(tentative_orphans))
     for status in statuses:
         if status.status == ST_CHANGED and not _will_copy(status, args):
             log.log(f"SKIP CHANGED {status.planned.rel}")
@@ -980,16 +1340,33 @@ def _run_backup(args, log, stamp):
         print(str(exc), file=sys.stderr)
         log.log(f"ERROR {exc}")
         return 2
+    done = done_bytes = error_count = 0
+    moved = moved_bytes = move_errors = 0
+    interrupted = False
     try:
+        _ensure_backup_id(dest, log)
         _adopt_rows(catalog, statuses)
+        if candidates:
+            moved, moved_bytes, move_errors, interrupted = _apply_moves(
+                candidates, dest, catalog, log)
+        if interrupted:
+            return 130
+        orphans = _find_orphans(catalog.all_rows(), statuses, prefixes, set())
+        log.csv("_orphans.csv", ["reason", "rel", "size", "source_path", "copied_at"],
+                _orphan_csv_rows(orphans))
         done, done_bytes, error_count, interrupted = _copy_all(
             args, statuses, dest, stamp, catalog, log)
+        log.log(f"moved {moved} files / {_gb(moved_bytes)}")
         log.log(f"copied {done} files / {_gb(done_bytes)}; {error_count} errors")
+        if interrupted:
+            return 130
+        if args.move_orphans:
+            moved_orphans = _move_orphans(dest, stamp, orphans, catalog, log)
+            log.log(f"moved {moved_orphans} orphans to "
+                    f"{os.path.join(dest, CATALOG_FOLDER, ORPHANS_FOLDER, stamp)}")
     finally:
         catalog.close()
-    if interrupted:
-        return 130
-    return 1 if error_count or planned.errors else 0
+    return 1 if error_count or move_errors or planned.errors else 0
 
 
 @dataclass
@@ -1010,14 +1387,17 @@ def _verify_row(job, dest, deep):
     # The backup copy is checked BEFORE the source: when the original is gone
     # or changed, the copy may be the only one left, and its health matters most.
     hash_dst = None
+    dest_verified = False
     if deep and row.sha256:
         hash_dst = _sha256_file(dst)
         if hash_dst != row.sha256:
             return VerifyResult("DEST_CORRUPT", row.rel, row.source_path,
                                 "destination sha256 differs from the catalog")
+        dest_verified = True
     if not _exists(row.source_path):
         detail = "source file missing; backup copy hash verified" if hash_dst else "source file missing"
-        return VerifyResult("SOURCE_MISSING", row.rel, row.source_path, detail)
+        return VerifyResult("SOURCE_MISSING", row.rel, row.source_path, detail,
+                            dest_verified=dest_verified)
     source_stat = os.stat(_io(row.source_path), follow_symlinks=False)
     tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
     if (source_stat.st_size != row.size
@@ -1025,23 +1405,25 @@ def _verify_row(job, dest, deep):
         detail = "source size/mtime differ from the catalog"
         if hash_dst:
             detail += "; backup copy hash verified"
-        return VerifyResult("SOURCE_CHANGED", row.rel, row.source_path, detail)
+        return VerifyResult("SOURCE_CHANGED", row.rel, row.source_path, detail,
+                            dest_verified=dest_verified)
     if not deep:
         return VerifyResult("OK", row.rel, row.source_path, "")
     if row.sha256:
         hash_src = _sha256_file(row.source_path)
         if hash_src != row.sha256:
             return VerifyResult("SOURCE_CORRUPT_SUSPECT", row.rel, row.source_path,
-                                "source sha256 differs from the catalog with same size/mtime")
+                                "source sha256 differs from the catalog with same size/mtime",
+                                dest_verified=dest_verified)
     else:
         hash_dst = _sha256_file(dst)
         hash_src = _sha256_file(row.source_path)
         if hash_src == hash_dst:
             return VerifyResult("HASH_FILLED", row.rel, row.source_path,
-                                "hash recorded", new_hash=hash_dst)
+                                "hash recorded", new_hash=hash_dst, dest_verified=True)
         return VerifyResult("DEST_DIFFERS", row.rel, row.source_path,
                             "destination differs from the source (no catalog hash)")
-    return VerifyResult("OK", row.rel, row.source_path, "")
+    return VerifyResult("OK", row.rel, row.source_path, "", dest_verified=dest_verified)
 
 
 def _key_under_prefixes(key, prefixes):
@@ -1056,6 +1438,14 @@ def _run_verify(args, log):
     if not os.path.isdir(_io(dest)):
         print(f"destination does not exist: {dest}", file=sys.stderr)
         return 2
+    if args.expect_backup_id:
+        found = read_backup_id(dest)
+        if found != args.expect_backup_id:
+            print(f"Destination {dest} is not the expected backup "
+                  f"(expected {args.expect_backup_id}, found {found or 'no backup here'})",
+                  file=sys.stderr)
+            log.log("ERROR expected backup ID does not match")
+            return 2
     try:
         catalog = _Catalog(dest, create=False)
     except (RuntimeError, FileNotFoundError) as exc:
@@ -1063,6 +1453,8 @@ def _run_verify(args, log):
         return 2
     deep = args.verify == "full"
     good = {"OK", "HASH_FILLED"}
+    if not deep and args.max_gb > 0:
+        log.log("max-gb ignored (quick verify)")
     try:
         planned = plan(args)
         for error in planned.errors:
@@ -1071,13 +1463,11 @@ def _run_verify(args, log):
             log.log(warning)
         rows = {row.key: row for row in catalog.all_rows()}
         db_keys = set(rows)
-        prefixes = []
-        for source, base in planned.sources:
-            relative = os.path.relpath(source, base).casefold().rstrip("\\/")
-            prefixes.append("" if relative == "." else relative)
+        prefixes = _source_prefixes(planned)
         checked = set()
         results = []
-        jobs = []
+        planned_jobs = []
+        catalog_jobs = []
         for planned_file in planned.files:
             key = planned_file.rel.casefold()
             if key in rows:
@@ -1094,15 +1484,32 @@ def _run_verify(args, log):
                 catalog.adopt(planned_file)
                 db_keys.add(key)
             rows[key] = row
-            jobs.append(_VerifyJob(row, key in db_keys))
+            planned_jobs.append(_VerifyJob(row, key in db_keys))
             checked.add(key)
         for key, row in rows.items():
             if key in checked:
                 continue
             if not _key_under_prefixes(key, prefixes):
                 continue
-            jobs.append(_VerifyJob(row, key in db_keys))
+            catalog_jobs.append(_VerifyJob(row, key in db_keys))
             checked.add(key)
+        deferred = []
+        if deep and args.max_gb > 0:
+            catalog_jobs.sort(key=lambda job: (job.row.verified_at is not None,
+                                               job.row.verified_at or "",
+                                               job.row.copied_at or ""))
+            budget = args.max_gb * 1e9
+            rolling_bytes = 0
+            kept = []
+            for index, job in enumerate(catalog_jobs):
+                if index == 0 or rolling_bytes + job.row.size <= budget:
+                    kept.append(job)
+                    rolling_bytes += job.row.size
+                else:
+                    deferred.extend(catalog_jobs[index:])
+                    break
+            catalog_jobs = kept
+        jobs = planned_jobs + catalog_jobs
         total_bytes = sum(job.row.size for job in jobs if deep)
         done_bytes = 0
         started = time.monotonic()
@@ -1121,6 +1528,8 @@ def _run_verify(args, log):
                     catalog.set_hash_verified(job.row.key, result.new_hash, now)
                 elif result.status == "OK":
                     catalog.set_verified(job.row.key, now)
+                elif result.dest_verified:
+                    catalog.set_verified(job.row.key, now)
         catalog.commit()
         counts = {}
         for result in results:
@@ -1128,6 +1537,12 @@ def _run_verify(args, log):
         summary = f"Verify {args.verify}: {_num(len(results))} files  " + "  ".join(
             f"{status} {_num(counts[status])}" for status in sorted(counts))
         log.out(summary)
+        if deep and args.max_gb > 0:
+            log.out(f"Rolling verify: checked {_num(len(catalog_jobs))} files / "
+                    f"{_gb(sum(job.row.size for job in catalog_jobs))}, "
+                    f"deferred {_num(len(deferred))} files / "
+                    f"{_gb(sum(job.row.size for job in deferred))} "
+                    f"(oldest verification first; the next run continues)")
         if planned.errors:
             log.out(f"Errors: {_num(len(planned.errors))} folders/files could not be read -> {log.path}")
         log.csv("_verify.csv", ["status", "rel", "source_path", "detail"],
@@ -1182,12 +1597,22 @@ def _build_parser():
                         default=AUTO_UPDATE,
                         help="do not update changed edit settings/sidecars "
                              "(AUTO_UPDATE_EXTENSIONS) without --update-changed")
+    parser.add_argument("--no-detect-moves", dest="detect_moves", action="store_false",
+                        default=DETECT_MOVES,
+                        help="copy a moved/renamed file again instead of moving its backup copy")
+    parser.add_argument("--move-orphans", action="store_true",
+                        help="move backup files whose source is gone into the orphans folder")
+    parser.add_argument("--expect-backup-id", default=None, metavar="ID",
+                        help="abort unless the destination holds this backup ID")
     parser.add_argument("--space-margin-gb", type=float, default=SPACE_MARGIN_GB, metavar="N",
                         help="free space kept on the destination (default: %(default)s)")
     parser.add_argument("--dry-run", action="store_true",
                         help="plan and log, copy nothing")
     parser.add_argument("--verify", choices=("quick", "full"), default=None,
                         help="verify an existing backup (no copy)")
+    parser.add_argument("--max-gb", type=float, default=VERIFY_MAX_GB, metavar="N",
+                        help="with --verify full: verify at most N GB, oldest verification "
+                             "first (default: %(default)s = everything)")
     parser.add_argument("--yes", action="store_true",
                         help="do not ask for confirmation")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -1195,6 +1620,10 @@ def _build_parser():
 
 
 def main(argv=None):
+    try:                        # a cp1252 console cannot print the owner's ～ paths
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, OSError):
+        pass
     parser = _build_parser()
     try:
         args = parser.parse_args(argv)

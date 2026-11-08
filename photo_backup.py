@@ -24,12 +24,13 @@ import string
 import subprocess
 import sys
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
     os.path.expanduser("~"), ".photo_backup_config.json")   # remembered choices + presets
 BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "selective_backup.py")
+RESTORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "restore_backup.py")
 VERIFY_MODE = "quick"           # default verify mode offered by the menu: quick | full
 FORMAT_ALTERNATIVES = {         # offered next to the backend's EXPORT_FORMATS default
     "jxl>tif>jpg": "best per photo: the JXL master, else the TIFF, else the JPEG",
@@ -75,6 +76,14 @@ def run_backend(argv):
     """Run selective_backup.py with `argv`; its output goes straight to the console."""
     try:
         return subprocess.run([sys.executable, BACKEND, *argv]).returncode
+    except KeyboardInterrupt:
+        return 130
+
+
+def run_restore(argv):
+    """Run restore_backup.py with `argv`; its output goes straight to the console."""
+    try:
+        return subprocess.run([sys.executable, RESTORE, *argv]).returncode
     except KeyboardInterrupt:
         return 130
 
@@ -174,6 +183,7 @@ def default_session():
         "c1_cache": bool(_setting("COPY_CAPTUREONE_CACHE")),
         "update_changed": False,
         "verify_mode": VERIFY_MODE,
+        "max_gb": _setting("VERIFY_MAX_GB"),
     }
 
 
@@ -200,6 +210,8 @@ def build_argv(session, mode):
         argv.append("--c1-cache")
     if mode == "verify":
         argv += ["--verify", session["verify_mode"]]
+        if session["verify_mode"] == "full":
+            argv += ["--max-gb", str(session["max_gb"])]
     elif mode == "dry-run":
         argv.append("--dry-run")
     else:
@@ -224,16 +236,6 @@ def describe(session):
 
 
 # ---- Drives ------------------------------------------------------------------------------------
-def _volume_label(root):
-    if os.name != "nt":
-        return ""
-    import ctypes
-    buffer = ctypes.create_unicode_buffer(261)
-    ok = ctypes.windll.kernel32.GetVolumeInformationW(
-        ctypes.c_wchar_p(root), buffer, 261, None, None, None, None, 0)
-    return buffer.value if ok else ""
-
-
 def list_drives():
     """(root, label, free, total) of every mounted drive; an empty card reader is skipped
     without a Windows 'no disk' dialog."""
@@ -253,7 +255,7 @@ def list_drives():
                 usage = shutil.disk_usage(root)
             except OSError:
                 continue
-            drives.append((root, _volume_label(root), usage.free, usage.total))
+            drives.append((root, _backend()._volume_label(root), usage.free, usage.total))
     finally:
         kernel32.SetErrorMode(old_mode)
     return drives
@@ -344,6 +346,19 @@ def edit_session(session, verify=False):
         session["verify_mode"] = choose("Verify", [
             ("quick", "sizes and dates only (seconds)"),
             ("full", "re-read and hash both sides (hours on a big backup)")], session["verify_mode"])
+        if session["verify_mode"] == "full":
+            while True:
+                answer = ask("Max GB to verify in this run (0 = everything)", session["max_gb"])
+                try:
+                    value = float(answer)
+                except ValueError:
+                    say("  Type a number >= 0.", "yellow")
+                    continue
+                if value < 0:
+                    say("  Type a number >= 0.", "yellow")
+                    continue
+                session["max_gb"] = value
+                break
     else:
         session["update_changed"] = yes_no(
             "Replace originals/exports that changed since the last backup "
@@ -360,7 +375,11 @@ _EXIT_TEXT = {
 }
 
 
-def backup_flow(config, session=None, preset_name=None):
+def _with_backup_id(argv, backup_id):
+    return argv + ["--expect-backup-id", backup_id] if backup_id else argv
+
+
+def backup_flow(config, session=None, preset_name=None, backup_id=None):
     """Dry-run, then copy after a yes. Returns the backend's exit code of the last step."""
     if session is None:
         last = session_from(config["last"])
@@ -374,7 +393,7 @@ def backup_flow(config, session=None, preset_name=None):
     save_config(config)
 
     title("Step 1/2 - what would be copied (dry-run, nothing is written)")
-    rc = run_backend(build_argv(session, "dry-run"))
+    rc = run_backend(_with_backup_id(build_argv(session, "dry-run"), backup_id))
     if rc == 2:
         say(f"Dry-run: {_EXIT_TEXT[2]}.", "red")
         return rc
@@ -388,20 +407,20 @@ def backup_flow(config, session=None, preset_name=None):
         say("Nothing copied.")
         return 0
     title("Copying")
-    rc = run_backend(build_argv(session, "copy"))
+    rc = run_backend(_with_backup_id(build_argv(session, "copy"), backup_id))
     say(f"Backup: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "green" if rc == 0 else "yellow")
     if preset_name is None and rc in (0, 1):
         offer_preset(config, session, KIND_BACKUP)
     return rc
 
 
-def verify_flow(config, session=None):
+def verify_flow(config, session=None, backup_id=None):
     if session is None:
         session = edit_session(session_from(config["last"]), verify=True)
         config["last"] = session
         save_config(config)
     title(f"Verifying ({session['verify_mode']})")
-    rc = run_backend(build_argv(session, "verify"))
+    rc = run_backend(_with_backup_id(build_argv(session, "verify"), backup_id))
     if rc == 0:
         say("Verify: everything matches.", "green")
     elif rc == 1:
@@ -419,9 +438,34 @@ def offer_preset(config, session, kind):
         return
     if name in config["presets"] and not yes_no(f"Replace the preset '{name}'?", False):
         return
-    config["presets"][name] = dict(session, kind=kind)
+    config["presets"][name] = dict(
+        session, kind=kind, backup_id=_backend().read_backup_id(session["dest"]))
     save_config(config)
     say(f"Saved. Unattended: python photo_backup.py --run-preset \"{name}\"", "green")
+
+
+def _locate_backup(preset):
+    """The destination of a preset: its own path, or the same path on another
+    connected drive when the backup ID matches there. None when not found."""
+    dest = preset.get("dest", "")
+    backup_id = preset.get("backup_id")
+    if not backup_id:
+        return dest
+    if _backend().read_backup_id(dest) == backup_id:
+        return dest
+    rest = os.path.splitdrive(dest)[1].lstrip("\\/")
+    for root, _label, _free, _total in list_drives():
+        candidate = os.path.join(root, rest)
+        if _backend().read_backup_id(candidate) == backup_id:
+            say(f"Backup found on {candidate} (the preset says {dest})")
+            return candidate
+    return None
+
+
+def _backup_not_found(name, preset):
+    backup_id = preset.get("backup_id") or ""
+    say(f"The backup of preset '{name}' (ID {backup_id[:8]}) is not on any connected drive.",
+        "red")
 
 
 def presets_menu(config):
@@ -451,12 +495,95 @@ def presets_menu(config):
         if answer.isdigit() and 1 <= int(answer) <= len(names):
             name = names[int(answer) - 1]
             preset = config["presets"][name]
+            dest = _locate_backup(preset)
+            if dest is None:
+                _backup_not_found(name, preset)
+                continue
             session = session_from(preset)
+            session["dest"] = dest
+            backup_id = preset.get("backup_id")
             say(describe(session))
             if preset.get("kind") == KIND_VERIFY:
-                verify_flow(config, session)
+                verify_flow(config, session, backup_id=backup_id)
             else:
-                backup_flow(config, session, preset_name=name)
+                backup_flow(config, session, preset_name=name, backup_id=backup_id)
+
+
+# ---- Restore -----------------------------------------------------------------------------------
+def _catalog_folder_rows(backup):
+    catalog = _backend()._Catalog(backup, create=False, readonly=True)
+    try:
+        rows = catalog.all_rows()
+    finally:
+        catalog.close()
+    firsts = {row.rel.split("\\")[0] for row in rows}
+    depth = 2 if len(firsts) == 1 and rows else 1
+    groups = {}
+    for row in rows:
+        parts = row.rel.replace("/", "\\").split("\\")[:-1]
+        folder = "\\".join(parts[:depth]) if parts else ""
+        count, nbytes = groups.get(folder, (0, 0))
+        groups[folder] = (count + 1, nbytes + row.size)
+    return sorted(groups.items())
+
+
+def restore_flow(config):
+    title("Restore from a backup")
+    default = config["last"].get("dest", "")
+    while True:
+        backup = ask("Backup folder", default).strip().strip('"')
+        if not backup:
+            say("  Type the backup folder.", "yellow")
+            continue
+        try:
+            folders = _catalog_folder_rows(backup)
+        except (FileNotFoundError, RuntimeError) as exc:
+            say(f"  {exc}", "yellow")
+            continue
+        break
+    total = sum(count for _folder, (count, _bytes) in folders)
+    say(f"  In the backup, by folder ({_backend()._num(total)} files):")
+    for index, (folder, (count, nbytes)) in enumerate(folders, 1):
+        say(f"    [{index}] {folder:<40} {_backend()._gb(nbytes):>10}  ({count} files)")
+    answer = ask("What to restore (a folder from the list or a path inside it; "
+                 "separate several with ';'; Enter = everything)", "")
+    only = []
+    for part in answer.split(";"):
+        part = part.strip().strip('"')
+        if not part:
+            continue
+        if part.isdigit() and 1 <= int(part) <= len(folders):
+            only.append(folders[int(part) - 1][0])
+        else:
+            only.append(part)
+    destination = choose("Where to restore", [
+        ("original", "original place (where each file came from)"),
+        ("folder", "another folder")], "original")
+    argv = ["--backup", backup]
+    for rel in only:
+        argv += ["--only", rel]
+    if destination == "original":
+        argv.append("--to-original")
+    else:
+        to = ask("Folder to restore into").strip().strip('"')
+        while not to:
+            say("  Type a folder.", "yellow")
+            to = ask("Folder to restore into").strip().strip('"')
+        argv += ["--to", to]
+    title("Step 1/2 - what would be restored (dry-run, nothing is written)")
+    rc = run_restore(argv + ["--dry-run"])
+    if rc == 2:
+        say("Restore: stopped before restoring anything (see the message above).", "red")
+        return rc
+    if rc == 130:
+        return rc
+    if not yes_no("Step 2/2 - restore now?", True):
+        say("Nothing restored.")
+        return 0
+    title("Restoring")
+    rc = run_restore(argv + ["--yes"])
+    say(f"Restore: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "green" if rc == 0 else "yellow")
+    return rc
 
 
 def settings_menu(config):
@@ -484,6 +611,7 @@ def interactive():
         say("  [2] Verify a backup")
         say("  [3] Presets")
         say("  [4] Settings")
+        say("  [5] Restore from a backup")
         say("  [0] Exit")
         answer = ask("Choose", "1")
         if answer == "0":
@@ -496,6 +624,8 @@ def interactive():
             presets_menu(config)
         elif answer == "4":
             settings_menu(config)
+        elif answer == "5":
+            restore_flow(config)
 
 
 def run_preset(name):
@@ -507,12 +637,18 @@ def run_preset(name):
         say(f"No preset named '{name}'. Presets: {', '.join(sorted(config['presets'])) or '(none)'}",
             "red")
         return 2
+    dest = _locate_backup(preset)
+    if dest is None:
+        _backup_not_found(name, preset)
+        return 2
     session = session_from(preset)
+    session["dest"] = dest
+    backup_id = preset.get("backup_id")
     say(f"photo-backup preset '{name}' ({preset.get('kind', KIND_BACKUP)})")
     say(describe(session))
     if preset.get("kind") == KIND_VERIFY:
-        return run_backend(build_argv(session, "verify"))
-    return run_backend(build_argv(session, "copy"))
+        return run_backend(_with_backup_id(build_argv(session, "verify"), backup_id))
+    return run_backend(_with_backup_id(build_argv(session, "copy"), backup_id))
 
 
 def main(argv=None):

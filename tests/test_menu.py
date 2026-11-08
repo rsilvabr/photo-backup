@@ -8,7 +8,7 @@ import pytest
 import selective_backup
 import photo_backup as menu
 
-from conftest import build_base_tree, dest_files
+from conftest import argv_for, build_base_tree, dest_files, make_tree
 
 
 @pytest.fixture(autouse=True)
@@ -172,3 +172,68 @@ def test_menu_flags_are_documented():
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
     for flag in ("--run-preset", "--list-presets", "photo_backup.py"):
         assert flag in readme
+
+
+def test_menu_preset_finds_backup_on_another_letter(tmp_path, monkeypatch, menu_config):
+    backup_id = "a" * 32
+    other = tmp_path / "other"
+    found = other / "fake" / "photos" / "backup"
+    (found / "_photo_backup").mkdir(parents=True)
+    (found / "_photo_backup" / "volume.json").write_text(
+        json.dumps({"backup_id": backup_id}), encoding="utf-8")
+    source = tmp_path / "G"
+    source.mkdir()
+    preset = menu.default_session()
+    preset.update({"sources": [str(source)],
+                   "dest": str(Path("C:/fake/photos/backup")), "kind": "backup"})
+    menu_config.write_text(json.dumps(
+        {"last": {}, "presets": {"P": dict(preset, backup_id=backup_id)}}),
+        encoding="utf-8")
+    calls = capture_backend(monkeypatch)
+    monkeypatch.setattr(menu, "list_drives",
+                        lambda: [(str(other) + os.sep, "", 0, 0)])
+    assert menu.main(["--run-preset", "P"]) == 0
+    argv = calls[0]
+    assert argv[argv.index("--dest") + 1] == str(found)
+    assert argv[argv.index("--expect-backup-id") + 1] == backup_id
+    calls.clear()
+    monkeypatch.setattr(menu, "list_drives", lambda: [])
+    menu_config.write_text(json.dumps(
+        {"last": {}, "presets": {"P": dict(preset, backup_id="b" * 32)}}),
+        encoding="utf-8")
+    assert menu.main(["--run-preset", "P"]) == 2
+    assert calls == []
+
+
+def test_menu_rolling_verify_argv():
+    session = menu.default_session()
+    session.update({"sources": ["x"], "dest": "y", "verify_mode": "full", "max_gb": 200.0})
+    argv = menu.build_argv(session, "verify")
+    assert argv[argv.index("--max-gb") + 1] == "200.0"
+    session["verify_mode"] = "quick"
+    assert "--max-gb" not in menu.build_argv(session, "verify")
+
+
+def test_menu_restore_flow(tmp_path, monkeypatch, menu_config):
+    make_tree(tmp_path, {
+        "G/2025/shoot/_DSC1.NEF": 100,
+        "G/2025/shoot/_EXPORT/x/_DSC1_v1.jpg": 50,
+    })
+    source = tmp_path / "G" / "2025"
+    backup = tmp_path / "out"
+    assert selective_backup.main(argv_for(source, backup, tmp_path, "--yes")) == 0
+    calls = []
+
+    def fake_restore(argv):
+        calls.append(list(argv))
+        return 0
+
+    monkeypatch.setattr(menu, "run_restore", fake_restore)
+    script(monkeypatch, ["5", str(backup), "", "1", "y", "0"])
+    assert menu.main([]) == 0
+    assert len(calls) == 2
+    assert "--backup" in calls[0] and "--dry-run" in calls[0]
+    assert "--yes" not in calls[0]
+    assert "--to-original" in calls[0]
+    assert "--yes" in calls[1] and "--dry-run" not in calls[1]
+    assert "--only" not in calls[0]
