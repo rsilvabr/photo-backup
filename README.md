@@ -86,6 +86,9 @@ The first copy writes `_photo_backup\volume.json` with a random backup ID and th
 ### 13. **Skips what jxl-photo can remake** *(v0.5.0)*
 An sRGB or resized JXL that [jxl-photo](https://github.com/rsilvabr/jxl-photo) made from a master is left out when that master is backed up — the copy says so in its own XMP, and anything uncertain is copied. `--derivatives` keeps them. [Details](#jxl-photo-derivatives---derivatives-v050).
 
+### 14. **Keeps what Capture One needs to show your edits** *(v0.6.0)*
+A `.cos` only names its ICC profile, curve and style. The backup also keeps those files, read from where Capture One really has them, plus a double-click restore for a new computer that needs no Python. [Details](#capture-ones-own-files-captureone_backuppy-v060).
+
 ---
 
 ## Scripts
@@ -95,6 +98,7 @@ An sRGB or resized JXL that [jxl-photo](https://github.com/rsilvabr/jxl-photo) m
 | `photo_backup.py` | **Start here.** Interactive menu: back up (dry-run first, then copy), verify, presets, unattended runs, restore. Runs the scripts below for you. |
 | `selective_backup.py` | The selective backup itself, from the command line: plan, copy, catalog, verify. Everything the menu does goes through it. |
 | `restore_backup.py` | Restores files from a backup: under a new folder (`--to`) or to the original places (`--to-original`). It imports the catalog and the copier from `selective_backup.py`, so the catalog format exists in one place only. |
+| `captureone_backup.py` | Backs up, verifies and restores Capture One's own profiles, styles and settings. The menu runs it with every backup. |
 
 The menu never copies anything itself — it runs `selective_backup.py` (or `restore_backup.py`) with the options you confirmed, so every [safety guarantee](#safety-guarantees) holds either way.
 
@@ -128,6 +132,7 @@ python photo_backup.py
   [3] Presets
   [4] Settings
   [5] Restore from a backup
+  [6] Restore Capture One's profiles, styles and settings
   [0] Exit
 ```
 
@@ -137,6 +142,7 @@ python photo_backup.py
 - **[3] Presets**: after a backup the menu offers to save its settings (and the backup's ID) under a name. A preset runs from the menu (dry-run first) or unattended; if the drive letter changed, the menu finds the backup by its ID.
 - **[4] Settings** shows where the remembered choices live (`~/.photo_backup_config.json`, or `$PHOTOBACKUP_CONFIG`) and the defaults of `selective_backup.py`. The menu reads those defaults from `selective_backup.py` itself: edit the top of that file and the menu follows.
 - **[5] Restore** lists the backup's top folders, asks what to restore and where to (the original places or another folder), runs a dry-run and then restores after a yes.
+- **[6] Restore Capture One's…** puts its profiles, styles and settings back; see [Capture One's own files](#capture-ones-own-files-captureone_backuppy-v060).
 
 > **Tip:** The value shown in `[brackets]` is the default — just press Enter to accept it.
 
@@ -324,6 +330,52 @@ listed and copied with `--unexported copy`.
 - Every folder named `NKSC_PARAM` is copied in full.
 - Both are copied without filtering by photo (they are small), for sessions
   and, with `--unexported copy`, for folders without an export.
+
+## Capture One's own files (`captureone_backup.py`) *(v0.6.0)*
+
+The `.cos` files beside your photos hold the edits, but they only **name** the ICC profile, film curve and style they use. On a computer without those files, Capture One shows the edit differently. Every backup from the menu (and every preset) therefore also keeps, in `<destination>\_captureone`:
+
+| Folder in the backup | Where it comes from | What it holds |
+|---|---|---|
+| `UserData` | `%LOCALAPPDATA%\CaptureOne` | your profiles, styles (with the profiles they carry), defaults, presets, recipes, shortcuts, workspaces, plugins, any folder you add |
+| `Preferences` | `%LOCALAPPDATA%\Capture_One` | `user.config` of each version |
+| `Installed` | `Color Profiles` and `Film Curves` of the install folder | the profiles the `.cos` files name, in case a later version drops one |
+| `WindowsColor` | the Windows colour folder | its `.icc`/`.icm` files (export and monitor profiles) |
+
+Left out on purpose: login data and cookies (`MSALCache*`, the WebView folders), the licence file, `Logs`, `Stability`, and the program itself. `WHERE_EACH_FOLDER_GOES.txt` in that folder says where each part came from.
+
+Keep the installer and the serial in a folder inside `%LOCALAPPDATA%\CaptureOne` (`_Instalador` by default): they are copied with the rest.
+
+**On a new computer:**
+
+1. Install Capture One from `_captureone\UserData\_Instalador`.
+2. **Before opening it**, double-click `_captureone\RESTORE_CAPTUREONE.cmd`. It needs no Python, asks Windows for administrator rights and only adds missing files. (Opening Capture One first creates its default recipes, and a file that already exists is never replaced.)
+3. Open Capture One and activate it.
+
+With Python, the same restore checks every file against the catalog:
+
+```console
+python captureone_backup.py --dest H:\BACKUP [--dry-run] [--yes]
+python captureone_backup.py --verify H:\BACKUP
+python captureone_backup.py --restore-from H:\BACKUP [--dry-run] [--yes]
+python captureone_backup.py --restore-from H:\BACKUP --also _Instalador --also Preferences --to D:\Out
+```
+
+| Option | Meaning |
+|---|---|
+| `--dest PATH` | back up to `PATH\_captureone` |
+| `--verify PATH` | re-read and hash the backup under `PATH` |
+| `--restore-from PATH` | restore from the backup under `PATH` |
+| `--also NAME` | restore this part too: `Preferences`, or a folder of `UserData` (`_Instalador`, `Batch*`); repeatable |
+| `--to PATH` | restore under `PATH` instead of the original places |
+| `--install-folder PATH` | Capture One's install folder (default: read from Windows) |
+| `--space-margin-gb N` | free space kept on the target drive |
+| `--dry-run` | plan and report, write nothing |
+| `--yes` | do not ask for confirmation |
+
+A restore brings back the profiles, styles, defaults, presets, recipes, shortcuts and workspaces, plus any missing file of `Installed` and `WindowsColor`. The batch queue, `ImageCore`, plugins, `Preferences` and your own folders stay in the backup unless you name them with `--also`. It refuses to run while Capture One is open, and reports what needs an administrator instead of failing half-way. As everywhere in this tool, nothing in the backup is deleted: the old copy of a file that really changed goes to the versions folder.
+
+The settings are at the top of `captureone_backup.py`; `COPY_CAPTUREONE_SETTINGS` at the top of `photo_backup.py` turns the step off.
 
 ## Re-runs, changed files and the versions folder
 
@@ -640,12 +692,10 @@ Japanese file names.
 
 ## Current version
 
-**v0.5.0** (2026-11-08).
+**v0.6.0** (2026-11-08).
 
-- The sRGB/resized JXL copies jxl-photo makes from a master are no longer backed up when that master is: they say so in their own XMP, and the master remakes them. `--derivatives` copies them anyway.
-- `DSC_0001 (2)` gets its own export formats when an original with that name is beside the export, instead of being taken for `DSC_0001` (a JPEG of it could be dropped because `DSC_0001` had a JXL). Its originals still bring `DSC_0001` along, as before.
-
-Compared file by file with v0.4.0 on a 1.6 TB archive: only the derivatives leave the plan; no original is dropped.
+- Every backup from the menu also keeps what Capture One needs to show your edits: the ICC profiles, styles, defaults and settings, read from where it really has them. About 1.8 GB.
+- On a new computer, install Capture One and double-click `RESTORE_CAPTUREONE.cmd` in the backup. It needs no Python and never overwrites a file. [Details](#capture-ones-own-files-captureone_backuppy-v060).
 
 **106 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
 
@@ -653,7 +703,8 @@ Compared file by file with v0.4.0 on a 1.6 TB archive: only the derivatives leav
 
 | Version | Date | What it added |
 |---------|------|---------------|
-| **v0.5.0** | 2026-11-08 | Leaves out the sRGB/resized JXL copies jxl-photo made from a master that is backed up; `DSC_0001 (2)` treated as its own photo |
+| **v0.6.0** | 2026-11-08 | Keeps Capture One's own profiles, styles and settings; double-click restore for a new computer |
+| v0.5.0 | 2026-11-08 | Leaves out the sRGB/resized JXL copies jxl-photo made from a master that is backed up; `DSC_0001 (2)` treated as its own photo |
 | v0.4.0 | 2026-11-08 | Renamed folders moved instead of copied again; orphans listed; a backup ID per disk; verify in slices; `restore_backup.py` |
 | v0.3.0 | 2026-10-07 | The interactive menu (dry-run first, then the copy after a yes) and unattended presets |
 | v0.2.0 | 2026-10-07 | First release: exported photos with their originals and edits, SHA-256 catalog, verify, space check |

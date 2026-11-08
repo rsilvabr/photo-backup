@@ -28,6 +28,17 @@ from the command line. A future job (e.g. a full mirror) is a new
   `--to-original`). A backend may import the catalog and the copier from
   `selective_backup.py` (`import selective_backup as sb`); never duplicate
   the catalog format or the copy routine — they exist once.
+- `captureone_backup.py` — keeps what Capture One itself holds (profiles,
+  styles, defaults, ...) in `<dest>\_captureone`, a backup root with its own
+  catalog, so `selective_backup.py`'s orphan logic never sees those rows. Rows
+  are `<label>\<rest>` and the restore resolves the label on the CURRENT
+  machine (a new PC has another user name). Numbered folders change with
+  Capture One versions (`Styles50`, `Recipes165`): never name one exactly,
+  use the `*` patterns in its settings. Login data, cookies and the licence
+  stay out. `RESTORE_CAPTUREONE.cmd` is generated into the backup for a PC
+  without Python: robocopy `/XC /XN /XO` only, no `call` and no `( )` block
+  around a path (both break on `%`/`)` in the backup's path). Tests point
+  `PHOTOBACKUP_C1_*` (conftest) away from the real Capture One folders.
 
 ## Safety rules (these are the product)
 - **The source is READ-ONLY.** No code path may open a source file for

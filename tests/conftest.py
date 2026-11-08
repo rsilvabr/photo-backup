@@ -16,6 +16,12 @@ def photobackup_log_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("PHOTOBACKUP_LOG_DIR", str(log_dir))
     monkeypatch.setattr(selective_backup, "LOG_DIR", str(log_dir))
     log_dir.mkdir(parents=True, exist_ok=True)
+    # No test may ever read the real Capture One folders of this computer.
+    empty = tmp_path / "no_capture_one"
+    empty.mkdir(exist_ok=True)
+    monkeypatch.setenv("PHOTOBACKUP_C1_LOCALAPPDATA", str(empty))
+    monkeypatch.setenv("PHOTOBACKUP_C1_INSTALL", str(empty / "install"))
+    monkeypatch.setenv("PHOTOBACKUP_C1_WINDOWS_COLOR", str(empty / "color"))
     return log_dir
 
 

@@ -9,13 +9,41 @@ releases are also published as
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **[v0.5.0](#v050)** | 2026-11-08 | Leaves out what jxl-photo can make again: an sRGB/resized JXL copy is not backed up when its master is. `DSC_0001 (2)` is treated as its own photo |
+| **[v0.6.0](#v060)** | 2026-11-08 | Keeps what Capture One needs to show your edits on another computer: profiles, styles, defaults and settings, with a double-click restore |
+| [v0.5.0](#v050) | 2026-11-08 | Leaves out what jxl-photo can make again: an sRGB/resized JXL copy is not backed up when its master is. `DSC_0001 (2)` is treated as its own photo |
 | [v0.4.0](#v040) | 2026-11-08 | A renamed folder is moved inside the backup instead of copied again; orphans listed; each backup knows which disk it is; verify a big backup in slices; restore files from a backup |
 | [v0.3.0](#v030) | 2026-10-07 | An interactive menu: questions, a dry-run, then the copy after a yes; presets that run unattended |
 | [v0.2.0](#v020) | 2026-10-07 | First release: back up the exported photos with their originals and edits, a SHA-256 catalog, verify, a space check before copying |
 | v0.1.0 | 2026-10-06 | First implementation, not released |
 
 `mobile_backup.py` has its own version: [see the end of this page](#mobile_backuppy).
+
+---
+
+## v0.6.0
+
+**Released 2026-11-08.** Nothing to do when upgrading: existing presets and the
+menu start keeping these files on their next backup
+(`COPY_CAPTUREONE_SETTINGS` at the top of `photo_backup.py` turns it off).
+
+- **`captureone_backup.py` keeps what the edits depend on.** A `.cos` file only
+  names its ICC profile, film curve and style. The script copies them from
+  where Capture One really has them into `<destination>\_captureone`, with its
+  own catalog: everything in `%LOCALAPPDATA%\CaptureOne` and `Capture_One`
+  except login data, cookies, the licence file and logs; the install folder's
+  `Color Profiles` and `Film Curves`; the `.icc`/`.icm` files of the Windows
+  colour folder. A folder you add there, for the installer and serial, comes
+  along. `WHERE_EACH_FOLDER_GOES.txt` says where each part came from.
+- **A new computer needs no Python.** `RESTORE_CAPTUREONE.cmd`, written into
+  the backup, asks for administrator rights and only adds missing files. With
+  Python, `--restore-from` does the same and checks each file against the
+  catalog; `--also` brings back what a restore leaves alone by default (batch
+  queue, plugins, preferences, your own folders).
+- `--verify` re-hashes this backup; the menu's verify includes it, and item
+  `[6]` restores it.
+- As in the rest of the tool, the sources are read-only, nothing in the backup
+  is deleted (a file that really changed keeps its old copy in the versions
+  folder) and a restore never overwrites a file.
 
 ---
 

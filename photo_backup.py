@@ -24,13 +24,15 @@ import string
 import subprocess
 import sys
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
     os.path.expanduser("~"), ".photo_backup_config.json")   # remembered choices + presets
 BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "selective_backup.py")
 RESTORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "restore_backup.py")
+CAPTUREONE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captureone_backup.py")
+COPY_CAPTUREONE_SETTINGS = True # every backup also keeps Capture One's profiles, styles and settings
 VERIFY_MODE = "quick"           # default verify mode offered by the menu: quick | full
 FORMAT_ALTERNATIVES = {         # offered next to the backend's EXPORT_FORMATS default
     "jxl>tif>jpg": "best per photo: the JXL master, else the TIFF, else the JPEG",
@@ -72,6 +74,20 @@ def _setting(name):
     return getattr(_backend(), name)
 
 
+_CAPTUREONE_MODULE = None
+
+
+def _captureone_setting(name):
+    """A setting of captureone_backup.py, read from the script itself."""
+    global _CAPTUREONE_MODULE
+    if _CAPTUREONE_MODULE is None:
+        spec = importlib.util.spec_from_file_location("captureone_backup", CAPTUREONE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _CAPTUREONE_MODULE = module
+    return getattr(_CAPTUREONE_MODULE, name)
+
+
 def run_backend(argv):
     """Run selective_backup.py with `argv`; its output goes straight to the console."""
     try:
@@ -84,6 +100,14 @@ def run_restore(argv):
     """Run restore_backup.py with `argv`; its output goes straight to the console."""
     try:
         return subprocess.run([sys.executable, RESTORE, *argv]).returncode
+    except KeyboardInterrupt:
+        return 130
+
+
+def run_captureone(argv):
+    """Run captureone_backup.py with `argv`; its output goes straight to the console."""
+    try:
+        return subprocess.run([sys.executable, CAPTUREONE, *argv]).returncode
     except KeyboardInterrupt:
         return 130
 
@@ -182,6 +206,7 @@ def default_session():
         "unexported": _setting("UNEXPORTED"),
         "c1_cache": bool(_setting("COPY_CAPTUREONE_CACHE")),
         "derivatives": bool(_setting("COPY_JXLPHOTO_DERIVATIVES")),
+        "captureone": bool(COPY_CAPTUREONE_SETTINGS),
         "update_changed": False,
         "verify_mode": VERIFY_MODE,
         "max_gb": _setting("VERIFY_MAX_GB"),
@@ -236,6 +261,8 @@ def describe(session):
         f"Replace changed originals/exports: {'yes' if session['update_changed'] else 'no'}",
         "  jxl-photo derivatives of a copied master: "
         + ("copy" if session["derivatives"] else "skip (COPY_JXLPHOTO_DERIVATIVES)"),
+        "  Capture One profiles, styles and settings: "
+        + ("copy" if session["captureone"] else "skip (COPY_CAPTUREONE_SETTINGS)"),
     ]
     return "\n".join(lines)
 
@@ -384,6 +411,27 @@ def _with_backup_id(argv, backup_id):
     return argv + ["--expect-backup-id", backup_id] if backup_id else argv
 
 
+def captureone_step(session, mode):
+    """Keep Capture One's own files in the same backup. mode: 'dry-run' or 'copy'."""
+    if not session["captureone"]:
+        return 0
+    title("Capture One profiles, styles and settings")
+    rc = run_captureone(["--dest", session["dest"], "--dry-run" if mode == "dry-run" else "--yes"])
+    if rc != 0:
+        say(f"Capture One: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "yellow")
+    return rc
+
+
+def captureone_verify_step(session):
+    """Verify Capture One's files too, when this backup holds them."""
+    if not session["captureone"]:
+        return 0
+    if not os.path.isdir(os.path.join(session["dest"], _captureone_setting("BACKUP_SUBFOLDER"))):
+        return 0
+    title("Verifying the Capture One files")
+    return run_captureone(["--verify", session["dest"]])
+
+
 def backup_flow(config, session=None, preset_name=None, backup_id=None):
     """Dry-run, then copy after a yes. Returns the backend's exit code of the last step."""
     if session is None:
@@ -404,6 +452,7 @@ def backup_flow(config, session=None, preset_name=None, backup_id=None):
         return rc
     if rc == 130:
         return rc
+    captureone_step(session, "dry-run")
     if rc == 1:
         say("Some folders or files could not be read: they would NOT be backed up (see the log).", "yellow")
         if not yes_no("Copy the rest anyway?", False):
@@ -413,6 +462,8 @@ def backup_flow(config, session=None, preset_name=None, backup_id=None):
         return 0
     title("Copying")
     rc = run_backend(_with_backup_id(build_argv(session, "copy"), backup_id))
+    if rc in (0, 1):
+        rc = max(rc, 1 if captureone_step(session, "copy") else 0)
     say(f"Backup: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "green" if rc == 0 else "yellow")
     if preset_name is None and rc in (0, 1):
         offer_preset(config, session, KIND_BACKUP)
@@ -426,6 +477,8 @@ def verify_flow(config, session=None, backup_id=None):
         save_config(config)
     title(f"Verifying ({session['verify_mode']})")
     rc = run_backend(_with_backup_id(build_argv(session, "verify"), backup_id))
+    if rc in (0, 1):
+        rc = max(rc, 1 if captureone_verify_step(session) else 0)
     if rc == 0:
         say("Verify: everything matches.", "green")
     elif rc == 1:
@@ -591,6 +644,31 @@ def restore_flow(config):
     return rc
 
 
+def captureone_restore_flow(config):
+    title("Restore Capture One's profiles, styles and settings")
+    say("  Close Capture One first. Nothing that already exists is overwritten.")
+    backup = ask("Backup folder", config["last"].get("dest", "")).strip().strip('"')
+    if not backup:
+        return 0
+    say("  Also restore (optional, separated with ';'): _Instalador, Preferences, a folder like Batch*.")
+    extras = [part.strip() for part in ask("Also restore", "").split(";") if part.strip()]
+    argv = ["--restore-from", backup]
+    for name in extras:
+        argv += ["--also", name]
+    title("Step 1/2 - what would be restored (dry-run, nothing is written)")
+    rc = run_captureone(argv + ["--dry-run"])
+    if rc in (2, 130):
+        say(f"Restore: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "red")
+        return rc
+    if not yes_no("Step 2/2 - restore now?", True):
+        say("Nothing restored.")
+        return 0
+    title("Restoring")
+    rc = run_captureone(argv + ["--yes"])
+    say(f"Restore: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "green" if rc == 0 else "yellow")
+    return rc
+
+
 def settings_menu(config):
     title("Settings")
     say(f"  Remembered choices and presets: {CONFIG_PATH}")
@@ -618,6 +696,7 @@ def interactive():
         say("  [3] Presets")
         say("  [4] Settings")
         say("  [5] Restore from a backup")
+        say("  [6] Restore Capture One's profiles, styles and settings")
         say("  [0] Exit")
         answer = ask("Choose", "1")
         if answer == "0":
@@ -632,6 +711,8 @@ def interactive():
             settings_menu(config)
         elif answer == "5":
             restore_flow(config)
+        elif answer == "6":
+            captureone_restore_flow(config)
 
 
 def run_preset(name):
@@ -653,8 +734,14 @@ def run_preset(name):
     say(f"photo-backup preset '{name}' ({preset.get('kind', KIND_BACKUP)})")
     say(describe(session))
     if preset.get("kind") == KIND_VERIFY:
-        return run_backend(_with_backup_id(build_argv(session, "verify"), backup_id))
-    return run_backend(_with_backup_id(build_argv(session, "copy"), backup_id))
+        rc = run_backend(_with_backup_id(build_argv(session, "verify"), backup_id))
+        if rc in (0, 1):
+            rc = max(rc, 1 if captureone_verify_step(session) else 0)
+        return rc
+    rc = run_backend(_with_backup_id(build_argv(session, "copy"), backup_id))
+    if rc in (0, 1):
+        rc = max(rc, 1 if captureone_step(session, "copy") else 0)
+    return rc
 
 
 def main(argv=None):
