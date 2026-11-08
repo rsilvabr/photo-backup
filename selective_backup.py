@@ -18,15 +18,17 @@ import csv
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
+import struct
 import sys
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -52,6 +54,14 @@ ANCHOR_EXTENSIONS = RAW_EXTENSIONS + (".jpg", ".jpeg", ".tif", ".tiff", ".png",
 SIDECAR_EXTENSIONS = (".xmp", ".dop", ".pp3")   # copied with an unselected RAW under --unselected raw
 NAME_SEPARATORS = "_-. ("           # a key must be followed by one of these in a longer name
 UNSELECTED = "skip"                 # default --unselected: skip | raw | all
+
+# ---- jxl-photo derivatives -------------------------------------------------------
+COPY_JXLPHOTO_DERIVATIVES = False   # default for --derivatives: a JXL that jxl-photo derived from a
+                                    # master (an sRGB/mobile copy) is skipped when that photo's master
+                                    # is copied in the same run; it can be made again from the master
+DERIVATIVE_TOKEN = "jxlphoto-derived:"   # XMP dc:Relation token of a jxl-photo derivative
+MASTER_TOKEN = "jxlphoto-src:"           # ... and of a master (derivatives never carry it)
+XMP_SCAN_LIMIT_MB = 4               # boxes read before the codestream at most, per JXL
 
 # ---- Editor folders ---------------------------------------------------------
 CAPTUREONE_FOLDER_NAMES = "CaptureOne"       # ';'-separated (any case)
@@ -136,6 +146,85 @@ def _candidate_prefixes(stem):
     return out
 
 
+_DUP_COUNTER = re.compile(r" \(\d+\)")   # Windows' duplicate counter: "DSC_0001 (2)"
+_DUP_KEY = re.compile(r"^(.*) \(\d+\)$")
+
+
+def _source_keys(selected_keys):
+    """The keys whose originals are copied: the selected ones plus, for a key
+    with a duplicate counter, the name without it. '0005 (2)' is often a
+    rescan of the same film frame as '0005' (both were copied before v0.5.0);
+    for two camera photos it only copies one original more -- never fewer."""
+    keys = set(selected_keys)
+    for key in selected_keys:
+        match = _DUP_KEY.match(key)
+        if match:
+            keys.add(match.group(1))
+    return keys
+
+
+def _match_key(stem, anchors):
+    """The photo key of an export stem: its shortest prefix that is an original
+    beside the export, extended by a duplicate counter when that longer name is
+    an original too ('DSC_0001 (2)_v1' -> 'dsc_0001 (2)', not 'dsc_0001',
+    when both DSC_0001 and DSC_0001 (2) are there). None when nothing matches."""
+    for prefix in _candidate_prefixes(stem):
+        if prefix.casefold() in anchors:
+            counter = _DUP_COUNTER.match(stem, len(prefix))
+            if counter and stem[:counter.end()].casefold() in anchors:
+                return stem[:counter.end()].casefold()
+            return prefix.casefold()
+    return None
+
+
+_JXL_CONTAINER = b"\x00\x00\x00\x0cJXL \r\n\x87\n"
+
+
+def _jxl_role(path):
+    """'derivative', 'master' or None for a .jxl, from the jxl-photo tokens in
+    its XMP box. Only positive evidence counts: a bare codestream, a
+    compressed (brob) or missing XMP box, both tokens, a read error -> None."""
+    limit = XMP_SCAN_LIMIT_MB * 1024 * 1024
+    try:
+        with open(_io(path), "rb") as handle:
+            if handle.read(12) != _JXL_CONTAINER:
+                return None
+            pos = 12
+            size = os.fstat(handle.fileno()).st_size
+            while pos < min(size, limit):
+                handle.seek(pos)
+                header = handle.read(16)
+                if len(header) < 8:
+                    return None
+                length, kind = struct.unpack(">I4s", header[:8])
+                head = 8
+                if length == 1:
+                    if len(header) < 16:
+                        return None
+                    length = struct.unpack(">Q", header[8:16])[0]
+                    head = 16
+                elif length == 0:
+                    length = size - pos
+                if length < head or kind in (b"jxlc", b"jxlp"):
+                    return None
+                if kind == b"xml ":
+                    if length > limit:
+                        return None
+                    handle.seek(pos + head)
+                    xmp = handle.read(length - head)
+                    derived = DERIVATIVE_TOKEN.encode() in xmp
+                    master = MASTER_TOKEN.encode() in xmp
+                    if derived and not master:
+                        return "derivative"
+                    if master and not derived:
+                        return "master"
+                    return None
+                pos += length
+    except OSError:
+        return None
+    return None
+
+
 def _parse_formats(spec):
     """Return (mode, groups); mode is 'all', 'fallback' (a>b>c) or 'multi' (a+b)."""
     text = spec.strip().casefold().replace(" ", "")
@@ -198,6 +287,8 @@ class Stats:
     inside_shoot_skipped_bytes: int = 0
     c1_cache_skipped: int = 0
     c1_cache_skipped_bytes: int = 0
+    derivatives_skipped: int = 0
+    derivatives_skipped_bytes: int = 0
     skipped_links: int = 0
     scan_errors: int = 0
 
@@ -272,6 +363,30 @@ class _Planner:
         self.unexported_mode = args.unexported
         self.base = os.path.abspath(args.base) if args.base else None
         self.formats = _parse_formats(args.export_formats)
+        self.copy_derivatives = bool(args.derivatives)
+
+    def _drop_derivatives(self, chosen):
+        """Remove the jxl-photo derivatives of a photo whose master is chosen
+        too. Only photos with two or more chosen .jxl are read at all."""
+        if self.copy_derivatives:
+            return chosen
+        jxl_by_key = {}
+        for rec in chosen:
+            if rec[1] == ".jxl" and not rec[0].startswith("?"):
+                jxl_by_key.setdefault(rec[0], []).append(rec)
+        dropped = set()
+        for key, recs in jxl_by_key.items():
+            if len(recs) < 2:
+                continue
+            roles = {id(rec): _jxl_role(rec[2]) for rec in recs}
+            if "master" not in roles.values():
+                continue
+            for rec in recs:
+                if roles[id(rec)] == "derivative":
+                    dropped.add(id(rec))
+                    self.stats.derivatives_skipped += 1
+                    self.stats.derivatives_skipped_bytes += rec[3]
+        return [rec for rec in chosen if id(rec) not in dropped]
 
     def _is_export_name(self, name):
         folded = name.casefold()
@@ -435,21 +550,18 @@ class _Planner:
         records = []
         for fpath, size, mtime_ns in collected:
             stem, ext = os.path.splitext(os.path.basename(fpath))
-            key = None
-            for prefix in _candidate_prefixes(stem):
-                if prefix.casefold() in anchors:
-                    key = prefix.casefold()
-                    break
+            key = _match_key(stem, anchors)
             if key is None:
                 key = "?" + stem.casefold()
                 self.unmatched.append((path, fpath))
             records.append((key, ext.casefold(), fpath, size, mtime_ns))
-        chosen = self._apply_formats(records)
+        chosen = self._drop_derivatives(self._apply_formats(records))
         selected_keys = set()
         for key, _, fpath, size, mtime_ns in chosen:
             self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns, CAT_EXPORT))
             if not key.startswith("?"):
                 selected_keys.add(key)
+        selected_keys = _source_keys(selected_keys)
         unselected_raw_stems = set()
         for name, _, _, _ in files:
             stem, ext = os.path.splitext(name)
@@ -1172,6 +1284,10 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
     lines.append(f"  unselected originals: {_num(planned.stats.unselected_skipped)} / "
                  f"{_gb(planned.stats.unselected_skipped_bytes)}      "
                  f"Capture One cache: {_gb(planned.stats.c1_cache_skipped_bytes)}")
+    if planned.stats.derivatives_skipped:
+        lines.append(f"  jxl-photo derivatives (their master is copied; --derivatives copies them): "
+                     f"{_num(planned.stats.derivatives_skipped)} / "
+                     f"{_gb(planned.stats.derivatives_skipped_bytes)}")
     lines.append(f"  inside sessions (_OUTTAKES, OLD_TIFFs, ...): "
                  f"{_num(planned.stats.inside_shoot_skipped)} / "
                  f"{_gb(planned.stats.inside_shoot_skipped_bytes)}")
@@ -1587,6 +1703,9 @@ def _build_parser():
                         help="folders without an export (default: %(default)s)")
     parser.add_argument("--c1-cache", action="store_true", default=COPY_CAPTUREONE_CACHE,
                         help="also copy the Capture One Cache folders")
+    parser.add_argument("--derivatives", action="store_true", default=COPY_JXLPHOTO_DERIVATIVES,
+                        help="also copy the JXLs jxl-photo derived from a master that is copied "
+                             "(sRGB/mobile copies; skipped by default, the master remakes them)")
     parser.add_argument("--exclude-folders", default=EXCLUDE_FOLDERS, metavar="NAMES",
                         help="';'-separated folder names skipped anywhere")
     parser.add_argument("--verify-copy", choices=("none", "size", "hash"), default=VERIFY_COPY,

@@ -83,6 +83,9 @@ The first copy writes `_photo_backup\volume.json` with a random backup ID and th
 ### 12. **Restore** *(v0.4.0)*
 `restore_backup.py` copies files back from a backup — under a new folder or to the original places — never overwriting anything and never writing to the backup. [Details](#restoring).
 
+### 13. **Skips what jxl-photo can remake** *(v0.5.0)*
+An sRGB or resized JXL that [jxl-photo](https://github.com/rsilvabr/jxl-photo) made from a master is left out when that master is backed up — the copy says so in its own XMP, and anything uncertain is copied. `--derivatives` keeps them. [Details](#jxl-photo-derivatives---derivatives-v050).
+
 ---
 
 ## Scripts
@@ -212,6 +215,13 @@ right before a separator (`_`, `-`, `.`, space, `(`) and equals an anchor:
   both originals are copied.
 - `DSC_9360x.jpg` with `DSC_936` beside it does NOT match: the character
   after `DSC_936` is `0`, not a separator.
+- Windows' duplicate counter is part of the name *(v0.5.0)*:
+  `DSC_0001 (2)_sRGB.jpg` with both `DSC_0001.NEF` and `DSC_0001 (2).NEF`
+  beside it → key `DSC_0001 (2)`, not `DSC_0001`, so the export formats are
+  chosen for that photo alone. (With only `DSC_0001.NEF` there, the key stays
+  `DSC_0001`.) The originals of `DSC_0001 (2)` still bring `DSC_0001` along:
+  a film rescan `0005 (2).tif` is often the same frame as `0005.tif`, and a
+  backup copies one original too many rather than one too few.
 
 The keys of an export file that has no matching original are recorded as
 `?<stem>` and listed in `_unmatched.csv`; such files are still copied (film
@@ -251,6 +261,30 @@ Format groups (`FORMAT_GROUPS` in the script):
 | `heic` | `.heic`, `.heif`, `.hif` |
 | `psd` | `.psd`, `.psb` |
 | `dng` | `.dng` |
+
+## jxl-photo derivatives (`--derivatives`) *(v0.5.0)*
+
+[jxl-photo](https://github.com/rsilvabr/jxl-photo) makes copies of a JXL
+master — an sRGB JXL, a resized or sharpened JXL — and writes
+`jxlphoto-derived:<recipe>` into each copy's XMP; the master carries
+`jxlphoto-src:` instead. Such a copy can be made again from the master, so by
+default it is **not** backed up when the master of the same photo is copied in
+the same run (the same reasoning as the Capture One `Cache`).
+
+The rule, per photo, never on a guess:
+
+1. the JXL's own XMP says `jxlphoto-derived:` (and not `jxlphoto-src:`), and
+2. a JXL of the same photo (same key) that says `jxlphoto-src:` is selected
+   in this run.
+
+Anything else is copied: a JXL without a container or without XMP, a
+compressed (`brob`) XMP box, a lossless JPEG → JXL archive (it carries no
+token), a derivative whose master is excluded or missing, a file that cannot
+be read. Only photos with two or more selected `.jxl` are read, and only the
+boxes before the image data (a few KB per file). The summary counts what was
+left out: `jxl-photo derivatives (their master is copied ...)`.
+
+`--derivatives` (or `COPY_JXLPHOTO_DERIVATIVES = True`) copies them anyway.
 
 ## Originals that were not exported (`--unselected`)
 
@@ -500,6 +534,7 @@ selective_backup.py --source PATH [--source PATH ...] --dest PATH [options]
 | `--unselected {skip,raw,all}` | originals of photos that were not exported (default `skip`) |
 | `--unexported {skip,copy}` | folders without an export (default `skip`) |
 | `--c1-cache` | also copy the Capture One `Cache` folders |
+| `--derivatives` | also copy the JXLs jxl-photo derived from a master that is copied ([details](#jxl-photo-derivatives---derivatives-v050)) |
 | `--exclude-folders NAMES` | `;`-separated folder names skipped anywhere |
 | `--verify-copy {none,size,hash}` | verification of each copy (default `hash`) |
 | `--update-changed` | move a changed destination file to the versions folder before copying the new one |
@@ -539,6 +574,9 @@ default everywhere.
 | `CAPTUREONE_FOLDER_NAMES` | `CaptureOne` | `;`-separated Capture One folder names |
 | `CAPTUREONE_CACHE_NAMES` | `Cache` | `;`-separated subfolders of a Capture One folder skipped by default |
 | `COPY_CAPTUREONE_CACHE` | `False` | default for `--c1-cache` |
+| `COPY_JXLPHOTO_DERIVATIVES` | `False` | default for `--derivatives` |
+| `DERIVATIVE_TOKEN` / `MASTER_TOKEN` | `jxlphoto-derived:` / `jxlphoto-src:` | the XMP tokens jxl-photo writes into a derivative / a master |
+| `XMP_SCAN_LIMIT_MB` | `4` | the boxes read before the image data, at most, per JXL |
 | `NXSTUDIO_FOLDER_NAMES` | `NKSC_PARAM` | `;`-separated NX Studio folder names |
 | `UNEXPORTED` | `skip` | default `--unexported` |
 | `EXCLUDE_FOLDERS` | (empty) | `;`-separated folder names skipped anywhere |
@@ -602,17 +640,20 @@ Japanese file names.
 
 ## Current version
 
-**v0.4.0** (2026-11-08).
+**v0.5.0** (2026-11-08).
 
-- Moved/renamed folders are moved inside the backup instead of copied again; orphans are reported and `--move-orphans` parks the ones whose source is gone.
-- `_photo_backup\volume.json` identifies the backup; `--expect-backup-id`, and presets find the disk even when the letter changed.
-- `--verify full --max-gb N` verifies a big backup in slices, oldest verification first.
-- `restore_backup.py` and the menu's `[5] Restore`: restore to a folder or to the original places, never overwriting and never writing to the backup.
-- The dry-run summary gains a per-folder table with cumulative sizes.
+- The sRGB/resized JXL copies jxl-photo makes from a master are no longer backed up when that master is: they say so in their own XMP, and the master remakes them. `--derivatives` copies them anyway.
+- `DSC_0001 (2)` gets its own export formats when an original with that name is beside the export, instead of being taken for `DSC_0001` (a JPEG of it could be dropped because `DSC_0001` had a JXL). Its originals still bring `DSC_0001` along, as before.
 
-**94 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
+Compared file by file with v0.4.0 on a 1.6 TB archive: only the derivatives leave the plan; no original is dropped.
+
+**106 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
 
 ## Changelog
+
+### v0.5.0 (2026-11-08)
+- **jxl-photo derivatives are skipped** when the master of the same photo is copied in the same run: a JXL is left out only when its XMP says `jxlphoto-derived:` and a selected JXL of that photo says `jxlphoto-src:`; anything unreadable or uncertain is copied. New `--derivatives` / `COPY_JXLPHOTO_DERIVATIVES` to copy them; the summary counts them.
+- **The duplicate counter is part of the photo key**: an export `DSC_0001 (2)_x` belongs to the original `DSC_0001 (2)` when there is one, not to `DSC_0001` — before, its format choice was made together with the other photo, and a JPEG of `(2)` could be dropped because `DSC_0001` had a JXL. Which originals are copied does not shrink: a selected `X (2)` still brings `X` along (film rescans).
 
 ### v0.4.0 (2026-11-08)
 - **Moved and renamed folders** are moved inside the backup after the content is confirmed by SHA-256, instead of being copied again; the folders the move leaves empty are removed (`--no-detect-moves` turns it off). Backup files whose source is gone are reported in `<log>_orphans.csv`; `--move-orphans` moves the `source_missing` ones to `_photo_backup\orphans\<stamp>`.

@@ -24,7 +24,7 @@ import string
 import subprocess
 import sys
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
@@ -181,6 +181,7 @@ def default_session():
         "unselected": _setting("UNSELECTED"),
         "unexported": _setting("UNEXPORTED"),
         "c1_cache": bool(_setting("COPY_CAPTUREONE_CACHE")),
+        "derivatives": bool(_setting("COPY_JXLPHOTO_DERIVATIVES")),
         "update_changed": False,
         "verify_mode": VERIFY_MODE,
         "max_gb": _setting("VERIFY_MAX_GB"),
@@ -208,6 +209,8 @@ def build_argv(session, mode):
              "--unexported", session["unexported"]]
     if session["c1_cache"]:
         argv.append("--c1-cache")
+    if session["derivatives"]:
+        argv.append("--derivatives")
     if mode == "verify":
         argv += ["--verify", session["verify_mode"]]
         if session["verify_mode"] == "full":
@@ -231,6 +234,8 @@ def describe(session):
         f"Folders without export: {session['unexported']}",
         f"  Capture One cache: {'copy' if session['c1_cache'] else 'skip'}   "
         f"Replace changed originals/exports: {'yes' if session['update_changed'] else 'no'}",
+        "  jxl-photo derivatives of a copied master: "
+        + ("copy" if session["derivatives"] else "skip (COPY_JXLPHOTO_DERIVATIVES)"),
     ]
     return "\n".join(lines)
 
@@ -593,7 +598,8 @@ def settings_menu(config):
     say(f"  Logs: {_setting('LOG_DIR')}")
     say("  Defaults of selective_backup.py (edit the top of that file to change them):")
     for name in ("EXPORT_FORMATS", "EXPORT_NAME_CONTAINS", "EXCLUDE_EXPORT_SUBFOLDERS",
-                 "UNSELECTED", "UNEXPORTED", "COPY_CAPTUREONE_CACHE", "AUTO_UPDATE",
+                 "UNSELECTED", "UNEXPORTED", "COPY_CAPTUREONE_CACHE",
+                 "COPY_JXLPHOTO_DERIVATIVES", "AUTO_UPDATE",
                  "AUTO_UPDATE_EXTENSIONS", "SPACE_MARGIN_GB", "VERIFY_COPY"):
         say(f"    {name:<26} {_setting(name)!r}")
     if yes_no("Forget the remembered choices (presets are kept)?", False):

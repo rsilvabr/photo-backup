@@ -49,6 +49,14 @@ from the command line. A future job (e.g. a full mirror) is a new
   BEFORE the first byte is copied, exit code 2.
 - A copy is written to a temp file next to its final name, verified, then
   `os.replace`d — a crash never leaves a half file under the final name.
+  The restore uses `no_clobber=True` (`os.rename` on Windows): a target that
+  appears during the restore is never replaced.
+- **Leaving a file out needs proof (v0.5.0).** A jxl-photo derivative is
+  skipped only when its own XMP says `jxlphoto-derived:` AND a JXL of the same
+  photo that says `jxlphoto-src:` is selected in the same run
+  (`_drop_derivatives`, `_jxl_role`). Anything unreadable or ambiguous is
+  copied. Any new "skip" rule follows the same shape: positive evidence that
+  the file can be remade from something this run copies.
 
 ## Settings are never hardcoded
 Every user-editable setting lives at the TOP of `selective_backup.py`
