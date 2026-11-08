@@ -252,7 +252,7 @@ def _gb(n):
 
 
 def _num(n):
-    return f"{n:,}".replace(",", " ")
+    return str(n)
 
 
 def _hms(seconds):
