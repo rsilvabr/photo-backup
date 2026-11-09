@@ -54,7 +54,12 @@ from the command line. A future job (e.g. a full mirror) is a new
   and after every run and must find it identical.
 - **Nothing on the destination is ever deleted.** A file whose source changed
   is reported; with `--update-changed` the old copy is MOVED to the versions
-  folder first, never overwritten in place. The only file the tool removes is
+  folder first, never overwritten in place. A new file identical byte for byte
+  to the old copy takes its place instead: `_handle_old_copy` compares the old
+  copy with the hash of the bytes really copied (`before_final`, the last step
+  before the final name), never with what the source held earlier, and the
+  comparison only decides the versions folder, never whether to copy. The only
+  file the tool removes is
   its own temp file (`*` + `TEMP_SUFFIX`) after a failed copy. The one
   exception: a folder left empty by one of our own moves (a detected
   move/rename, or `--move-orphans`) is removed with `os.rmdir` — never a
@@ -153,3 +158,11 @@ Same as the sibling repo `jxl-photo`. Documents live in `AI_tools/`
 ## Docs map
 - `README.md` — what it does, safety guarantees, every `--flag` (enforced by
   `tests/test_docs_cover_the_flags.py`), every setting, examples, exit codes.
+
+## Pending list
+The owner keeps one list of everything still pending, across all repos, in
+`../PENDENCIAS.md` (the folder above this repo, outside git, in Portuguese).
+Read it when asked what is left to do. When work here finishes an item, leaves
+something for later, or waits on a decision from the owner, update that file in
+the same session: remove what is done, add what is new. It is private: never
+copy its contents into tracked files, commits or release notes.

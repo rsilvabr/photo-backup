@@ -189,8 +189,11 @@ python selective_backup.py --source "G:\2025" --dest "H:\BACKUP" --verify full
   `--source`.
 - **Nothing on the destination is ever deleted.** A file whose source changed
   is reported; with `--update-changed` the old copy is MOVED to the versions
-  folder first, never overwritten in place. The only file the tool removes is
-  its own temp file (`*` + `.pbtmp`) after a failed copy or a crash.
+  folder first, never overwritten in place. The one exception is a new file
+  identical byte for byte to the old one, which takes its place: nothing is
+  lost, and the versions folder only holds real old versions. The only file the
+  tool removes is its own temp file (`*` + `.pbtmp`) after a failed copy or a
+  crash.
 - **Fail closed.** Not enough space, a destination drive that is not
   connected, an unreadable catalog, a closed stdin without `--yes`, a
   destination inside a source (or the reverse): the tool aborts BEFORE the
@@ -405,6 +408,10 @@ On every run, each planned file is compared against the destination:
   is given. With `--update-changed`, the old copy is moved to
   `<dest>\_photo_backup\versions\<YYMMDD_HHMMSS>\<rel>` and the new file is
   copied. Nothing in the destination is ever overwritten in place.
+- **Same bytes, new date.** Capture One rewrites every `.cos` of a folder it
+  opens, without changing them. Such a file is still copied, but when the bytes
+  copied are identical to the old copy, the old copy is not kept in the versions
+  folder (the log says `IDENTICAL`). A different file is always kept.
 - **Edit settings and sidecars are updated automatically.** Every edit in
   NX Studio or Capture One rewrites the `.xmp`, `.cos`, `.comask`, `.nksc`
   (`AUTO_UPDATE_EXTENSIONS`). A changed file with one of those extensions is
@@ -711,19 +718,20 @@ Japanese file names.
 
 ## Current version
 
-**v0.8.0** (2026-11-09).
+**v0.8.1** (2026-11-09).
 
-- Faster backups: the source is read ahead while the destination writes, and small files (edit settings, sidecars) reach the disk in batches. Nothing to do when upgrading, and a file still gets its final name only once it is on the disk.
+- The `versions\` folder keeps only real old versions: a file saved again with the same bytes (Capture One does that to every `.cos` of a folder it opens) is still copied, but its identical old copy is no longer kept. Nothing to do when upgrading.
 
-**v0.7.0** added Capture One alone to a folder you choose, and a force restore that keeps the current files first and can be undone. [Details](#capture-ones-own-files-captureone_backuppy-v060).
+**v0.8.0** made backups faster: the source is read ahead while the destination writes, and small files reach the disk in batches.
 
-**208 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
+**222 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
 
 ## Changelog
 
 | Version | Date | What it added |
 |---------|------|---------------|
-| **v0.8.0** | 2026-11-09 | Faster backups: read-ahead while the destination writes, small files flushed in batches |
+| **v0.8.1** | 2026-11-09 | The versions folder no longer keeps an old copy identical to the new one |
+| v0.8.0 | 2026-11-09 | Faster backups: read-ahead while the destination writes, small files flushed in batches |
 | v0.7.0 | 2026-11-08 | Capture One alone to a folder you choose; force restore that keeps the old files, and undo |
 | v0.6.0 | 2026-11-08 | Keeps Capture One's own profiles, styles and settings; double-click restore for a new computer |
 | v0.5.0 | 2026-11-08 | Leaves out the sRGB/resized JXL copies jxl-photo made from a master that is backed up; `DSC_0001 (2)` treated as its own photo |

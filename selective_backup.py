@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -947,6 +947,29 @@ def _move_to_versions(dest, stamp, status, log):
     log.log(f"VERSION {status.planned.rel}")
 
 
+def _handle_old_copy(dest, stamp, status, log):
+    """The destination's old copy of a CHANGED file. A different size proves
+    different content: it goes to the versions folder now. With the same size
+    the choice waits for the returned callback, which gets the hash of the
+    bytes really copied: only a new file identical byte for byte leaves the old
+    one out of the versions folder (Capture One rewrites every .cos it opens,
+    new date, same bytes). The new file is copied either way."""
+    if os.stat(_io(status.dst)).st_size != status.planned.size:
+        _move_to_versions(dest, stamp, status, log)
+        return None
+    old_sha256 = _sha256_file(status.dst)
+
+    def before_final(new_sha256):
+        if new_sha256 != old_sha256:
+            _move_to_versions(dest, stamp, status, log)
+            return
+        # Windows refuses to replace a read-only file
+        os.chmod(_io(status.dst), os.stat(_io(status.dst)).st_mode | 0o200)
+        log.log(f"IDENTICAL {status.planned.rel} (old copy not kept in versions)")
+
+    return before_final
+
+
 class _SourceRead:
     """One source file, read once and hashed as it is read. `digest` and
     `stat0` are set when the iteration ends; a file that changed meanwhile
@@ -1112,8 +1135,10 @@ def _flush_error(tmp):
     return None
 
 
-def _finish_temp(planned, tmp, dst, verify, digest, stat0, expected_sha256=None, no_clobber=False):
-    """Verify a temp file already on the disk, then give it its final name."""
+def _finish_temp(planned, tmp, dst, verify, digest, stat0, expected_sha256=None, no_clobber=False,
+                 before_final=None):
+    """Verify a temp file already on the disk, then give it its final name.
+    before_final(digest) runs last, right before that name is given."""
     if expected_sha256 is not None and digest != expected_sha256:
         raise RuntimeError("content differs from the catalog sha256 (backup copy corrupt?)")
     shutil.copystat(_io(planned.src), _io(tmp))
@@ -1123,6 +1148,8 @@ def _finish_temp(planned, tmp, dst, verify, digest, stat0, expected_sha256=None,
     elif verify == "hash":
         if _sha256_file(tmp) != digest:
             raise RuntimeError("hash mismatch after copy")
+    if before_final is not None:
+        before_final(digest)
     if no_clobber:
         # Atomic "only if absent": Windows' rename refuses an existing
         # target; elsewhere a hard link does (rename would overwrite).
@@ -1136,7 +1163,8 @@ def _finish_temp(planned, tmp, dst, verify, digest, stat0, expected_sha256=None,
     return digest, stat0.st_size, stat0.st_mtime_ns
 
 
-def _copy_file(planned, dst, verify, expected_sha256=None, no_clobber=False, source=None):
+def _copy_file(planned, dst, verify, expected_sha256=None, no_clobber=False, source=None,
+               before_final=None):
     """Copy to a temp file next to `dst`, verify, then move it into place.
     no_clobber: a `dst` that exists at that last step is never replaced
     (FileExistsError, nothing written) -- the restore's rule. `source`: where
@@ -1147,7 +1175,7 @@ def _copy_file(planned, dst, verify, expected_sha256=None, no_clobber=False, sou
     try:
         _write_temp(planned, tmp, source, True)
         return _finish_temp(planned, tmp, dst, verify, source.digest, source.stat0,
-                            expected_sha256, no_clobber)
+                            expected_sha256, no_clobber, before_final)
     except BaseException:
         _remove_temp(tmp)
         raise
@@ -1159,9 +1187,10 @@ class _PendingCopy:
     status: object
     tmp: str
     source: object
+    before_final: object = None
 
 
-def _stage_small_file(status, source):
+def _stage_small_file(status, source, before_final=None):
     """Write a small file to its temp name without waiting for the disk."""
     tmp = status.dst + TEMP_SUFFIX
     os.makedirs(_io(os.path.dirname(status.dst)), exist_ok=True)
@@ -1170,7 +1199,7 @@ def _stage_small_file(status, source):
     except BaseException:
         _remove_temp(tmp)
         raise
-    return _PendingCopy(status, tmp, source)
+    return _PendingCopy(status, tmp, source, before_final)
 
 
 def _auto_updated(status, args):
@@ -1422,7 +1451,7 @@ def _copy_all(args, statuses, dest, stamp, catalog, log):
                     raise flush_error
                 record(item.status, *_finish_temp(
                     item.status.planned, item.tmp, item.status.dst, args.verify_copy,
-                    item.source.digest, item.source.stat0))
+                    item.source.digest, item.source.stat0, before_final=item.before_final))
             except Exception as exc:
                 _remove_temp(item.tmp)
                 failed(item.status, exc)
@@ -1434,15 +1463,16 @@ def _copy_all(args, statuses, dest, stamp, catalog, log):
         for status in to_copy:
             source = read_ahead.next_source(status.planned) if read_ahead else _SourceRead(status.planned)
             try:
+                before_final = None
                 if status.status == ST_CHANGED:
-                    _move_to_versions(dest, stamp, status, log)
+                    before_final = _handle_old_copy(dest, stamp, status, log)
                 if FLUSH_BATCH_FILES > 1 and status.planned.size < SMALL_FILE_KB * 1024:
-                    pending.append(_stage_small_file(status, source))
+                    pending.append(_stage_small_file(status, source, before_final))
                     if len(pending) >= FLUSH_BATCH_FILES:
                         finish_pending()
                 else:
                     record(status, *_copy_file(status.planned, status.dst, args.verify_copy,
-                                               source=source))
+                                               source=source, before_final=before_final))
             except Exception as exc:
                 failed(status, exc)
             source.drain()

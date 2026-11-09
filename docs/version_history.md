@@ -9,7 +9,8 @@ releases are also published as
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **[v0.8.0](#v080)** | 2026-11-09 | Faster backups: the source is read ahead while the destination writes, and small files reach the disk in batches |
+| **[v0.8.1](#v081)** | 2026-11-09 | The versions folder keeps only real old versions: an old copy identical to the new one is no longer kept |
+| [v0.8.0](#v080) | 2026-11-09 | Faster backups: the source is read ahead while the destination writes, and small files reach the disk in batches |
 | [v0.7.0](#v070) | 2026-11-08 | Capture One alone to a folder you choose; a force restore that keeps the old files, and undo |
 | [v0.6.0](#v060) | 2026-11-08 | Keeps what Capture One needs to show your edits on another computer: profiles, styles, defaults and settings, with a double-click restore |
 | [v0.5.0](#v050) | 2026-11-08 | Leaves out what jxl-photo can make again: an sRGB/resized JXL copy is not backed up when its master is. `DSC_0001 (2)` is treated as its own photo |
@@ -19,6 +20,23 @@ releases are also published as
 | v0.1.0 | 2026-10-06 | First implementation, not released |
 
 `mobile_backup.py` has its own version: [see the end of this page](#mobile_backuppy).
+
+---
+
+## v0.8.1
+
+**Released 2026-11-09.** Nothing to do when upgrading.
+
+- **The versions folder keeps only real old versions.** Capture One rewrites
+  every `.cos` of a folder it opens: new date, same bytes (37 of 38 in a real
+  folder). Each of those used to leave an identical copy in `versions\`. The new
+  file is still copied every time; the old one is left out only when it is
+  identical to the bytes really copied, and the log says `IDENTICAL`.
+- **Checked at the last moment.** The comparison uses the hash of what was
+  copied, right before the final name, so a file saved during the copy still
+  keeps its old version. A different size goes to the versions folder at once,
+  as before.
+- **A failed copy of an identical file** now leaves the old copy where it was.
 
 ---
 
