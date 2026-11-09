@@ -35,7 +35,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 # ---- Settings -------------------------------------------------------------------
 MODES_FILE = "backup_modes.csv"     # next to this script; --modes reads another
@@ -46,6 +46,8 @@ ORIGINALS_VALUES = {                # manifest Originals -> --unselected / Folde
     "all": "all",
 }
 ANALYSIS_ORIGINALS = ("raw", "raw+jpeg", "all")   # the --analyze columns
+ONLY_GROUPS = {**sb.FORMAT_GROUPS,    # names usable in the Only column -> extensions
+               "raw": sb.RAW_EXTENSIONS, "jpeg": sb.JPEG_EXTENSIONS}
 MODE_COLUMNS = ("Mode", "Unselected", "AddFolders", "AddWhole", "Exclude", "Whole",
                 "Description")
 MANIFEST_COLUMNS = ("Folder", "Mode", "Originals")
@@ -65,6 +67,8 @@ class Mode:
     whole: bool
     description: str = ""
     unexported: bool = False    # folders without an export are copied whole
+    skip: bool = False          # this folder stays out of the backup
+    only: tuple = ()            # lower-case extensions; every other file is left out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -120,6 +124,21 @@ def _yes_no(row, column, path, line):
                         f"{row.get(column)!r}")
 
 
+def _only_extensions(value, path, line):
+    """The Only column: group names of ONLY_GROUPS and/or .extensions."""
+    extensions = []
+    for token in sb._split_names(value):
+        folded = token.casefold()
+        if folded.startswith(".") and len(folded) > 1:
+            extensions.append(folded)
+        elif folded in ONLY_GROUPS:
+            extensions.extend(ONLY_GROUPS[folded])
+        else:
+            raise ManifestError(f"{path} line {line}: Only: unknown {token!r} (use "
+                                + ", ".join(ONLY_GROUPS) + " or .ext)")
+    return tuple(extensions)
+
+
 def read_modes(path):
     """The modes table: {mode name: Mode}, in file order."""
     modes = {}
@@ -140,8 +159,14 @@ def read_modes(path):
         if whole and (add_folders or add_whole or unexported):
             raise ManifestError(f"{path} line {line}: Whole=yes cannot be combined "
                                 f"with AddFolders, AddWhole or Unexported")
+        only = _only_extensions(row.get("Only") or "", path, line)
+        skip = (_yes_no(row, "Skip", path, line)
+                if str(row.get("Skip") or "").strip() else False)
+        if skip and (unselected or whole or add_folders or add_whole or unexported or only):
+            raise ManifestError(f"{path} line {line}: Skip=yes cannot be combined with "
+                                f"anything that copies files")
         modes[name] = Mode(name, unselected, add_folders, add_whole, exclude, whole,
-                           str(row.get("Description") or "").strip(), unexported)
+                           str(row.get("Description") or "").strip(), unexported, skip, only)
     return modes
 
 
@@ -197,7 +222,8 @@ def _row_unselected(mode, originals):
 def _row_rules(mode, originals):
     return sb.FolderRules(add_filtered=mode.add_folders, add_whole=mode.add_whole,
                           exclude=mode.exclude, whole=mode.whole,
-                          originals=ORIGINALS_VALUES[originals])
+                          originals=ORIGINALS_VALUES[originals],
+                          skip=mode.skip, only=mode.only)
 
 
 def _skip_paths_for(folder, rows):

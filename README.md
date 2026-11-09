@@ -346,7 +346,7 @@ another set in another. Two CSV files say what to do:
   stays out of git; `backup_manifest.example.csv` shows the format.
 - **The modes table** (`--modes`, default `backup_modes.csv` beside the
   script) says what each mode copies:
-  `Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Description`.
+  `Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Only,Skip,Description`.
 
 | Column | Meaning |
 |---|---|
@@ -357,6 +357,8 @@ another set in another. Two CSV files say what to do:
 | `Exclude` | `;`-separated patterns never added, at any depth |
 | `Whole` | `yes`/`no`: the whole folder, session or not |
 | `Unexported` | `yes`/`no`, optional: a folder without an export is copied whole; a folder with one follows the rest of the mode |
+| `Only` | optional, `;`-separated: copy only these types. A group (`raw`, `jpeg`, `jpg`, `jxl`, `tif`, `png`, `heic`, `psd`, `dng`) or an extension (`.xmp`) |
+| `Skip` | `yes`/`no`, optional: this folder stays out of the backup |
 | `Description` | free text shown nowhere; for the owner |
 
 A pattern is matched against the folder name, case-insensitively; only `*` is
@@ -380,6 +382,22 @@ UTF-8 (in Excel, save as "CSV UTF-8"), a mode that does not exist, a folder that
 on more than one drive, and every other invalid table value — before any photo
 is read.
 
+**Leaving a folder out, or keeping one type.** Give that folder its own line
+below the larger one, with one of the modes `skip`, `raw-only`, `jpeg-only` or
+`jxl-only`:
+
+```csv
+Folder,Mode,Originals
+G:\2026,3+,raw
+G:\2026\event I care less about,skip,
+G:\2026\event from a phone,jpeg-only,
+```
+
+`Only` is literal: `jpeg-only` copies the JPEGs and nothing else, so a photo that
+exists only as RAW has no copy, and `jxl-only` leaves out a JPEG not converted
+yet. `raw-only` also keeps the sidecars and edit settings. The summary shows
+what these lines left out, and `--analyze` shows every mode of such a folder.
+
 **Lowering a mode deletes nothing.** A file that a lower mode no longer
 selects stays on the destination and appears as a `not_selected` orphan in
 `_orphans.csv`, exactly like a normal backup.
@@ -395,6 +413,8 @@ Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Description
 5,yes,_OUTTAKES*,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,Mode 4 + every _OUTTAKES*
 6,no,,,,yes,no,The whole folder
 ```
+
+(Shown without the `Only` and `Skip` columns, which are empty in these six.)
 
 Modes `1+` to `5+` are the same five with `Unexported=yes`: a folder with an
 export follows the mode, and a folder not exported yet is copied whole, so what
@@ -831,19 +851,20 @@ Japanese file names.
 
 ## Current version
 
-**v0.10.0** (2026-11-10).
+**v0.11.0** (2026-11-10).
 
-- Modes `1+` to `5+`: a folder with an export follows the mode, and a folder not exported yet is copied whole, so what has not been edited is not left out. [Details](#per-folder-modes-manifest_backuppy). Nothing to do when upgrading: the modes `1` to `6` work as before.
+- A manifest line can leave a folder out (`skip`) or keep one type of file in it (`raw-only`, `jpeg-only`, `jxl-only`, or your own `Only` list). [Details](#per-folder-modes-manifest_backuppy). Nothing to do when upgrading: tables without the new columns keep working.
 
-**v0.9.0** gave each folder its own backup mode, from a manifest, with `--analyze` to see the size of each mode first.
+**v0.10.0** added the modes `1+` to `5+`: a folder not exported yet is copied whole.
 
-**256 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
+**269 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
 
 ## Changelog
 
 | Version | Date | What it added |
 |---------|------|---------------|
-| **v0.10.0** | 2026-11-10 | Modes `1+` to `5+`: a folder not exported yet is copied whole |
+| **v0.11.0** | 2026-11-10 | A manifest line can leave a folder out or keep only one type of file in it |
+| v0.10.0 | 2026-11-10 | Modes `1+` to `5+`: a folder not exported yet is copied whole |
 | v0.9.0 | 2026-11-09 | Per-folder backup modes from a manifest, with `--analyze` to see the size of each mode first |
 | v0.8.1 | 2026-11-09 | The versions folder no longer keeps an old copy identical to the new one |
 | v0.8.0 | 2026-11-09 | Faster backups: read-ahead while the destination writes, small files flushed in batches |

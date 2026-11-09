@@ -722,3 +722,108 @@ def test_analyze_of_a_plus_mode_matches_the_dry_run(tmp_path, photobackup_log_di
                     "--dest", str(tmp_path / "out"), "--dry-run"]) == 0
     planned = list(csv.DictReader(io.StringIO(latest_csv(photobackup_log_dir, "_plan.csv"))))
     assert sum(int(row["size"]) for row in planned) == int(chosen["bytes"])
+
+
+# ---- Skip and Only: a line below another leaves that folder out or keeps one type
+def nested_run(tmp_path, mode, extra=()):
+    folder, prefix = mixed_tree(tmp_path / "G")
+    manifest = write_manifest(tmp_path / "manifest.csv",
+                              [(folder, "3+", "raw"), (folder / "not_edited", mode, "")])
+    dest = tmp_path / "backup"
+    assert mb.main(["--manifest", str(manifest), "--modes", str(SHIPPED_MODES),
+                    "--dest", str(dest), "--yes", *extra]) == 0
+    return dest_files(dest), prefix, manifest, dest
+
+
+def test_skip_leaves_only_that_folder_out(tmp_path, capsys):
+    files, prefix, _, _ = nested_run(tmp_path, "skip")
+    assert not any("not_edited" in rel for rel in files)
+    assert has(files, f"{prefix}/edited/_DSC1.NEF")
+    out = capsys.readouterr().out
+    assert "folders the manifest leaves out (Skip): 1 folders / 7 files" in out
+
+
+def test_a_line_below_a_skip_line_is_still_copied(tmp_path):
+    folder, prefix = mixed_tree(tmp_path / "G")
+    manifest = write_manifest(tmp_path / "manifest.csv", [
+        (folder, "skip", ""), (folder / "not_edited", "6", "")])
+    dest = tmp_path / "backup"
+    assert mb.main(["--manifest", str(manifest), "--modes", str(SHIPPED_MODES),
+                    "--dest", str(dest), "--yes"]) == 0
+    files = dest_files(dest)
+    assert has(files, f"{prefix}/not_edited/_DSC5.NEF")
+    assert not any("/edited/" in rel for rel in files)
+
+
+def test_skip_after_a_backup_deletes_nothing_and_reports_orphans(tmp_path, photobackup_log_dir):
+    folder, prefix = mixed_tree(tmp_path / "G")
+    before = snapshot(tmp_path / "G")
+    dest = tmp_path / "backup"
+    first = write_manifest(tmp_path / "first.csv", [(folder, "3+", "raw")])
+    assert mb.main(["--manifest", str(first), "--modes", str(SHIPPED_MODES),
+                    "--dest", str(dest), "--yes"]) == 0
+    copied = dest_files(dest)
+    second = write_manifest(tmp_path / "second.csv",
+                            [(folder, "3+", "raw"), (folder / "not_edited", "skip", "")])
+    assert mb.main(["--manifest", str(second), "--modes", str(SHIPPED_MODES),
+                    "--dest", str(dest), "--yes"]) == 0
+    assert dest_files(dest) == copied
+    orphans = list(csv.DictReader(io.StringIO(latest_csv(photobackup_log_dir, "_orphans.csv"))))
+    assert orphans and {row["reason"] for row in orphans} == {"not_selected"}
+    assert snapshot(tmp_path / "G") == before
+
+
+@pytest.mark.parametrize("mode,kept,gone", [
+    ("jpeg-only", ["_DSC5.JPG"], ["_DSC5.NEF", "notes.txt", "a.cos"]),
+    ("raw-only", ["_DSC5.NEF", "_OUTTAKES/x.NEF", "CaptureOne/Settings166/a.cos"],
+     ["_DSC5.JPG", "notes.txt"]),
+    ("jxl-only", [], ["_DSC5.NEF", "_DSC5.JPG"]),
+])
+def test_only_modes_keep_one_type_in_that_folder(tmp_path, capsys, mode, kept, gone):
+    files, prefix, _, _ = nested_run(tmp_path, mode)
+    for rel in kept:
+        assert has(files, f"{prefix}/not_edited/{rel}"), rel
+    for rel in gone:
+        assert not has(files, f"{prefix}/not_edited/{rel}"), rel
+    assert has(files, f"{prefix}/edited/_DSC1.NEF")
+    assert "left out by a mode's Only filter:" in capsys.readouterr().out
+
+
+def test_analyze_of_skip_and_only_matches_the_dry_run(tmp_path, photobackup_log_dir):
+    for mode in ("skip", "jpeg-only"):
+        run_dir = tmp_path / mode
+        folder, _ = mixed_tree(run_dir / "G")
+        manifest = write_manifest(run_dir / "manifest.csv", [(folder, mode, "")])
+        assert mb.main(["--manifest", str(manifest), "--modes", str(SHIPPED_MODES),
+                        "--analyze"]) == 0
+        rows = list(csv.DictReader(io.StringIO(latest_csv(photobackup_log_dir, "_analysis.csv"))))
+        chosen = [row for row in rows if row["chosen"] == "yes"][0]
+        assert mb.main(["--manifest", str(manifest), "--modes", str(SHIPPED_MODES),
+                        "--dest", str(run_dir / "out"), "--dry-run"]) == 0
+        planned = list(csv.DictReader(io.StringIO(latest_csv(photobackup_log_dir, "_plan.csv"))))
+        assert sum(int(row["size"]) for row in planned) == int(chosen["bytes"])
+
+
+def test_skip_cannot_take_an_export_folder_below_another_line(tmp_path):
+    folder, _ = mixed_tree(tmp_path / "G")
+    manifest = write_manifest(tmp_path / "manifest.csv", [
+        (folder, "3+", "raw"), (folder / "edited" / "_EXPORT", "skip", "")])
+    assert mb.main(["--manifest", str(manifest), "--modes", str(SHIPPED_MODES),
+                    "--analyze"]) == 2
+
+
+@pytest.mark.parametrize("line", [
+    "X,no,,,,yes,no,nosuchtype,no,t",
+    "X,no,,,,no,no,,maybe,t",
+    "X,no,,,,yes,no,,yes,t",
+    "X,yes,,,,no,no,,yes,t",
+    "X,no,,,,no,no,jpeg,yes,t",
+])
+def test_bad_only_or_skip_values_abort(tmp_path, line):
+    table = tmp_path / "modes.csv"
+    table.write_text("Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Only,Skip,"
+                     "Description\n" + line + "\n", encoding="utf-8")
+    folder = tmp_path / HOSTILE
+    folder.mkdir()
+    manifest = write_manifest(tmp_path / "manifest.csv", [(folder, "X", "raw")])
+    assert mb.main(["--manifest", str(manifest), "--modes", str(table), "--analyze"]) == 2

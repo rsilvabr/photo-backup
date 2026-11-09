@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -340,6 +340,11 @@ class Stats:
     c1_cache_skipped_bytes: int = 0
     derivatives_skipped: int = 0
     derivatives_skipped_bytes: int = 0
+    manifest_skip_folders: int = 0
+    manifest_skip_files: int = 0
+    manifest_skip_bytes: int = 0
+    only_filtered: int = 0
+    only_filtered_bytes: int = 0
     skipped_links: int = 0
     scan_errors: int = 0
 
@@ -397,6 +402,8 @@ class FolderRules:
     exclude: tuple = ()         # patterns: never added, at any depth
     whole: bool = False         # the whole folder, session or not
     originals: str = "raw_or_jpeg"
+    skip: bool = False          # this folder stays out: nothing planned, its size reported
+    only: tuple = ()            # lower-case extensions: every other planned file is left out
 
 
 class _Planner:
@@ -741,7 +748,12 @@ class _Planner:
             if base is None:
                 base = os.path.splitdrive(src)[0] + os.sep
             self.sources.append((src, base))
-            if whole:
+            if self.rules is not None and self.rules.skip:
+                count, nbytes = self._tree_usage(src)
+                self.stats.manifest_skip_folders += 1
+                self.stats.manifest_skip_files += count
+                self.stats.manifest_skip_bytes += nbytes
+            elif whole:
                 self._add_whole_row(src, base)
             else:
                 stack.append((src, base, False))
@@ -801,6 +813,18 @@ class _Planner:
                         continue
                     if os.path.normcase(dpath) not in classified:
                         stack.append((dpath, base, False))
+        if self.rules is not None and self.rules.only:
+            self._apply_only()
+
+    def _apply_only(self):
+        kept = []
+        for item in self.files:
+            if os.path.splitext(item.src)[1].casefold() in self.rules.only:
+                kept.append(item)
+            else:
+                self.stats.only_filtered += 1
+                self.stats.only_filtered_bytes += item.size
+        self.files = kept
 
 
 def plan(args):
@@ -1698,6 +1722,14 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
         lines.append(f"  jxl-photo derivatives (their master is copied; --derivatives copies them): "
                      f"{_num(planned.stats.derivatives_skipped)} / "
                      f"{_gb(planned.stats.derivatives_skipped_bytes)}")
+    if planned.stats.manifest_skip_folders:
+        lines.append(f"  folders the manifest leaves out (Skip): "
+                     f"{_num(planned.stats.manifest_skip_folders)} folders / "
+                     f"{_num(planned.stats.manifest_skip_files)} files / "
+                     f"{_gb(planned.stats.manifest_skip_bytes)}")
+    if planned.stats.only_filtered:
+        lines.append(f"  left out by a mode's Only filter: {_num(planned.stats.only_filtered)} / "
+                     f"{_gb(planned.stats.only_filtered_bytes)}")
     lines.append(f"  inside sessions (_OUTTAKES, OLD_TIFFs, ...): "
                  f"{_num(planned.stats.inside_shoot_skipped)} / "
                  f"{_gb(planned.stats.inside_shoot_skipped_bytes)}")

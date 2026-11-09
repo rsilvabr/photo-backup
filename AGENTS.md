@@ -104,6 +104,11 @@ from the command line. A future job (e.g. a full mirror) is a new
 - **A folder not exported yet is not lost in a `+` mode.** `Unexported=yes`
   in the modes table copies a folder without an export whole (`--unexported
   copy`, per line); a folder with one follows the rest of the mode.
+- **Leaving out by a manifest line is the owner's explicit choice, and it is
+  reported.** `Skip=yes` plans nothing and `Only` keeps only those extensions
+  (both in `_Planner.build`, so analysis, dry-run and copy agree); the summary
+  counts what they left out. Backed-up files they no longer select stay on
+  the destination as `not_selected` orphans.
 - **A manifest never hides a loss.** An export folder cannot have its own line
   below another line (the line above would stop being a session and lose its
   originals), and `--analyze` exits 1 when a folder could not be read.

@@ -9,7 +9,8 @@ releases are also published as
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **[v0.10.0](#v0100)** | 2026-11-10 | Modes `1+` to `5+`: a folder not exported yet is copied whole, so what has not been edited is not left out |
+| **[v0.11.0](#v0110)** | 2026-11-10 | A manifest line can leave a folder out (`skip`) or keep only one type of file in it (`raw-only`, `jpeg-only`, `jxl-only`) |
+| [v0.10.0](#v0100) | 2026-11-10 | Modes `1+` to `5+`: a folder not exported yet is copied whole, so what has not been edited is not left out |
 | [v0.9.0](#v090) | 2026-11-09 | Each folder with its own backup mode, from a manifest; `--analyze` shows the size of every mode first |
 | [v0.8.1](#v081) | 2026-11-09 | The versions folder keeps only real old versions: an old copy identical to the new one is no longer kept |
 | [v0.8.0](#v080) | 2026-11-09 | Faster backups: the source is read ahead while the destination writes, and small files reach the disk in batches |
@@ -22,6 +23,24 @@ releases are also published as
 | v0.1.0 | 2026-10-06 | First implementation, not released |
 
 `mobile_backup.py` has its own version: [see the end of this page](#mobile_backuppy).
+
+---
+
+## v0.11.0
+
+**Released 2026-11-10.** Nothing to do when upgrading: tables without the new
+columns keep working.
+
+- **Leave a folder out.** Mode `skip` on a line below a larger one: that folder
+  stays out and the rest of the larger line is copied. Lines inside it can still
+  have their own mode.
+- **Keep one type.** `raw-only` (with sidecars and edit settings), `jpeg-only`,
+  `jxl-only`, or your own list in the new `Only` column. It is literal: a photo
+  that does not exist in that type has no copy.
+- **Shown before copying.** The summary counts what these lines left out, and
+  `--analyze` shows every mode of such a folder.
+- **Nothing is deleted.** Files already backed up that a line no longer selects
+  stay on the backup and appear as `not_selected` orphans.
 
 ---
 
