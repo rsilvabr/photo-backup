@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 
 # ---- Settings -------------------------------------------------------------------
 BACKUP_SUBFOLDER = "_captureone"            # under --dest: this script's own backup root

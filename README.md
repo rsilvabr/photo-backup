@@ -826,19 +826,20 @@ Japanese file names.
 
 ## Current version
 
-**v0.8.1** (2026-11-09).
+**v0.9.0** (2026-11-09).
 
-- The `versions\` folder keeps only real old versions: a file saved again with the same bytes (Capture One does that to every `.cos` of a folder it opens) is still copied, but its identical old copy is no longer kept. Nothing to do when upgrading.
+- Each folder can have its own backup mode, from a manifest: a CSV lists the folders, another says what each mode copies, and `--analyze` shows how much each mode takes before anything is copied. [Details](#per-folder-modes-manifest_backuppy). Nothing to do when upgrading: the normal backup works as before.
 
-**v0.8.0** made backups faster: the source is read ahead while the destination writes, and small files reach the disk in batches.
+**v0.8.1** made the `versions\` folder keep only real old versions: an old copy identical to the new one is no longer kept.
 
-**222 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
+**247 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
 
 ## Changelog
 
 | Version | Date | What it added |
 |---------|------|---------------|
-| **v0.8.1** | 2026-11-09 | The versions folder no longer keeps an old copy identical to the new one |
+| **v0.9.0** | 2026-11-09 | Per-folder backup modes from a manifest, with `--analyze` to see the size of each mode first |
+| v0.8.1 | 2026-11-09 | The versions folder no longer keeps an old copy identical to the new one |
 | v0.8.0 | 2026-11-09 | Faster backups: read-ahead while the destination writes, small files flushed in batches |
 | v0.7.0 | 2026-11-08 | Capture One alone to a folder you choose; force restore that keeps the old files, and undo |
 | v0.6.0 | 2026-11-08 | Keeps Capture One's own profiles, styles and settings; double-click restore for a new computer |

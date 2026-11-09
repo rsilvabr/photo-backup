@@ -9,7 +9,8 @@ releases are also published as
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **[v0.8.1](#v081)** | 2026-11-09 | The versions folder keeps only real old versions: an old copy identical to the new one is no longer kept |
+| **[v0.9.0](#v090)** | 2026-11-09 | Each folder with its own backup mode, from a manifest; `--analyze` shows the size of every mode first |
+| [v0.8.1](#v081) | 2026-11-09 | The versions folder keeps only real old versions: an old copy identical to the new one is no longer kept |
 | [v0.8.0](#v080) | 2026-11-09 | Faster backups: the source is read ahead while the destination writes, and small files reach the disk in batches |
 | [v0.7.0](#v070) | 2026-11-08 | Capture One alone to a folder you choose; a force restore that keeps the old files, and undo |
 | [v0.6.0](#v060) | 2026-11-08 | Keeps what Capture One needs to show your edits on another computer: profiles, styles, defaults and settings, with a double-click restore |
@@ -20,6 +21,30 @@ releases are also published as
 | v0.1.0 | 2026-10-06 | First implementation, not released |
 
 `mobile_backup.py` has its own version: [see the end of this page](#mobile_backuppy).
+
+---
+
+## v0.9.0
+
+**Released 2026-11-09.** Nothing to do when upgrading: the normal backup works
+as before.
+
+- **Each folder with its own mode.** `manifest_backup.py` reads a manifest
+  (`Folder,Mode,Originals`) and a table of modes (`backup_modes.csv`), which you
+  can edit: unselected originals, subfolders to add filtered or whole, folders
+  to exclude, or the whole folder, also what has no export. The most specific
+  line wins. Menu `[7]`.
+- **See the size first.** `--analyze` shows every mode of every folder through
+  the same planner the copy uses, and copies nothing.
+- **Originals, per line.** `raw` keeps the RAW, its sidecars and any JPEG with
+  no RAW beside it, so no photo is left without a copy; `raw+jpeg` keeps every
+  JPEG; `all` keeps everything.
+- **Mistakes stop before the first byte.** A repeated or missing folder, an
+  unknown mode, a file that is not UTF-8, or an export folder with a line of its
+  own below another line abort with exit code 2.
+- **Same safety as a normal backup.** The copy, catalog, space check, versions
+  and orphans are the selective backup's own. Lowering a mode deletes nothing:
+  those files appear as orphans.
 
 ---
 
