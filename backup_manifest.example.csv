@@ -1,0 +1,5 @@
+Folder,Mode,Originals
+# Originals: raw = RAW + sidecars + JPEG without a RAW beside it; raw+jpeg = all JPEG too; all = everything.
+# The most specific folder wins: a folder listed below another follows its own line only.
+G:\2024,4,raw
+G:\2025,2,raw+jpeg

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import captureone_backup
+import manifest_backup
 import restore_backup
 import selective_backup
 
@@ -8,10 +9,11 @@ import selective_backup
 def test_docs_cover_the_flags():
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
     for parser in (selective_backup._build_parser(), restore_backup._build_parser(),
-                   captureone_backup.build_parser()):
+                   captureone_backup.build_parser(), manifest_backup.build_parser()):
         for action in parser._actions:
             for option in action.option_strings:
                 if option.startswith("--"):
                     assert option in readme, f"{option} is missing from README.md"
-    for text in ("restore_backup.py", "[5] Restore", "captureone_backup.py", "[6] Capture One only"):
+    for text in ("restore_backup.py", "[5] Restore", "captureone_backup.py",
+                 "[6] Capture One only", "manifest_backup.py", "[7] Manifest"):
         assert text in readme, f"{text} is missing from README.md"

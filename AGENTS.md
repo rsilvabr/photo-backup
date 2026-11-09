@@ -15,6 +15,16 @@ from the command line. A future job (e.g. a full mirror) is a new
 
 - `selective_backup.py` — the backend: planner, copy, catalog, verify. Every
   safety rule below lives here.
+- `manifest_backup.py` — per-folder modes, read from `backup_manifest.csv`
+  (gitignored; `backup_manifest.example.csv` is versioned) and
+  `backup_modes.csv` (versioned, UTF-8; `--modes` reads another). The code
+  never names a mode, `_OUTTAKES` or `RAW SCANS`: those are settings of the
+  CSV. It builds one `selective_backup._Planner` per manifest line (with
+  `FolderRules`, the most specific line first) and hands the joined `Plan` to
+  `selective_backup._run_backup(..., plan_fn=...)` — the copy, catalog, space
+  check, versions, moves and orphans are the selective backup's own.
+  `--analyze` plans every mode through the same `_Planner` and writes
+  `<stamp>_analysis.csv`. Never duplicate a copy or catalog routine here.
 - `photo_backup.py` — interactive menu + presets (`--run-preset`). It
   never copies by itself: it builds an argv and runs `selective_backup.py` (or
   `restore_backup.py`, via `run_restore`) as a child process (`run_backend`).
@@ -87,6 +97,13 @@ from the command line. A future job (e.g. a full mirror) is a new
   (`_drop_derivatives`, `_jxl_role`). Anything unreadable or ambiguous is
   copied. Any new "skip" rule follows the same shape: positive evidence that
   the file can be remade from something this run copies.
+- **A manifest's `Originals=raw` never leaves a photo without a copy.** It
+  maps to `raw_or_jpeg`: RAW + sidecars + every JPEG that has no RAW of the
+  same photo beside it (`X (2).JPG` is another file, not a variant of `X`), and
+  the sidecars of what it keeps. `raw+jpeg` and `all` only copy more.
+- **A manifest never hides a loss.** An export folder cannot have its own line
+  below another line (the line above would stop being a session and lose its
+  originals), and `--analyze` exits 1 when a folder could not be read.
 
 ## Settings are never hardcoded
 Every user-editable setting lives at the TOP of `selective_backup.py`

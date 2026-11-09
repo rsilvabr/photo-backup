@@ -1,0 +1,7 @@
+Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Description
+1,no,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Exports and the originals of the exported photos
+2,yes,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Mode 1 + unselected originals
+3,yes,_OUTTAKES_KEEP,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Mode 2 + _OUTTAKES_KEEP
+4,yes,_OUTTAKES_KEEP;_OUTTAKES,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Mode 3 + _OUTTAKES
+5,yes,_OUTTAKES*,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Mode 4 + every _OUTTAKES*
+6,no,,,,yes,The whole folder

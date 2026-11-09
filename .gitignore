@@ -21,3 +21,6 @@ AI_tools/
 # System files
 .DS_Store
 Thumbs.db
+
+# The owner's real manifest (the example is versioned)
+backup_manifest.csv

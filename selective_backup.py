@@ -52,6 +52,7 @@ FORMAT_GROUPS = {                   # names usable in --export-formats -> extens
 RAW_EXTENSIONS = (".nef", ".nrw", ".cr2", ".cr3", ".crw", ".arw", ".srf", ".sr2",
                   ".raf", ".orf", ".rw2", ".dng", ".pef", ".srw", ".3fr", ".iiq",
                   ".x3f", ".erf", ".mrw", ".kdc", ".dcr")
+JPEG_EXTENSIONS = (".jpg", ".jpeg")
 ANCHOR_EXTENSIONS = RAW_EXTENSIONS + (".jpg", ".jpeg", ".tif", ".tiff", ".png",
                                       ".heic", ".heif", ".hif", ".psd")  # files whose stem can be a photo key
 SIDECAR_EXTENSIONS = (".xmp", ".dop", ".pp3")   # copied with an unselected RAW under --unselected raw
@@ -111,6 +112,8 @@ CAT_UNSELECTED = "unselected"
 CAT_CAPTURE_ONE = "capture_one"
 CAT_NX_STUDIO = "nx_studio"
 CAT_UNEXPORTED = "unexported"
+CAT_ADDED = "added"
+CAT_WHOLE = "whole"
 
 ST_NEW = "NEW"
 ST_CHANGED = "CHANGED"
@@ -151,6 +154,47 @@ def _candidate_prefixes(stem):
     out = [stem[:i] for i in range(1, len(stem)) if stem[i] in NAME_SEPARATORS]
     out.append(stem)
     return out
+
+
+def _folder_matches(name, patterns):
+    """True when `name` matches one of `patterns`: case-insensitive, only '*'
+    is a wildcard, every other character literal ('[FINAL]' is a name, not a
+    character class)."""
+    folded = name.casefold()
+    for pattern in patterns:
+        regex = re.escape(str(pattern).casefold()).replace(r"\*", ".*")
+        if re.fullmatch(regex, folded):
+            return True
+    return False
+
+
+def _original_kept(name, raw_stems, originals, all_sidecars, photo_stems=None):
+    """Whether an original beside an export is copied under `originals`.
+    raw_stems: casefolded stems of the RAW files of that folder. With
+    all_sidecars every sidecar is kept; otherwise only the sidecars of a photo
+    of the folder (photo_stems, default raw_stems). A JPEG is kept by raw_jpeg
+    always and by raw_or_jpeg only when no RAW of the photo is beside it (the
+    photo would otherwise have no copy). "X (2).JPG" is another file, not a
+    variant of X: only a RAW named "X (2)" pairs with it."""
+    stem, ext = os.path.splitext(name)
+    folded_ext = ext.casefold()
+    if folded_ext in RAW_EXTENSIONS:
+        return True
+    if originals == "all":
+        return True
+    if folded_ext in SIDECAR_EXTENSIONS:
+        if all_sidecars:
+            return True
+        stems = raw_stems if photo_stems is None else photo_stems
+        return any(prefix.casefold() in stems for prefix in _candidate_prefixes(stem))
+    if folded_ext in JPEG_EXTENSIONS:
+        if originals == "raw_jpeg":
+            return True
+        if originals == "raw_or_jpeg":
+            prefixes = [stem] if _DUP_COUNTER.search(stem) else _candidate_prefixes(stem)
+            return not any(prefix.casefold() in raw_stems for prefix in prefixes)
+        return False
+    return False
 
 
 _DUP_COUNTER = re.compile(r" \(\d+\)")   # Windows' duplicate counter: "DSC_0001 (2)"
@@ -346,9 +390,21 @@ class VerifyResult:
     dest_verified: bool = False
 
 
+@dataclass(frozen=True)
+class FolderRules:
+    add_filtered: tuple = ()    # patterns: direct subfolders of a session, filtered by `originals`
+    add_whole: tuple = ()       # patterns: direct subfolders of a session, copied whole
+    exclude: tuple = ()         # patterns: never added, at any depth
+    whole: bool = False         # the whole folder, session or not
+    originals: str = "raw_or_jpeg"
+
+
 class _Planner:
-    def __init__(self, args):
+    def __init__(self, args, list_cache=None, skip_paths=frozenset(), rules=None):
         self.args = args
+        self.list_cache = list_cache
+        self.skip_paths = frozenset(os.path.normcase(path) for path in skip_paths)
+        self.rules = rules
         self.stats = Stats()
         self.errors = []
         self.warnings = []
@@ -399,7 +455,7 @@ class _Planner:
         folded = name.casefold()
         return self.export_contains in folded and folded not in self.export_excludes
 
-    def _list_dir(self, path):
+    def _scan_dir(self, path):
         files = []
         dirs = []
         try:
@@ -423,6 +479,19 @@ class _Planner:
             self.stats.scan_errors += 1
         files.sort(key=lambda item: item[0].casefold())
         dirs.sort(key=lambda item: item[0].casefold())
+        return files, dirs
+
+    def _list_dir(self, path):
+        key = os.path.normcase(path)
+        cached = self.list_cache.get(key) if self.list_cache is not None else None
+        if cached is None:
+            cached = self._scan_dir(path)
+            if self.list_cache is not None:
+                self.list_cache[key] = cached
+        files, dirs = cached
+        if self.skip_paths:
+            dirs = [item for item in dirs
+                    if os.path.normcase(item[1]) not in self.skip_paths]
         return files, dirs
 
     def _rel(self, path, base):
@@ -472,6 +541,8 @@ class _Planner:
             path, top = stack.pop()
             files, dirs = self._list_dir(path)
             for name, dpath in dirs:
+                if self.rules is not None and _folder_matches(name, self.rules.exclude):
+                    continue
                 if top and name.casefold() in skip_direct:
                     count, nbytes = self._tree_usage(dpath)
                     self.stats.c1_cache_skipped += count
@@ -570,10 +641,17 @@ class _Planner:
                 selected_keys.add(key)
         selected_keys = _source_keys(selected_keys)
         unselected_raw_stems = set()
+        raw_stems = set()
+        photo_stems = set()
         for name, _, _, _ in files:
             stem, ext = os.path.splitext(name)
-            if ext.casefold() in RAW_EXTENSIONS and not self._stem_matches(stem, selected_keys):
-                unselected_raw_stems.add(stem.casefold())
+            if ext.casefold() in JPEG_EXTENSIONS:
+                photo_stems.add(stem.casefold())
+            if ext.casefold() in RAW_EXTENSIONS:
+                raw_stems.add(stem.casefold())
+                if not self._stem_matches(stem, selected_keys):
+                    unselected_raw_stems.add(stem.casefold())
+        photo_stems |= raw_stems
         for name, fpath, size, mtime_ns in files:
             stem, ext = os.path.splitext(name)
             folded_ext = ext.casefold()
@@ -587,6 +665,14 @@ class _Planner:
                                  for prefix in _candidate_prefixes(stem))
                 if copied:
                     self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns, CAT_UNSELECTED))
+                else:
+                    self.stats.unselected_skipped += 1
+                    self.stats.unselected_skipped_bytes += size
+            elif self.unselected in ("raw_or_jpeg", "raw_jpeg"):
+                if _original_kept(name, raw_stems, self.unselected, all_sidecars=False,
+                                  photo_stems=photo_stems):
+                    self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns,
+                                          CAT_UNSELECTED))
                 else:
                     self.stats.unselected_skipped += 1
                     self.stats.unselected_skipped_bytes += size
@@ -604,15 +690,61 @@ class _Planner:
         # subfolders must keep their own classification.
         return bool(anchors)
 
+    def _add_filtered(self, root, base, originals):
+        stack = [root]
+        while stack:
+            path = stack.pop()
+            files, dirs = self._list_dir(path)
+            raw_stems = {os.path.splitext(name)[0].casefold()
+                         for name, _, _, _ in files
+                         if os.path.splitext(name)[1].casefold() in RAW_EXTENSIONS}
+            for name, fpath, size, mtime_ns in files:
+                if _original_kept(name, raw_stems, originals, all_sidecars=True):
+                    self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns,
+                                          CAT_ADDED))
+            for name, dpath in dirs:
+                folded = name.casefold()
+                if self.rules is not None and _folder_matches(name, self.rules.exclude):
+                    continue
+                if folded in self.c1_names:
+                    self._add_tree(dpath, base, CAT_ADDED, self.cache_skip_direct)
+                elif folded in self.nx_names:
+                    self._add_tree(dpath, base, CAT_ADDED)
+                else:
+                    stack.append(dpath)
+
+    def _add_whole_row(self, root, base):
+        stack = [root]
+        while stack:
+            path = stack.pop()
+            files, dirs = self._list_dir(path)
+            for name, dpath in dirs:
+                folded = name.casefold()
+                if folded in self.skip_folder_names:
+                    continue
+                if self.rules is not None and _folder_matches(name, self.rules.exclude):
+                    continue
+                if folded in self.c1_names:
+                    self._add_tree(dpath, base, CAT_WHOLE, self.cache_skip_direct)
+                else:
+                    stack.append(dpath)
+            for _, fpath, size, mtime_ns in files:
+                self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns,
+                                      CAT_WHOLE))
+
     def build(self):
         stack = []
+        whole = self.rules is not None and self.rules.whole
         for source in self.args.source:
             src = os.path.abspath(source)
             base = self.base
             if base is None:
                 base = os.path.splitdrive(src)[0] + os.sep
             self.sources.append((src, base))
-            stack.append((src, base, False))
+            if whole:
+                self._add_whole_row(src, base)
+            else:
+                stack.append((src, base, False))
         stack.reverse()
         while stack:
             path, base, inside_shoot = stack.pop()
@@ -626,6 +758,18 @@ class _Planner:
             if exports:
                 has_originals = self._session(path, base, files, exports, c1_dirs, nx_dirs)
                 child_inside = inside_shoot or has_originals
+                if has_originals and self.rules is not None:
+                    for name, dpath in dirs:
+                        if os.path.normcase(dpath) in classified:
+                            continue
+                        if _folder_matches(name, self.rules.exclude):
+                            continue
+                        if _folder_matches(name, self.rules.add_whole):
+                            self._add_tree(dpath, base, CAT_ADDED, self.cache_skip_direct)
+                            classified.add(os.path.normcase(dpath))
+                        elif _folder_matches(name, self.rules.add_filtered):
+                            self._add_filtered(dpath, base, self.rules.originals)
+                            classified.add(os.path.normcase(dpath))
                 for _, dpath in dirs:
                     if os.path.normcase(dpath) not in classified:
                         stack.append((dpath, base, child_inside))
@@ -1529,8 +1673,8 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
                  f"export formats: {args.export_formats}")
     lines.append(f"Plan:  NEW {_num(len(new))} files {_gb(sum(s.planned.size for s in new))} "
                  f"| CHANGED {_num(len(changed))}{auto_note} | UP_TO_DATE {_num(len(up_to_date))}")
-    categories = [CAT_EXPORT, CAT_SOURCE, CAT_CAPTURE_ONE, CAT_NX_STUDIO,
-                  CAT_UNSELECTED, CAT_UNEXPORTED]
+    categories = [CAT_EXPORT, CAT_SOURCE, CAT_ADDED, CAT_WHOLE, CAT_CAPTURE_ONE,
+                  CAT_NX_STUDIO, CAT_UNSELECTED, CAT_UNEXPORTED]
     to_copy = [status for status in statuses if _will_copy(status, args)]
     parts = []
     for category in categories:
@@ -1572,7 +1716,7 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
     return lines
 
 
-def _run_backup(args, log, stamp):
+def _run_backup(args, log, stamp, plan_fn=None):
     dest = os.path.abspath(args.dest)
     if args.expect_backup_id:
         found = read_backup_id(dest)
@@ -1582,7 +1726,7 @@ def _run_backup(args, log, stamp):
                   file=sys.stderr)
             log.log("ERROR expected backup ID does not match")
             return 2
-    planned = plan(args)
+    planned = (plan_fn or plan)(args)
     for error in planned.errors:
         log.log(error)
     for warning in planned.warnings:
@@ -1960,7 +2104,9 @@ def _build_parser():
                         help="a folder whose name contains this (any case) is an export folder")
     parser.add_argument("--exclude-export-names", default=EXPORT_NAME_EXCLUDE, metavar="NAMES",
                         help="';'-separated exact folder names that are not export folders")
-    parser.add_argument("--unselected", choices=("skip", "raw", "all"), default=UNSELECTED,
+    parser.add_argument("--unselected",
+                        choices=("skip", "raw", "raw_or_jpeg", "raw_jpeg", "all"),
+                        default=UNSELECTED,
                         help="originals of photos that were not exported (default: %(default)s)")
     parser.add_argument("--unexported", choices=("skip", "copy"), default=UNEXPORTED,
                         help="folders without an export (default: %(default)s)")

@@ -32,6 +32,7 @@ CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
 BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "selective_backup.py")
 RESTORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "restore_backup.py")
 CAPTUREONE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captureone_backup.py")
+MANIFEST_BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifest_backup.py")
 COPY_CAPTUREONE_SETTINGS = True # every backup also keeps Capture One's profiles, styles and settings
 VERIFY_MODE = "quick"           # default verify mode offered by the menu: quick | full
 FORMAT_ALTERNATIVES = {         # offered next to the backend's EXPORT_FORMATS default
@@ -108,6 +109,14 @@ def run_captureone(argv):
     """Run captureone_backup.py with `argv`; its output goes straight to the console."""
     try:
         return subprocess.run([sys.executable, CAPTUREONE, *argv]).returncode
+    except KeyboardInterrupt:
+        return 130
+
+
+def run_manifest(argv):
+    """Run manifest_backup.py with `argv`; its output goes straight to the console."""
+    try:
+        return subprocess.run([sys.executable, MANIFEST_BACKEND, *argv]).returncode
     except KeyboardInterrupt:
         return 130
 
@@ -644,6 +653,53 @@ def restore_flow(config):
     return rc
 
 
+def manifest_flow(config):
+    """Each folder of a manifest with its own mode: analyze, or dry-run then copy."""
+    title("Manifest - each folder with its own mode")
+    default = config.get("last_manifest") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "backup_manifest.csv")
+    while True:
+        manifest = ask("Manifest file", default).strip().strip('"')
+        if manifest:
+            break
+        say("  Type the manifest file.", "yellow")
+    config["last_manifest"] = manifest
+    dest = ask_dest(config.get("last_manifest_dest") or config["last"].get("dest", ""),
+                    must_exist=False)
+    config["last_manifest_dest"] = dest
+    save_config(config)
+    say("  [1] Analyze only (how many bytes each mode would take in each folder)")
+    say("  [2] Back up (dry-run first, then copy)")
+    choice = ask("Choose", "2")
+    if choice == "1":
+        rc = run_manifest(["--manifest", manifest, "--analyze"])
+        say(f"Analyze: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.",
+            "green" if rc == 0 else "yellow")
+        return rc
+    if choice != "2":
+        return 0
+    title("Step 1/2 - what would be copied (dry-run, nothing is written)")
+    rc = run_manifest(["--manifest", manifest, "--dest", dest, "--dry-run"])
+    if rc == 2:
+        say(f"Dry-run: {_EXIT_TEXT[2]}.", "red")
+        return rc
+    if rc == 130:
+        return rc
+    if rc == 1:
+        say("Some folders or files could not be read: they would NOT be backed up "
+            "(see the log).", "yellow")
+        if not yes_no("Copy the rest anyway?", False):
+            return rc
+    if not yes_no("Step 2/2 - copy now?", True):
+        say("Nothing copied.")
+        return 0
+    title("Copying")
+    rc = run_manifest(["--manifest", manifest, "--dest", dest, "--yes"])
+    say(f"Manifest backup: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.",
+        "green" if rc == 0 else "yellow")
+    return rc
+
+
 def _captureone_folder(config, must_exist):
     """The folder of a Capture One job; the last one is offered again."""
     folder = ask_dest(config.get("captureone_folder") or config["last"].get("dest", ""), must_exist)
@@ -737,6 +793,7 @@ def interactive():
         say("  [4] Settings")
         say("  [5] Restore from a backup")
         say("  [6] Capture One only (back up, restore, force, undo)")
+        say("  [7] Manifest (each folder with its own mode)")
         say("  [0] Exit")
         answer = ask("Choose", "1")
         if answer == "0":
@@ -753,6 +810,8 @@ def interactive():
             restore_flow(config)
         elif answer == "6":
             captureone_menu(config)
+        elif answer == "7":
+            manifest_flow(config)
 
 
 def run_preset(name):

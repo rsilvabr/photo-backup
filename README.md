@@ -17,6 +17,7 @@ A selective backup for photographers' archives. It backs up **the photos you exp
 - [Export formats](#export-formats)
 - [Originals that were not exported](#originals-that-were-not-exported---unselected)
 - [Folders without an export](#folders-without-an-export)
+- [Per-folder modes (`manifest_backup.py`)](#per-folder-modes-manifest_backuppy)
 - [Capture One and NX Studio](#capture-one-and-nx-studio)
 - [Re-runs, changed files and the versions folder](#re-runs-changed-files-and-the-versions-folder)
 - [Moved and renamed folders](#moved-and-renamed-folders)
@@ -99,6 +100,7 @@ A `.cos` only names its ICC profile, curve and style. The backup also keeps thos
 | `selective_backup.py` | The selective backup itself, from the command line: plan, copy, catalog, verify. Everything the menu does goes through it. |
 | `restore_backup.py` | Restores files from a backup: under a new folder (`--to`) or to the original places (`--to-original`). It imports the catalog and the copier from `selective_backup.py`, so the catalog format exists in one place only. |
 | `captureone_backup.py` | Backs up, verifies and restores Capture One's own profiles, styles and settings. The menu runs it with every backup. |
+| `manifest_backup.py` | Each folder of a manifest with its own mode (older years one configuration, recent years another). `--analyze` shows how many TB each mode would take per folder. It plans with `selective_backup.py`'s `_Planner` and copies with its `_run_backup`. |
 
 The menu never copies anything itself — it runs `selective_backup.py` (or `restore_backup.py`) with the options you confirmed, so every [safety guarantee](#safety-guarantees) holds either way.
 
@@ -133,6 +135,7 @@ python photo_backup.py
   [4] Settings
   [5] Restore from a backup
   [6] Capture One only (back up, restore, force, undo)
+  [7] Manifest (each folder with its own mode)
   [0] Exit
 ```
 
@@ -143,6 +146,7 @@ python photo_backup.py
 - **[4] Settings** shows where the remembered choices live (`~/.photo_backup_config.json`, or `$PHOTOBACKUP_CONFIG`) and the defaults of `selective_backup.py`. The menu reads those defaults from `selective_backup.py` itself: edit the top of that file and the menu follows.
 - **[5] Restore** lists the backup's top folders, asks what to restore and where to (the original places or another folder), runs a dry-run and then restores after a yes.
 - **[6] Capture One only** backs up just Capture One to a folder you choose, restores from one, force-restores and undoes the last force restore; see [Capture One's own files](#capture-ones-own-files-captureone_backuppy-v060).
+- **[7] Manifest** asks for a manifest and a destination and offers `[1] Analyze only` (how many bytes each mode would take in each folder) or `[2] Back up` (a dry-run first, then the copy after a yes); see [Per-folder modes](#per-folder-modes-manifest_backuppy).
 
 > **Tip:** The value shown in `[brackets]` is the default — just press Enter to accept it.
 
@@ -300,7 +304,14 @@ left out: `jxl-photo derivatives (their master is copied ...)`.
 - `skip` (default): not copied, counted in the summary.
 - `raw`: copy RAW files, plus sidecars (`.xmp`, `.dop`, `.pp3`) whose stem
   prefix matches an unselected RAW of that folder.
+- `raw_or_jpeg`: `raw`, plus every JPEG (`.jpg`, `.jpeg`) that has no RAW of
+  the same photo beside it — no camera photo is left without a copy.
+- `raw_jpeg`: `raw`, plus every JPEG of the session.
 - `all`: copy every direct file of the session.
+
+`raw_or_jpeg` and `raw_jpeg` were added for the manifest's `Originals` column
+([Per-folder modes](#per-folder-modes-manifest_backuppy)); `raw` keeps exactly
+the behaviour it had.
 
 The originals are copied only when at least one export file of that photo was
 actually selected for the backup (after format filtering and
@@ -324,6 +335,103 @@ drive root holding `04_ Exported_OLD`. Its export files are copied (and listed
 as exports without a matching original), but its subfolders keep their own
 classification — a trip folder below it is still a folder without an export,
 listed and copied with `--unexported copy`.
+
+## Per-folder modes (`manifest_backup.py`)
+
+One run can use a different rule for each folder: one set of years in one mode,
+another set in another. Two CSV files say what to do:
+
+- **The manifest** (`--manifest`, required) lists the folders:
+  `Folder,Mode,Originals`. The owner's real manifest (`backup_manifest.csv`)
+  stays out of git; `backup_manifest.example.csv` shows the format.
+- **The modes table** (`--modes`, default `backup_modes.csv` beside the
+  script) says what each mode copies:
+  `Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Description`.
+
+| Column | Meaning |
+|---|---|
+| `Mode` | the name used in the manifest's `Mode` column |
+| `Unselected` | `yes`/`no`: also copy the originals of the photos that were not exported |
+| `AddFolders` | `;`-separated patterns of direct subfolders of a session, copied with the filter of `Originals` |
+| `AddWhole` | `;`-separated patterns of direct subfolders of a session, copied whole |
+| `Exclude` | `;`-separated patterns never added, at any depth |
+| `Whole` | `yes`/`no`: the whole folder, session or not |
+| `Description` | free text shown nowhere; for the owner |
+
+A pattern is matched against the folder name, case-insensitively; only `*` is
+a wildcard, everything else is literal (so `[FINAL]` is a name, not a
+character class). `yes`/`no` are case-insensitive.
+
+**`Originals`** chooses how the photos that were not exported are kept:
+
+| Value | Copies |
+|---|---|
+| `raw` (empty = this) | RAW + sidecars + every JPEG that has no RAW of the same photo beside it (`DSC_0001 (2).JPG` is its own photo) |
+| `raw+jpeg` | RAW + sidecars + every JPEG |
+| `all` | everything |
+
+**The most specific line wins.** With `G:\2025` in mode 3 and
+`G:\2025\evento` in mode 6, the event follows mode 6 only; the mode 3 line
+never plans a file inside it. An export folder cannot have its own line below
+another line (the line above would no longer see its session's export). A
+folder repeated in the manifest aborts (exit 2), as does a file that is not
+UTF-8 (in Excel, save as "CSV UTF-8"), a mode that does not exist, a folder that does not exist, folders
+on more than one drive, and every other invalid table value — before any photo
+is read.
+
+**Lowering a mode deletes nothing.** A file that a lower mode no longer
+selects stays on the destination and appears as a `not_selected` orphan in
+`_orphans.csv`, exactly like a normal backup.
+
+The modes shipped in `backup_modes.csv`:
+
+```csv
+Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Description
+1,no,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Exports and the originals of the exported photos
+2,yes,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Mode 1 + unselected originals
+3,yes,_OUTTAKES_KEEP,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Mode 2 + _OUTTAKES_KEEP
+4,yes,_OUTTAKES_KEEP;_OUTTAKES,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Mode 3 + _OUTTAKES
+5,yes,_OUTTAKES*,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Mode 4 + every _OUTTAKES*
+6,no,,,,yes,The whole folder
+```
+
+Measured with `--analyze` on one 11 TB drive listed as a single line
+(2026-11-09). The `all` column also carries loose TIFF, JXL and other files:
+
+| Mode | What it copies | `raw` | `raw+jpeg` | `all` |
+|---|---|---:|---:|---:|
+| 1 | exports + originals of the exported photos + film scan folders | 1.37 TB | 1.37 TB | 1.37 TB |
+| 2 | mode 1 + unselected originals | 2.41 TB | 2.68 TB | 2.88 TB |
+| 3 | mode 2 + `_OUTTAKES_KEEP` | 2.50 TB | 2.80 TB | 3.00 TB |
+| 4 | mode 3 + `_OUTTAKES` | 3.84 TB | 4.57 TB | 4.77 TB |
+| 5 | mode 4 + every `_OUTTAKES*` | 4.25 TB | 5.12 TB | 5.33 TB |
+| 6 | the whole folder, also what has no export (without the Capture One `Cache`) | | | 11.16 TB |
+
+Options of `manifest_backup.py`:
+
+| Option | Description |
+|---|---|
+| `--manifest PATH` | the manifest CSV (`Folder,Mode,Originals`); required |
+| `--dest PATH` | destination root; required unless `--analyze` |
+| `--modes PATH` | the modes table (default `backup_modes.csv` beside the script) |
+| `--analyze` | print how many bytes each mode would take in each folder and write `<stamp>_analysis.csv`; copies nothing and needs no destination |
+| `--dry-run` | plan, print the summary and write the logs/CSVs; copy nothing |
+| `--yes` | do not ask for confirmation |
+| `--update-changed` | move a changed destination file to the versions folder before copying the new one |
+| `--no-auto-update` | do not update changed edit settings/sidecars (`AUTO_UPDATE_EXTENSIONS`) unless `--update-changed` is given |
+| `--verify-copy {none,size,hash}` | verification of each copy (default: `hash`, from `selective_backup.py`) |
+| `--space-margin-gb N` | free space kept on the destination, in GB (default: `20.0`, from `selective_backup.py`) |
+| `--export-formats SPEC` | `all`, `a>b>c` fallback or `a+b` multiple (default: `jxl>tif>jpg`, from `selective_backup.py`) |
+| `--expect-backup-id ID` | abort (exit 2) unless the destination holds this backup ID |
+| `--version` | print the version and exit |
+| `--help` | print the usage and exit |
+
+`--analyze` plans every mode of the table with every `Originals` value through
+the same `_Planner` the copy uses, sharing the folder scan between the modes,
+and marks the mode chosen by each manifest line. A folder that could not be
+read makes the numbers partial: the run says so and exits 1. The copy itself is
+`selective_backup.py`'s `_run_backup`: the same catalog, space check, versions
+folder, move detection and orphan report.
 
 ## Capture One and NX Studio
 
@@ -605,7 +713,7 @@ selective_backup.py --source PATH [--source PATH ...] --dest PATH [options]
 | `--exclude-export-subfolders NAMES` | `;`-separated folder names skipped inside export folders (any level), e.g. `JXL_mobile;WEB` |
 | `--export-name-contains TEXT` | a folder whose name contains this (any case) is an export folder (default `export`) |
 | `--exclude-export-names NAMES` | `;`-separated exact folder names that are NOT export folders |
-| `--unselected {skip,raw,all}` | originals of photos that were not exported (default `skip`) |
+| `--unselected {skip,raw,raw_or_jpeg,raw_jpeg,all}` | originals of photos that were not exported (default `skip`; see [the values](#originals-that-were-not-exported---unselected)) |
 | `--unexported {skip,copy}` | folders without an export (default `skip`) |
 | `--c1-cache` | also copy the Capture One `Cache` folders |
 | `--derivatives` | also copy the JXLs jxl-photo derived from a master that is copied ([details](#jxl-photo-derivatives---derivatives-v050)) |
