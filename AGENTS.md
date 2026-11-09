@@ -69,6 +69,13 @@ from the command line. A future job (e.g. a full mirror) is a new
   `os.replace`d — a crash never leaves a half file under the final name.
   The restore uses `no_clobber=True` (`os.rename` on Windows): a target that
   appears during the restore is never replaced.
+- **The order of a copy is write → on the disk → final name → catalog.** The
+  backup reads ahead on a thread (`_ReadAhead`) and flushes small files in
+  batches (`finish_pending` in `_copy_all`), but a file gets its final name
+  only after its `fsync`, and a catalog row only after that name: a re-run
+  trusts a final name with the right size and mtime. The flush runs before
+  `_finish_temp` because `copystat` can make the temp read-only. The catalog
+  stays on the main thread (SQLite).
 - **Leaving a file out needs proof (v0.5.0).** A jxl-photo derivative is
   skipped only when its own XMP says `jxlphoto-derived:` AND a JXL of the same
   photo that says `jxlphoto-src:` is selected in the same run

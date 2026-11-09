@@ -38,13 +38,13 @@ def test_renamed_session_is_moved_not_copied(tmp_path, monkeypatch):
     assert selective_backup.main(argv_for(source, dest, tmp_path, "--yes")) == 0
     os.rename(tmp_path / "G/2025/shoot", tmp_path / "G/2025/shoot [FINAL]")
     calls = []
-    real_copy = selective_backup._copy_file
+    real_write = selective_backup._write_temp
 
-    def counting_copy(planned, dst, verify, **kwargs):
+    def counting_write(planned, tmp, source, flush):
         calls.append(planned.rel)
-        return real_copy(planned, dst, verify, **kwargs)
+        return real_write(planned, tmp, source, flush)
 
-    monkeypatch.setattr(selective_backup, "_copy_file", counting_copy)
+    monkeypatch.setattr(selective_backup, "_write_temp", counting_write)
     assert selective_backup.main(argv_for(source, dest, tmp_path, "--yes")) == 0
     assert calls == []
     renamed = dest / "G/2025/shoot [FINAL]"

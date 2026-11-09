@@ -9,7 +9,8 @@ releases are also published as
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **[v0.7.0](#v070)** | 2026-11-08 | Capture One alone to a folder you choose; a force restore that keeps the old files, and undo |
+| **[v0.8.0](#v080)** | 2026-11-09 | Faster backups: the source is read ahead while the destination writes, and small files reach the disk in batches |
+| [v0.7.0](#v070) | 2026-11-08 | Capture One alone to a folder you choose; a force restore that keeps the old files, and undo |
 | [v0.6.0](#v060) | 2026-11-08 | Keeps what Capture One needs to show your edits on another computer: profiles, styles, defaults and settings, with a double-click restore |
 | [v0.5.0](#v050) | 2026-11-08 | Leaves out what jxl-photo can make again: an sRGB/resized JXL copy is not backed up when its master is. `DSC_0001 (2)` is treated as its own photo |
 | [v0.4.0](#v040) | 2026-11-08 | A renamed folder is moved inside the backup instead of copied again; orphans listed; each backup knows which disk it is; verify a big backup in slices; restore files from a backup |
@@ -18,6 +19,27 @@ releases are also published as
 | v0.1.0 | 2026-10-06 | First implementation, not released |
 
 `mobile_backup.py` has its own version: [see the end of this page](#mobile_backuppy).
+
+---
+
+## v0.8.0
+
+**Released 2026-11-09.** Nothing to do when upgrading. An interrupted backup
+continues from where it stopped, as before.
+
+- **Both disks work at once.** A thread reads the source up to `READ_AHEAD_MB`
+  (512) ahead while the destination writes. Before, the source disk waited for
+  the destination at the end of every file.
+- **Small files reach the disk in batches.** Files below `SMALL_FILE_KB` (1024)
+  are flushed `FLUSH_BATCH_FILES` (50) at a time, by `FLUSH_THREADS` (8). On a
+  USB hard disk this took the wait from 71-78 ms to about 9 ms per file, which
+  matters because edit settings and sidecars are most of the files in a backup.
+- **The order did not change.** A file gets its final name only after it is on
+  the disk, and the catalog lists it only after that. Restores and the Capture
+  One backup copy as before.
+- **Measured.** A real 44 GB session (4 983 files) to a scratch SSD went from
+  34 to 45 MB/s. A large file's own flush costs nothing measurable (about
+  100 MB/s on that USB disk with any strategy), so large files keep theirs.
 
 ---
 

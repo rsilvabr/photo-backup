@@ -14,6 +14,7 @@ sidecars (AUTO_UPDATE_EXTENSIONS) are updated that way on every run.
 """
 
 import argparse
+import collections
 import csv
 import hashlib
 import json
@@ -23,12 +24,14 @@ import shutil
 import sqlite3
 import struct
 import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -81,6 +84,10 @@ VERIFY_COPY = "hash"                # default --verify-copy: none | size | hash
 SPACE_MARGIN_GB = 20.0              # free space kept on the destination (default --space-margin-gb)
 MTIME_TOLERANCE_S = 2.0             # FAT/exFAT store mtimes in 2 s steps
 COPY_CHUNK_MB = 8
+READ_AHEAD_MB = 512                 # backup: source data read ahead in RAM while the destination writes; 0 = one disk at a time
+SMALL_FILE_KB = 1024                # backup: files below this are flushed to disk in batches
+FLUSH_BATCH_FILES = 50              # backup: files per flush batch and per catalog commit; 1 = flush each file
+FLUSH_THREADS = 8                   # backup: simultaneous flushes of a batch (measured on a USB HDD: 8 beat 1 and 32)
 TEMP_SUFFIX = ".pbtmp"              # in-progress copy, next to its final name
 CATALOG_FOLDER = "_photo_backup"    # under the destination: catalog.sqlite + versions\
 PROGRESS_EVERY_S = 5.0
@@ -940,57 +947,230 @@ def _move_to_versions(dest, stamp, status, log):
     log.log(f"VERSION {status.planned.rel}")
 
 
-def _copy_file(planned, dst, verify, expected_sha256=None, no_clobber=False):
-    """Copy to a temp file next to `dst`, verify, then move it into place.
-    no_clobber: a `dst` that exists at that last step is never replaced
-    (FileExistsError, nothing written) -- the restore's rule."""
-    tmp = dst + TEMP_SUFFIX
-    os.makedirs(_io(os.path.dirname(dst)), exist_ok=True)
+class _SourceRead:
+    """One source file, read once and hashed as it is read. `digest` and
+    `stat0` are set when the iteration ends; a file that changed meanwhile
+    raises instead of ending."""
+
+    def __init__(self, planned):
+        self.planned = planned
+        self.digest = None
+        self.stat0 = None
+
+    def __iter__(self):
+        stat0 = os.stat(_io(self.planned.src), follow_symlinks=False)
+        hasher = hashlib.sha256()
+        with open(_io(self.planned.src), "rb") as handle:
+            while True:
+                chunk = handle.read(COPY_CHUNK_MB * 1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                yield chunk
+        stat1 = os.stat(_io(self.planned.src), follow_symlinks=False)
+        if (stat1.st_size, stat1.st_mtime_ns) != (stat0.st_size, stat0.st_mtime_ns):
+            raise RuntimeError("source changed during copy")
+        self.digest = hasher.hexdigest()
+        self.stat0 = stat0
+
+    def drain(self):
+        """Nothing is queued for a file read directly."""
+
+
+class _StreamedSource:
+    """A file's chunks coming out of _ReadAhead, in the order they were read."""
+
+    def __init__(self, read_ahead, planned):
+        self._read_ahead = read_ahead
+        self.planned = planned
+        self.digest = None
+        self.stat0 = None
+        self._finished = False
+
+    def _next_item(self):
+        """The next queued item of this file; marks the file finished at its last."""
+        item = self._read_ahead.take()
+        if item[0] != "chunk":
+            self._finished = True
+        return item
+
+    def __iter__(self):
+        while not self._finished:
+            item = self._next_item()
+            if item[0] == "chunk":
+                yield item[1]
+            elif item[0] == "error":
+                raise item[1]
+            elif item[1] is not self.planned:
+                raise RuntimeError("read-ahead out of step with the copy")
+            else:
+                self.digest, self.stat0 = item[2], item[3]
+
+    def drain(self):
+        """Discard what is left of this file, so the next one starts at its own data."""
+        while not self._finished:
+            self._next_item()
+
+
+class _ReadAhead:
+    """Reads the source files on a thread of its own, up to `capacity` bytes
+    ahead, so the source disk works while the destination disk is busy. The
+    files come out in the order of `planned_files`: take exactly one
+    next_source() per file and drain() it."""
+
+    def __init__(self, planned_files, capacity):
+        self._planned_files = planned_files
+        self._capacity = capacity
+        self._items = collections.deque()
+        self._bytes = 0
+        self._stopping = False
+        self._condition = threading.Condition()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _put(self, item, size=0):
+        with self._condition:
+            while (not self._stopping and self._bytes
+                   and self._bytes + size > self._capacity):
+                self._condition.wait(0.2)
+            if self._stopping:
+                return False
+            self._items.append((item, size))
+            self._bytes += size
+            self._condition.notify_all()
+            return True
+
+    def _run(self):
+        for planned in self._planned_files:
+            source = _SourceRead(planned)
+            try:
+                for chunk in source:
+                    if not self._put(("chunk", chunk), len(chunk)):
+                        return
+            except Exception as exc:
+                if not self._put(("error", exc)):
+                    return
+                continue
+            if not self._put(("end", planned, source.digest, source.stat0)):
+                return
+
+    def next_source(self, planned):
+        return _StreamedSource(self, planned)
+
+    def take(self):
+        with self._condition:
+            # A timed wait: Ctrl+C reaches a wait on Windows only when it ends.
+            while not self._items:
+                if not self._thread.is_alive():
+                    return ("error", RuntimeError("the read-ahead thread stopped"))
+                self._condition.wait(0.2)
+            item, size = self._items.popleft()
+            self._bytes -= size
+            self._condition.notify_all()
+            return item
+
+    def close(self):
+        with self._condition:
+            self._stopping = True
+            self._condition.notify_all()
+        self._thread.join(5)
+
+
+def _remove_temp(tmp):
     try:
         if _exists(tmp):
             os.remove(_io(tmp))
-        stat0 = os.stat(_io(planned.src), follow_symlinks=False)
-        hasher = hashlib.sha256()
-        with open(_io(planned.src), "rb") as source_handle:
-            with open(_io(tmp), "xb") as tmp_handle:
-                while True:
-                    chunk = source_handle.read(COPY_CHUNK_MB * 1024 * 1024)
-                    if not chunk:
-                        break
-                    hasher.update(chunk)
-                    tmp_handle.write(chunk)
-                tmp_handle.flush()
-                os.fsync(tmp_handle.fileno())
-        stat1 = os.stat(_io(planned.src), follow_symlinks=False)
-        if (stat1.st_size, stat1.st_mtime_ns) != (stat0.st_size, stat0.st_mtime_ns):
-            raise RuntimeError("source changed during copy")
-        if expected_sha256 is not None and hasher.hexdigest() != expected_sha256:
-            raise RuntimeError("content differs from the catalog sha256 (backup copy corrupt?)")
-        shutil.copystat(_io(planned.src), _io(tmp))
-        if verify == "size":
-            if os.stat(_io(tmp)).st_size != stat0.st_size:
-                raise RuntimeError("size mismatch after copy")
-        elif verify == "hash":
-            if _sha256_file(tmp) != hasher.hexdigest():
-                raise RuntimeError("hash mismatch after copy")
-        if no_clobber:
-            # Atomic "only if absent": Windows' rename refuses an existing
-            # target; elsewhere a hard link does (rename would overwrite).
-            if os.name == "nt":
-                os.rename(_io(tmp), _io(dst))
-            else:
-                os.link(_io(tmp), _io(dst))
-                os.remove(_io(tmp))
+    except OSError:
+        pass
+
+
+def _write_temp(planned, tmp, source, flush):
+    """Write `source` to the temp file; `flush` waits until it is on the disk."""
+    if _exists(tmp):
+        os.remove(_io(tmp))
+    with open(_io(tmp), "xb") as handle:
+        for chunk in source:
+            handle.write(chunk)
+        if flush:
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def _flush_temp(tmp):
+    """Wait until a temp file written without `flush` is on the disk. Must run
+    before _finish_temp: the copied attributes can make the file read-only."""
+    with open(_io(tmp), "r+b") as handle:
+        os.fsync(handle.fileno())
+
+
+def _flush_error(tmp):
+    """_flush_temp for a thread pool: the error comes back as a value."""
+    try:
+        _flush_temp(tmp)
+    except Exception as exc:
+        return exc
+    return None
+
+
+def _finish_temp(planned, tmp, dst, verify, digest, stat0, expected_sha256=None, no_clobber=False):
+    """Verify a temp file already on the disk, then give it its final name."""
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise RuntimeError("content differs from the catalog sha256 (backup copy corrupt?)")
+    shutil.copystat(_io(planned.src), _io(tmp))
+    if verify == "size":
+        if os.stat(_io(tmp)).st_size != stat0.st_size:
+            raise RuntimeError("size mismatch after copy")
+    elif verify == "hash":
+        if _sha256_file(tmp) != digest:
+            raise RuntimeError("hash mismatch after copy")
+    if no_clobber:
+        # Atomic "only if absent": Windows' rename refuses an existing
+        # target; elsewhere a hard link does (rename would overwrite).
+        if os.name == "nt":
+            os.rename(_io(tmp), _io(dst))
         else:
-            os.replace(_io(tmp), _io(dst))
-        return hasher.hexdigest(), stat0.st_size, stat0.st_mtime_ns
+            os.link(_io(tmp), _io(dst))
+            os.remove(_io(tmp))
+    else:
+        os.replace(_io(tmp), _io(dst))
+    return digest, stat0.st_size, stat0.st_mtime_ns
+
+
+def _copy_file(planned, dst, verify, expected_sha256=None, no_clobber=False, source=None):
+    """Copy to a temp file next to `dst`, verify, then move it into place.
+    no_clobber: a `dst` that exists at that last step is never replaced
+    (FileExistsError, nothing written) -- the restore's rule. `source`: where
+    the data comes from (default: read the file here)."""
+    tmp = dst + TEMP_SUFFIX
+    os.makedirs(_io(os.path.dirname(dst)), exist_ok=True)
+    source = _SourceRead(planned) if source is None else source
+    try:
+        _write_temp(planned, tmp, source, True)
+        return _finish_temp(planned, tmp, dst, verify, source.digest, source.stat0,
+                            expected_sha256, no_clobber)
     except BaseException:
-        try:
-            if _exists(tmp):
-                os.remove(_io(tmp))
-        except OSError:
-            pass
+        _remove_temp(tmp)
         raise
+
+
+@dataclass
+class _PendingCopy:
+    """A small file written to its temp name, waiting for its batch's flush."""
+    status: object
+    tmp: str
+    source: object
+
+
+def _stage_small_file(status, source):
+    """Write a small file to its temp name without waiting for the disk."""
+    tmp = status.dst + TEMP_SUFFIX
+    os.makedirs(_io(os.path.dirname(status.dst)), exist_ok=True)
+    try:
+        _write_temp(status.planned, tmp, source, False)
+    except BaseException:
+        _remove_temp(tmp)
+        raise
+    return _PendingCopy(status, tmp, source)
 
 
 def _auto_updated(status, args):
@@ -1205,37 +1385,90 @@ def _copy_all(args, statuses, dest, stamp, catalog, log):
     done = 0
     done_bytes = 0
     error_count = 0
+    uncommitted = 0
     started = time.monotonic()
     last_report = started
     log.log(f"Copying {_num(len(to_copy))} files / {_gb(total_bytes)}")
-    for index, status in enumerate(to_copy, 1):
-        try:
-            if status.status == ST_CHANGED:
-                _move_to_versions(dest, stamp, status, log)
-            sha256, size, mtime_ns = _copy_file(status.planned, status.dst, args.verify_copy)
-            catalog.upsert(status.planned, sha256, size, mtime_ns)
-            done += 1
-            done_bytes += status.planned.size
-            log.log(f"COPY {status.planned.rel}")
-        except KeyboardInterrupt:
-            catalog.commit()
-            print(f"Interrupted: {done} copied, {error_count} errors")
-            log.log(f"INTERRUPTED after {done} copied, {error_count} errors")
-            return done, done_bytes, error_count, True
-        except Exception as exc:
-            error_count += 1
-            log.log(f"ERROR {status.planned.rel}: {exc}")
-        now = time.monotonic()
-        if to_copy and now - last_report >= PROGRESS_EVERY_S:
-            elapsed = max(now - started, 1e-6)
-            speed = done_bytes / elapsed
-            eta = (total_bytes - done_bytes) / speed if speed > 0 else 0
-            print(f"[{done}/{len(to_copy)}] {_gb(done_bytes)}/{_gb(total_bytes)}  "
-                  f"{speed / 1e6:.0f} MB/s  ETA {_hms(eta)}")
-            last_report = now
-        if done and done % 50 == 0:
-            catalog.commit()
-    catalog.commit()
+    pending = []
+    read_ahead = None
+    if READ_AHEAD_MB > 0 and to_copy:
+        read_ahead = _ReadAhead([status.planned for status in to_copy],
+                                READ_AHEAD_MB * 1024 * 1024)
+    flush_pool = ThreadPoolExecutor(max_workers=max(FLUSH_THREADS, 1))
+
+    def record(status, sha256, size, mtime_ns):
+        nonlocal done, done_bytes, uncommitted
+        catalog.upsert(status.planned, sha256, size, mtime_ns)
+        done += 1
+        done_bytes += status.planned.size
+        uncommitted += 1
+        log.log(f"COPY {status.planned.rel}")
+
+    def failed(status, exc):
+        nonlocal error_count
+        error_count += 1
+        log.log(f"ERROR {status.planned.rel}: {exc}")
+
+    def finish_pending():
+        """Flush the waiting temp files together. Only a file already on the
+        disk gets its final name, and only then does the catalog list it: a
+        crash must not leave a garbage file that looks like a finished copy."""
+        nonlocal uncommitted
+        flush_errors = list(flush_pool.map(_flush_error, [item.tmp for item in pending]))
+        for flush_error in flush_errors:
+            item = pending[0]
+            try:
+                if flush_error is not None:
+                    raise flush_error
+                record(item.status, *_finish_temp(
+                    item.status.planned, item.tmp, item.status.dst, args.verify_copy,
+                    item.source.digest, item.source.stat0))
+            except Exception as exc:
+                _remove_temp(item.tmp)
+                failed(item.status, exc)
+            pending.pop(0)
+        catalog.commit()
+        uncommitted = 0
+
+    try:
+        for status in to_copy:
+            source = read_ahead.next_source(status.planned) if read_ahead else _SourceRead(status.planned)
+            try:
+                if status.status == ST_CHANGED:
+                    _move_to_versions(dest, stamp, status, log)
+                if FLUSH_BATCH_FILES > 1 and status.planned.size < SMALL_FILE_KB * 1024:
+                    pending.append(_stage_small_file(status, source))
+                    if len(pending) >= FLUSH_BATCH_FILES:
+                        finish_pending()
+                else:
+                    record(status, *_copy_file(status.planned, status.dst, args.verify_copy,
+                                               source=source))
+            except Exception as exc:
+                failed(status, exc)
+            source.drain()
+            now = time.monotonic()
+            if to_copy and now - last_report >= PROGRESS_EVERY_S:
+                elapsed = max(now - started, 1e-6)
+                speed = done_bytes / elapsed
+                eta = (total_bytes - done_bytes) / speed if speed > 0 else 0
+                print(f"[{done}/{len(to_copy)}] {_gb(done_bytes)}/{_gb(total_bytes)}  "
+                      f"{speed / 1e6:.0f} MB/s  ETA {_hms(eta)}")
+                last_report = now
+            if uncommitted >= max(FLUSH_BATCH_FILES, 1):
+                catalog.commit()
+                uncommitted = 0
+        finish_pending()
+    except KeyboardInterrupt:
+        for item in pending:
+            _remove_temp(item.tmp)
+        catalog.commit()
+        print(f"Interrupted: {done} copied, {error_count} errors")
+        log.log(f"INTERRUPTED after {done} copied, {error_count} errors")
+        return done, done_bytes, error_count, True
+    finally:
+        if read_ahead is not None:
+            read_ahead.close()
+        flush_pool.shutdown(wait=True)
     return done, done_bytes, error_count, False
 
 

@@ -652,6 +652,10 @@ default everywhere.
 | `SPACE_MARGIN_GB` | `20.0` | free space kept on the destination |
 | `MTIME_TOLERANCE_S` | `2.0` | mtime tolerance (FAT/exFAT stores 2 s steps) |
 | `COPY_CHUNK_MB` | `8` | read/write block size |
+| `READ_AHEAD_MB` | `512` | backup: source data read ahead in RAM while the destination writes (`0` = one disk at a time) |
+| `SMALL_FILE_KB` | `1024` | backup: files below this are flushed to disk in batches |
+| `FLUSH_BATCH_FILES` | `50` | backup: files per flush batch and per catalog commit (`1` = flush each file) |
+| `FLUSH_THREADS` | `8` | backup: simultaneous flushes of a batch |
 | `TEMP_SUFFIX` | `.pbtmp` | in-progress copy suffix |
 | `CATALOG_FOLDER` | `_photo_backup` | catalog and versions folder under the destination |
 | `PROGRESS_EVERY_S` | `5.0` | console progress interval |
@@ -707,20 +711,20 @@ Japanese file names.
 
 ## Current version
 
-**v0.7.0** (2026-11-08).
+**v0.8.0** (2026-11-09).
 
-- Menu `[6]`: back up only Capture One to a folder you choose, and restore from one.
-- A force restore replaces what differs and keeps the current files first; one command undoes it. Factory profiles need a separate option, and a monitor calibration is never replaced. [Details](#capture-ones-own-files-captureone_backuppy-v060).
+- Faster backups: the source is read ahead while the destination writes, and small files (edit settings, sidecars) reach the disk in batches. Nothing to do when upgrading, and a file still gets its final name only once it is on the disk.
 
-**v0.6.0** added the backup of Capture One's profiles, styles and settings, with a double-click restore for a new computer.
+**v0.7.0** added Capture One alone to a folder you choose, and a force restore that keeps the current files first and can be undone. [Details](#capture-ones-own-files-captureone_backuppy-v060).
 
-**106 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
+**208 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
 
 ## Changelog
 
 | Version | Date | What it added |
 |---------|------|---------------|
-| **v0.7.0** | 2026-11-08 | Capture One alone to a folder you choose; force restore that keeps the old files, and undo |
+| **v0.8.0** | 2026-11-09 | Faster backups: read-ahead while the destination writes, small files flushed in batches |
+| v0.7.0 | 2026-11-08 | Capture One alone to a folder you choose; force restore that keeps the old files, and undo |
 | v0.6.0 | 2026-11-08 | Keeps Capture One's own profiles, styles and settings; double-click restore for a new computer |
 | v0.5.0 | 2026-11-08 | Leaves out the sRGB/resized JXL copies jxl-photo made from a master that is backed up; `DSC_0001 (2)` treated as its own photo |
 | v0.4.0 | 2026-11-08 | Renamed folders moved instead of copied again; orphans listed; a backup ID per disk; verify in slices; `restore_backup.py` |
