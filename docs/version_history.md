@@ -9,7 +9,8 @@ releases are also published as
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **[v0.9.0](#v090)** | 2026-11-09 | Each folder with its own backup mode, from a manifest; `--analyze` shows the size of every mode first |
+| **[v0.10.0](#v0100)** | 2026-11-10 | Modes `1+` to `5+`: a folder not exported yet is copied whole, so what has not been edited is not left out |
+| [v0.9.0](#v090) | 2026-11-09 | Each folder with its own backup mode, from a manifest; `--analyze` shows the size of every mode first |
 | [v0.8.1](#v081) | 2026-11-09 | The versions folder keeps only real old versions: an old copy identical to the new one is no longer kept |
 | [v0.8.0](#v080) | 2026-11-09 | Faster backups: the source is read ahead while the destination writes, and small files reach the disk in batches |
 | [v0.7.0](#v070) | 2026-11-08 | Capture One alone to a folder you choose; a force restore that keeps the old files, and undo |
@@ -21,6 +22,21 @@ releases are also published as
 | v0.1.0 | 2026-10-06 | First implementation, not released |
 
 `mobile_backup.py` has its own version: [see the end of this page](#mobile_backuppy).
+
+---
+
+## v0.10.0
+
+**Released 2026-11-10.** Nothing to do when upgrading: the modes `1` to `6` work
+as before.
+
+- **Modes `1+` to `5+`.** A new optional column of the modes table,
+  `Unexported`: a folder with an export follows the rest of the mode, and a
+  folder without one is copied whole. A table without the column keeps working.
+- **Exporting later deletes nothing.** When a folder gets an export, the files
+  that left the selection appear as `not_selected` orphans and stay on the
+  backup.
+- **`Exclude` also applies** to the folders without an export in these modes.
 
 ---
 

@@ -346,7 +346,7 @@ another set in another. Two CSV files say what to do:
   stays out of git; `backup_manifest.example.csv` shows the format.
 - **The modes table** (`--modes`, default `backup_modes.csv` beside the
   script) says what each mode copies:
-  `Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Description`.
+  `Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Description`.
 
 | Column | Meaning |
 |---|---|
@@ -356,6 +356,7 @@ another set in another. Two CSV files say what to do:
 | `AddWhole` | `;`-separated patterns of direct subfolders of a session, copied whole |
 | `Exclude` | `;`-separated patterns never added, at any depth |
 | `Whole` | `yes`/`no`: the whole folder, session or not |
+| `Unexported` | `yes`/`no`, optional: a folder without an export is copied whole; a folder with one follows the rest of the mode |
 | `Description` | free text shown nowhere; for the owner |
 
 A pattern is matched against the folder name, case-insensitively; only `*` is
@@ -386,14 +387,18 @@ selects stays on the destination and appears as a `not_selected` orphan in
 The modes shipped in `backup_modes.csv`:
 
 ```csv
-Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Description
-1,no,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Exports and the originals of the exported photos
-2,yes,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Mode 1 + unselected originals
-3,yes,_OUTTAKES_KEEP,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Mode 2 + _OUTTAKES_KEEP
-4,yes,_OUTTAKES_KEEP;_OUTTAKES,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Mode 3 + _OUTTAKES
-5,yes,_OUTTAKES*,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,Mode 4 + every _OUTTAKES*
-6,no,,,,yes,The whole folder
+Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Description
+1,no,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,Exports and the originals of the exported photos
+2,yes,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,Mode 1 + unselected originals
+3,yes,_OUTTAKES_KEEP,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,Mode 2 + _OUTTAKES_KEEP
+4,yes,_OUTTAKES_KEEP;_OUTTAKES,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,Mode 3 + _OUTTAKES
+5,yes,_OUTTAKES*,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,Mode 4 + every _OUTTAKES*
+6,no,,,,yes,no,The whole folder
 ```
+
+Modes `1+` to `5+` are the same five with `Unexported=yes`: a folder with an
+export follows the mode, and a folder not exported yet is copied whole, so what
+has not been edited or selected is not left out.
 
 Measured with `--analyze` on one 11 TB drive listed as a single line
 (2026-11-09). The `all` column also carries loose TIFF, JXL and other files:
@@ -826,19 +831,20 @@ Japanese file names.
 
 ## Current version
 
-**v0.9.0** (2026-11-09).
+**v0.10.0** (2026-11-10).
 
-- Each folder can have its own backup mode, from a manifest: a CSV lists the folders, another says what each mode copies, and `--analyze` shows how much each mode takes before anything is copied. [Details](#per-folder-modes-manifest_backuppy). Nothing to do when upgrading: the normal backup works as before.
+- Modes `1+` to `5+`: a folder with an export follows the mode, and a folder not exported yet is copied whole, so what has not been edited is not left out. [Details](#per-folder-modes-manifest_backuppy). Nothing to do when upgrading: the modes `1` to `6` work as before.
 
-**v0.8.1** made the `versions\` folder keep only real old versions: an old copy identical to the new one is no longer kept.
+**v0.9.0** gave each folder its own backup mode, from a manifest, with `--analyze` to see the size of each mode first.
 
-**247 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
+**256 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
 
 ## Changelog
 
 | Version | Date | What it added |
 |---------|------|---------------|
-| **v0.9.0** | 2026-11-09 | Per-folder backup modes from a manifest, with `--analyze` to see the size of each mode first |
+| **v0.10.0** | 2026-11-10 | Modes `1+` to `5+`: a folder not exported yet is copied whole |
+| v0.9.0 | 2026-11-09 | Per-folder backup modes from a manifest, with `--analyze` to see the size of each mode first |
 | v0.8.1 | 2026-11-09 | The versions folder no longer keeps an old copy identical to the new one |
 | v0.8.0 | 2026-11-09 | Faster backups: read-ahead while the destination writes, small files flushed in batches |
 | v0.7.0 | 2026-11-08 | Capture One alone to a folder you choose; force restore that keeps the old files, and undo |

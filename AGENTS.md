@@ -101,6 +101,9 @@ from the command line. A future job (e.g. a full mirror) is a new
   maps to `raw_or_jpeg`: RAW + sidecars + every JPEG that has no RAW of the
   same photo beside it (`X (2).JPG` is another file, not a variant of `X`), and
   the sidecars of what it keeps. `raw+jpeg` and `all` only copy more.
+- **A folder not exported yet is not lost in a `+` mode.** `Unexported=yes`
+  in the modes table copies a folder without an export whole (`--unexported
+  copy`, per line); a folder with one follows the rest of the mode.
 - **A manifest never hides a loss.** An export folder cannot have its own line
   below another line (the line above would stop being a session and lose its
   originals), and `--analyze` exits 1 when a folder could not be read.

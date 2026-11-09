@@ -612,3 +612,113 @@ def test_review_f_an_export_folder_alone_is_allowed(tmp_path):
     manifest = write_manifest(tmp_path / "manifest.csv", [(source / "_EXPORT", "6", "raw")])
     assert mb.main(["--manifest", str(manifest), "--modes", str(SHIPPED_MODES),
                     "--analyze"]) == 0
+
+
+# ---- Modes with '+': the mode where there is an export, the whole folder where there is none
+def mixed_tree(root):
+    prefix = f"2025/{HOSTILE}"
+    make_tree(root, {
+        f"{prefix}/edited/_DSC1.NEF": 10,
+        f"{prefix}/edited/_DSC1.xmp": 11,
+        f"{prefix}/edited/_DSC2.NEF": 12,
+        f"{prefix}/edited/_EXPORT/x/_DSC1_v1.jpg": 20,
+        f"{prefix}/edited/_OUTTAKES/o.NEF": 30,
+        f"{prefix}/edited/_OUTTAKES_KEEP/k.NEF": 31,
+        f"{prefix}/not_edited/_DSC5.NEF": 40,
+        f"{prefix}/not_edited/_DSC5.JPG": 41,
+        f"{prefix}/not_edited/notes.txt": 42,
+        f"{prefix}/not_edited/_OUTTAKES/x.NEF": 43,
+        f"{prefix}/not_edited/tmp/y.NEF": 44,
+        f"{prefix}/not_edited/CaptureOne/Settings166/a.cos": 45,
+        f"{prefix}/not_edited/CaptureOne/Cache/p.cop": 46,
+    })
+    return root / "2025" / HOSTILE, f"2025/{HOSTILE}"
+
+
+def run_mixed(tmp_path, mode, modes=SHIPPED_MODES):
+    folder, prefix = mixed_tree(tmp_path / "G")
+    manifest = write_manifest(tmp_path / "manifest.csv", [(folder, mode, "raw")])
+    dest = tmp_path / "backup"
+    assert mb.main(["--manifest", str(manifest), "--modes", str(modes),
+                    "--dest", str(dest), "--yes"]) == 0
+    return dest_files(dest), prefix
+
+
+def has(files, suffix):
+    return any(rel.endswith(suffix) for rel in files)
+
+
+def test_plus_mode_takes_the_whole_folder_where_there_is_no_export(tmp_path):
+    files, prefix = run_mixed(tmp_path, "3+")
+    for rel in ("not_edited/_DSC5.NEF", "not_edited/_DSC5.JPG", "not_edited/notes.txt",
+                "not_edited/_OUTTAKES/x.NEF", "not_edited/tmp/y.NEF",
+                "not_edited/CaptureOne/Settings166/a.cos"):
+        assert has(files, f"{prefix}/{rel}"), rel
+    assert not has(files, "CaptureOne/Cache/p.cop")
+
+
+def test_plus_mode_follows_its_mode_where_there_is_an_export(tmp_path):
+    files, prefix = run_mixed(tmp_path, "3+")
+    assert has(files, f"{prefix}/edited/_EXPORT/x/_DSC1_v1.jpg")
+    assert has(files, f"{prefix}/edited/_DSC1.NEF")
+    assert has(files, f"{prefix}/edited/_DSC2.NEF")                  # mode 2 onwards
+    assert has(files, f"{prefix}/edited/_OUTTAKES_KEEP/k.NEF")       # mode 3
+    assert not has(files, f"{prefix}/edited/_OUTTAKES/o.NEF")        # mode 4 onwards
+
+
+def test_a_mode_without_plus_still_leaves_those_folders_out(tmp_path):
+    files, prefix = run_mixed(tmp_path, "3")
+    assert has(files, f"{prefix}/edited/_DSC1.NEF")
+    assert not has(files, f"{prefix}/not_edited/_DSC5.NEF")
+
+
+def test_every_plus_mode_of_the_table_is_its_mode_with_the_column_on(tmp_path):
+    modes = mb.read_modes(str(SHIPPED_MODES))
+    plus = [name for name in modes if name.endswith("+")]
+    assert plus
+    for name in plus:
+        base, mixed = modes[name[:-1]], modes[name]
+        assert mixed.unexported and not base.unexported
+        assert (mixed.unselected, mixed.add_folders, mixed.add_whole, mixed.whole) == (
+            base.unselected, base.add_folders, base.add_whole, base.whole)
+
+
+def test_a_table_without_the_column_keeps_working(tmp_path):
+    table = write_modes(tmp_path / "modes.csv", [("1", "no", "", "", "", "no", "old table")])
+    assert mb.read_modes(str(table))["1"].unexported is False
+
+
+def test_exclude_also_works_where_there_is_no_export(tmp_path):
+    table = tmp_path / "modes.csv"
+    table.write_text("Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Description\n"
+                     "X,no,,,tmp,no,yes,test\n", encoding="utf-8")
+    files, prefix = run_mixed(tmp_path, "X", table)
+    assert has(files, f"{prefix}/not_edited/_DSC5.NEF")
+    assert not has(files, f"{prefix}/not_edited/tmp/y.NEF")
+
+
+@pytest.mark.parametrize("line,name", [
+    ("X,no,,,,no,maybe,t", "invalid yes/no"),
+    ("X,no,,,,yes,yes,t", "Whole=yes with Unexported=yes"),
+])
+def test_a_bad_unexported_value_aborts(tmp_path, line, name):
+    table = tmp_path / "modes.csv"
+    table.write_text("Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Description\n"
+                     + line + "\n", encoding="utf-8")
+    folder = tmp_path / HOSTILE
+    folder.mkdir()
+    manifest = write_manifest(tmp_path / "manifest.csv", [(folder, "X", "raw")])
+    assert mb.main(["--manifest", str(manifest), "--modes", str(table), "--analyze"]) == 2, name
+
+
+def test_analyze_of_a_plus_mode_matches_the_dry_run(tmp_path, photobackup_log_dir):
+    folder, _ = mixed_tree(tmp_path / "G")
+    manifest = write_manifest(tmp_path / "manifest.csv", [(folder, "2+", "raw")])
+    assert mb.main(["--manifest", str(manifest), "--modes", str(SHIPPED_MODES),
+                    "--analyze"]) == 0
+    rows = list(csv.DictReader(io.StringIO(latest_csv(photobackup_log_dir, "_analysis.csv"))))
+    chosen = [row for row in rows if row["chosen"] == "yes"][0]
+    assert mb.main(["--manifest", str(manifest), "--modes", str(SHIPPED_MODES),
+                    "--dest", str(tmp_path / "out"), "--dry-run"]) == 0
+    planned = list(csv.DictReader(io.StringIO(latest_csv(photobackup_log_dir, "_plan.csv"))))
+    assert sum(int(row["size"]) for row in planned) == int(chosen["bytes"])

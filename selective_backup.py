@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -795,7 +795,10 @@ class _Planner:
                             self._add_tree(dpath, base, CAT_CAPTURE_ONE, self.cache_skip_direct)
                         for _, dpath in nx_dirs:
                             self._add_tree(dpath, base, CAT_NX_STUDIO)
-                for _, dpath in dirs:
+                for name, dpath in dirs:
+                    if (self.rules is not None and self.unexported_mode == "copy"
+                            and _folder_matches(name, self.rules.exclude)):
+                        continue
                     if os.path.normcase(dpath) not in classified:
                         stack.append((dpath, base, False))
 

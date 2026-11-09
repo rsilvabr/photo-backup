@@ -35,7 +35,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 # ---- Settings -------------------------------------------------------------------
 MODES_FILE = "backup_modes.csv"     # next to this script; --modes reads another
@@ -64,6 +64,7 @@ class Mode:
     exclude: tuple
     whole: bool
     description: str = ""
+    unexported: bool = False    # folders without an export are copied whole
 
 
 @dataclasses.dataclass(frozen=True)
@@ -133,11 +134,14 @@ def read_modes(path):
         add_folders = tuple(sb._split_names(row.get("AddFolders") or ""))
         add_whole = tuple(sb._split_names(row.get("AddWhole") or ""))
         exclude = tuple(sb._split_names(row.get("Exclude") or ""))
-        if whole and (add_folders or add_whole):
+        # an optional column: a table written before it existed keeps working
+        unexported = (_yes_no(row, "Unexported", path, line)
+                      if str(row.get("Unexported") or "").strip() else False)
+        if whole and (add_folders or add_whole or unexported):
             raise ManifestError(f"{path} line {line}: Whole=yes cannot be combined "
-                                f"with AddFolders or AddWhole")
+                                f"with AddFolders, AddWhole or Unexported")
         modes[name] = Mode(name, unselected, add_folders, add_whole, exclude, whole,
-                           str(row.get("Description") or "").strip())
+                           str(row.get("Description") or "").strip(), unexported)
     return modes
 
 
@@ -204,18 +208,21 @@ def _skip_paths_for(folder, rows):
             and sb._is_under(other.folder, folder)]
 
 
-def _row_args(args, folder, unselected):
+def _row_args(args, folder, unselected, unexported=False):
     row_args = copy.copy(args)
     row_args.source = [folder]
     row_args.base = None
     row_args.unselected = unselected
+    if unexported:
+        row_args.unexported = "copy"
     return row_args
 
 
 def _plan_row(row, rows, modes, args, list_cache, originals=None, mode=None):
     mode = modes[row.mode] if mode is None else mode
     originals = row.originals if originals is None else originals
-    planner = sb._Planner(_row_args(args, row.folder, _row_unselected(mode, originals)),
+    planner = sb._Planner(_row_args(args, row.folder, _row_unselected(mode, originals),
+                                    mode.unexported),
                           list_cache, _skip_paths_for(row.folder, rows),
                           _row_rules(mode, originals))
     planner.build()
