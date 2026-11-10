@@ -579,7 +579,7 @@ def test_unselected_raw_is_unchanged(tmp_path):
 def full_tree(root):
     """The invariant tree: the round-1 tree, an export inside the added folders, the
     originals above, a $RECYCLE.BIN outside an added folder and a folder named in
-    --exclude-folders (S4/S9)."""
+    --exclude-folders (S4/S9), also inside an added folder (R2 of round 3)."""
     folder = sweep_tree(root)
     export_in_added_tree(root)
     originals_tree(root)
@@ -588,6 +588,11 @@ def full_tree(root):
         f"{folder.name}/250101_Shoot/$RECYCLE.BIN/r2.NEF": 8,
         f"{folder.name}/250202_NotEdited/Skipme/x.NEF": 9,
         "Skipme/y.NEF": 9,
+        # skipped by name inside an AddFolders folder and a session in it (R2 of round 3)
+        f"{folder.name}/250101_Shoot/_OUTTAKES_KEEP/Skipme/k.NEF": 10,
+        "shoot/_OUTTAKES_KEEP/sub/Skipme/k2.NEF": 11,
+        "shoot/_OUTTAKES_KEEP/_EXPORT/Skipme/k3.jpg": 12,
+        "shoot/CaptureOne/Skipme/k4.cos": 13,
     })
     return root / "2025"
 

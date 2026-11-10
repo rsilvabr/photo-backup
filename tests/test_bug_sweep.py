@@ -234,11 +234,13 @@ def export_in_added_tree(root):
 
 
 # What v0.12.0's AddFolders walk copied (the Originals filter, also inside an
-# export folder it did not know was one): v0.12.1 must copy at least this.
+# export folder it did not know was one): v0.12.1 must copy at least this. Not
+# $RECYCLE.BIN/r.NEF: since round 3 a folder skipped by its name is skipped
+# everywhere, inside an added folder too (declared in docs/version_history.md).
 V0120_KEEP = ("DSC_0011.NEF", "_EXPORT/DSC_0011_WEB.jpg", "_EXPORT/DSC_0011_v1.xmp",
               "_EXPORT/DSC_0011-NR.dng", "_EXPORT/CaptureOne/Settings166/e.cos",
               "_EXPORT/NKSC_PARAM/e.nksc", "_EXPORT/WEB/DSC_0011_small.jpg",
-              "sub/DSC_0021.NEF", "sub/_EXPORT/DSC_0021_v1.jpg", "$RECYCLE.BIN/r.NEF")
+              "sub/DSC_0021.NEF", "sub/_EXPORT/DSC_0021_v1.jpg")
 V0120_KEEP_ALL = V0120_KEEP + ("_EXPORT/DSC_0011_v1.jxl", "_EXPORT/notes.txt",
                                "sub/_EXPORT/DSC_0021_v1.jxl")
 V0120_OUTTAKES = ("DSC_0061.NEF", "_EXPORT/DSC_0061_v1.jpg")
@@ -264,10 +266,16 @@ def test_m1_an_export_inside_add_folders_copies_what_v0120_did(tmp_path, monkeyp
         for rel in V0120_OUTTAKES:
             assert os.path.normcase(str(outtakes / rel)) in found, rel
     assert os.path.normcase(str(keep / "_EXPORT/CaptureOne/Cache/c.cop")) not in found
+    assert os.path.normcase(str(keep / "$RECYCLE.BIN/r.NEF")) not in found
+    assert os.path.normcase(str(keep / "$RECYCLE.BIN")) in {
+        os.path.normcase(path) for path in plan.skipped_folders}
     files = listed(folder)
+    skipped = listed(keep / "$RECYCLE.BIN")
     counted_files, counted_bytes = left_out(plan, mode.endswith("+"))
-    assert len(files) == len(plan.files) + counted_files
-    assert sum(files.values()) == sum(item.size for item in plan.files) + counted_bytes
+    # a folder skipped by its name is not listed: its files are not counted
+    assert len(files) == len(plan.files) + counted_files + len(skipped)
+    assert sum(files.values()) == (sum(item.size for item in plan.files) + counted_bytes
+                                   + sum(skipped.values()))
 
 
 # ---- B10 ----------------------------------------------------------------------------------
@@ -411,11 +419,11 @@ def test_b17_a_shared_listing_cache_keeps_the_count(tmp_path):
 # ---- B2 -----------------------------------------------------------------------------------
 def test_b2_inside_csv_and_the_biggest_names(tmp_path, capsys, photobackup_log_dir):
     make_tree(tmp_path, {
-        "G/2026/Nova pasta/_EXPORT/x.jpg": 10,
-        "G/2026/Nova pasta/WhatsApp Image 2026-05-31.jpeg": 11,
-        "G/2026/Nova pasta/Birthday party/IMG_1.JPG": 5000,
-        "G/2026/Nova pasta/Birthday party/IMG_2.JPG": 5000,
-        "G/2026/Nova pasta/_OUTTAKES/a.NEF": 300,
+        "G/2026/Untitled folder/_EXPORT/x.jpg": 10,
+        "G/2026/Untitled folder/chat_photo_0001.jpeg": 11,
+        "G/2026/Untitled folder/Birthday party/IMG_1.JPG": 5000,
+        "G/2026/Untitled folder/Birthday party/IMG_2.JPG": 5000,
+        "G/2026/Untitled folder/_OUTTAKES/a.NEF": 300,
         "G/2026/shoot/_DSC1.NEF": 10,
         "G/2026/shoot/_EXPORT/_DSC1_v1.jxl": 20,
         "G/2026/shoot/_OUTTAKES/b.NEF": 200,
@@ -428,9 +436,9 @@ def test_b2_inside_csv_and_the_biggest_names(tmp_path, capsys, photobackup_log_d
     out = capsys.readouterr().out.splitlines()
     rows = list(csv.DictReader(io.StringIO(latest_csv(photobackup_log_dir, "_inside.csv"))))
     by_sub = {(Path(row["session"]).name, row["subfolder"]): row for row in rows}
-    assert by_sub[("Nova pasta", "Birthday party")]["files"] == "2"
-    assert by_sub[("Nova pasta", "Birthday party")]["bytes"] == "10000"
-    assert by_sub[("Nova pasta", "_OUTTAKES")]["bytes"] == "300"
+    assert by_sub[("Untitled folder", "Birthday party")]["files"] == "2"
+    assert by_sub[("Untitled folder", "Birthday party")]["bytes"] == "10000"
+    assert by_sub[("Untitled folder", "_OUTTAKES")]["bytes"] == "300"
     assert by_sub[("shoot", "_OUTTAKES")]["bytes"] == "200"
     start = next(i for i, text in enumerate(out) if "inside sessions" in text)
     names = out[start + 1:start + 3]
@@ -441,9 +449,9 @@ def test_b2_inside_csv_and_the_biggest_names(tmp_path, capsys, photobackup_log_d
 def test_b2_guard_the_selection_does_not_change(tmp_path):
     """guard: B2 only reports; the rule of what is a session waits for the owner."""
     make_tree(tmp_path, {
-        "G/2026/Nova pasta/_EXPORT/x.jpg": 10,
-        "G/2026/Nova pasta/WhatsApp Image.jpeg": 11,
-        "G/2026/Nova pasta/Birthday party/IMG_1.JPG": 50,
+        "G/2026/Untitled folder/_EXPORT/x.jpg": 10,
+        "G/2026/Untitled folder/chat_photo.jpeg": 11,
+        "G/2026/Untitled folder/Birthday party/IMG_1.JPG": 50,
     })
     plan = plan_rows([(tmp_path / "G" / "2026", "3+", "raw")], tmp_path)
     assert not any("Birthday party" in item.src for item in plan.files)

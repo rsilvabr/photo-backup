@@ -160,10 +160,12 @@ from the command line. A future job (e.g. a full mirror) is a new
   a file there -- loose or inside its export folders (`_filter_keeps`) -- is
   copied when either the session or the `Originals` filter keeps it, as v0.12.0
   did. `tests/test_bug_sweep.py` checks both on synthetic trees;
-  a change to `_Planner.build` must keep them. The one rule allowed to copy
-  less is `Exclude` (the owner's explicit choice, counted), plus one declared
-  case: in an `AddFolders` folder, a `Cache` below the first level of a
-  `CaptureOne` inside an export folder counts as Capture One cache (v0.12.0
+  a change to `_Planner.build` must keep them. The rules allowed to copy
+  less are `Exclude` (the owner's explicit choice, counted) and a folder skipped
+  by its name (`SYSTEM_SKIP_FOLDERS`, `--exclude-folders`), which `_list_dir`
+  leaves out everywhere, inside `AddFolders` folders too (v0.12.1 round 3;
+  named, not counted), plus one declared case: in an `AddFolders` folder, a
+  `Cache` below the first level of a `CaptureOne` inside an export folder counts as Capture One cache (v0.12.0
   copied it; a cache is made again).
 - **A source that cannot be read is not a source that is gone (v0.12.1).**
   `_source_state` says `missing` only with proof: `FileNotFoundError` AND the

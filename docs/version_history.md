@@ -30,11 +30,11 @@ releases are also published as
 
 ## v0.12.1
 
-**Released 2026-11-11.** Nothing to do when upgrading, with two exceptions
-below (`Exclude` copies less; `Originals=raw` copies more). A sweep for bugs
-looked for what the backup leaves out without saying so, what it could lose,
-and what it calls a success when it is not; this version fixes what it found,
-in two rounds.
+**Released 2026-11-11.** Nothing to do when upgrading, with three exceptions
+below (`Exclude` and a folder skipped by its name copy less; `Originals=raw`
+copies more). A sweep for bugs looked for what the backup leaves out without
+saying so, what it could lose, and what it calls a success when it is not;
+this version fixes what it found, in three rounds.
 
 **Nothing left out without a count.**
 
@@ -98,6 +98,18 @@ folder (`_OUTTAKES_KEEP\_EXPORT\CaptureOne\X\Cache`) is counted as Capture One
 cache, as in every export folder; v0.12.0 copied it there. A cache is made
 again by Capture One. No such folder exists in the owner's archive.
 
+**Copies less on purpose, too: a folder skipped by its name.** The folders of
+`SYSTEM_SKIP_FOLDERS` (`$RECYCLE.BIN`, `System Volume Information`) and of
+`--exclude-folders` / `EXCLUDE_FOLDERS` are now skipped everywhere, at any
+depth and in every mode: also inside an `AddFolders` folder, a session inside
+one, an export folder and a `CaptureOne` folder. v0.12.0 copied them there, so
+mode 5 (`_OUTTAKES_KEEP` added) copied what mode 6 (everything) did not, and an
+`EXCLUDE_FOLDERS` you set did not apply inside `_OUTTAKES_KEEP`, without a word
+on the screen. Each one is named, as the others (`folders skipped by name` in
+the summary, `SKIPPED FOLDER <path>` in the log). A `$RECYCLE.BIN` only exists
+at the root of a drive, and the shipped `EXCLUDE_FOLDERS` is empty: on the
+owner's archive, nothing changes.
+
 **Copies more on purpose: `Originals=raw`.** It kept every RAW and a JPEG
 only when no RAW of the same photo was beside it; a photo whose only original
 is a TIFF, PNG, HEIC/HEIF/HIF or PSD (a camera that wrote TIFF, a developed
@@ -152,6 +164,19 @@ tested in every mode.
   row, the destination is tested with a file of its own (written and removed in
   `_photo_backup`); when that fails, the backup stops reading, records what was
   copied, prints the summary with a `STOPPED:` line and exits 1.
+- **The catalog of a destination that went away** could not be written either:
+  when the rows of the last copies were still waiting for their commit (a file
+  of 100 MB or more is recorded alone, and the rows are committed every
+  `FLUSH_BATCH_FILES`), the backup ended in a `sqlite3` traceback, without the
+  `STOPPED:` line or the summary. A catalog that cannot be written now stops the
+  copy as a destination that stopped taking writes: nothing more is read or
+  tried, the summary has the `STOPPED:` line and a `CATALOG:` line saying how
+  many copied files have no row yet (they keep their final names, and the next
+  run adopts them by their size and date), `--move-orphans` moves nothing, and
+  the run exits 1.
+- **A destination with a name Windows does not accept** (`--dest "E:\x|y"`)
+  ended in a traceback; it is now `Destination not available: ...`, exit 2,
+  before anything is copied.
 - **Not enough space because of a renamed folder.** A possible move inside the
   backup still counts as a copy in the space check (it is only confirmed by
   hash later), but the message now says how much of what is needed may be

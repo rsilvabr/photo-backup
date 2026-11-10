@@ -292,8 +292,8 @@ python selective_backup.py --source "G:\2025" --dest "H:\BACKUP" --verify full
   run exit 1 — a dry-run too. Every file under a source is either in the plan
   or in exactly one line of the summary's `Not copied:` *(v0.12.1)*, and the
   links and junctions it does not follow are counted and logged. The exception
-  is a folder skipped by its name (`SYSTEM_SKIP_FOLDERS`, `--exclude-folders`):
-  it is never listed (a `System Volume Information` cannot be read, and a
+  is a folder skipped by its name (`SYSTEM_SKIP_FOLDERS`, `--exclude-folders`),
+  at any depth and in every mode *(v0.12.1)*: it is never listed (a `System Volume Information` cannot be read, and a
   folder may be excluded because it gives errors), so its files are not
   counted; the folder itself is named (`folders skipped by name` in the
   summary, `SKIPPED FOLDER <path>` in the log).
@@ -312,7 +312,12 @@ python selective_backup.py --source "G:\2025" --dest "H:\BACKUP" --verify full
   destination. If that fails too, it stops reading the source, records what
   was already copied, prints the normal summary with a `STOPPED:` line (why,
   and how many files were left to copy) and exits 1. If it works, the backup
-  goes on.
+  goes on. A catalog that can no longer be written (the disk went away with
+  rows still waiting for their commit) stops the copy the same way: the summary
+  adds a `CATALOG:` line with the number of copied files that have no row yet.
+  They keep their final names, and the next run adopts them by their size and
+  date instead of copying them again; `--move-orphans` moves nothing in that
+  run.
 
 ## How a photo is selected
 
@@ -662,7 +667,7 @@ python captureone_backup.py --revert-last
 | `--dry-run` | plan and report, write nothing |
 | `--yes` | do not ask for confirmation |
 
-A restore brings back the profiles, styles, defaults, presets, recipes, shortcuts and workspaces, plus any missing file of `Installed` and `WindowsColor`. The batch queue, `ImageCore`, plugins, `Preferences` and your own folders stay in the backup unless you name them with `--also`. It refuses to run while Capture One is open, and reports what needs an administrator instead of failing half-way. As everywhere in this tool, nothing in the backup is deleted: the old copy of a file that really changed goes to the versions folder, and only once the new copy is on the disk — a copy that fails leaves the old one under its name *(v0.12.1)*. A file whose catalog row has no hash is restored after a size check only, as `RESTORED_UNVERIFIED` (counted apart in the result); a copy of another size is not restored (`CORRUPT_IN_BACKUP`, exit 1).
+A restore brings back the profiles, styles, defaults, presets, recipes, shortcuts and workspaces, plus any missing file of `Installed` and `WindowsColor`. The batch queue, `ImageCore`, plugins, `Preferences` and your own folders stay in the backup unless you name them with `--also`. It refuses to run while Capture One is open, and reports what needs an administrator instead of failing half-way. As everywhere in this tool, nothing in the backup is deleted: the old copy of a file that really changed goes to the versions folder, and only once the new copy is on the disk — a copy that fails leaves the old one under its name *(v0.12.1)*. A file whose catalog row has no hash is restored after a size check only, as `RESTORED_UNVERIFIED` (counted apart in the result); a copy of another size is not restored (`CORRUPT_IN_BACKUP`, exit 1). A damaged copy of the same size is therefore restored as it is: what finds it is a `--verify` before the restore (`DEST_DIFFERS`, when the file on this computer still has the size and date of the row).
 
 **Force restore and undo** *(v0.7.0)*. A normal restore only adds what is missing. `--force` also replaces what differs, after keeping the current file in `%LOCALAPPDATA%\CaptureOne_old\old_<date>_<time>_<ms>`; only files that really differ go there, and they are never removed for you. `--revert-last` puts the newest `old_` folder back and takes out what the force added (a file is journaled as added only after the force's copy of it is there: a file another program put there meanwhile is never taken out, *v0.12.1*). It keeps what it replaces in a `revert_old_…` folder, which is never taken for the last one.
 
@@ -1054,11 +1059,11 @@ Japanese file names.
 
 **v0.12.1** (2026-11-11).
 
-- Fixes from a bug sweep. Every file under a source is now in the plan or in exactly one line of `Not copied:` (what `AddFolders` leaves out, the Capture One folders inside sessions, the links and junctions not followed; a folder skipped by its name is named), and a bigger mode never copies less: `_OUTTAKES\_EXPORT` stays a session when mode 4 adds `_OUTTAKES`. A source that cannot be read is no longer treated as gone by `--move-orphans`, the move detection or `--verify`. The rolling verify no longer stops behind rows with a problem, and a `--verify quick` no longer sends it back to the start. A destination that stops taking writes stops the backup. The menu keeps `raw_or_jpeg`, always says "no" on the command line, and `[7] Manifest` does what `[1]` does (Capture One, `--update-changed`, "Max GB"). `captureone_backup.py` keeps the old copy under its name until the new one is safe and checks a row without a hash against its source. `mobile_backup.py` 0.1.2 deletes nothing of a source it was not given or could not read, and saves its state more often. One change copies less on purpose (a folder matching a mode's `Exclude` is never walked) and one more (`Originals=raw` keeps a photo whose only original is a TIFF, PNG, HEIC or PSD). [Details](docs/version_history.md#v0121).
+- Fixes from a bug sweep. Every file under a source is now in the plan or in exactly one line of `Not copied:` (what `AddFolders` leaves out, the Capture One folders inside sessions, the links and junctions not followed; a folder skipped by its name is named), and a bigger mode never copies less: `_OUTTAKES\_EXPORT` stays a session when mode 4 adds `_OUTTAKES`. A source that cannot be read is no longer treated as gone by `--move-orphans`, the move detection or `--verify`. The rolling verify no longer stops behind rows with a problem, and a `--verify quick` no longer sends it back to the start. A destination that stops taking writes stops the backup, also when its catalog can no longer be written. The menu keeps `raw_or_jpeg`, always says "no" on the command line, and `[7] Manifest` does what `[1]` does (Capture One, `--update-changed`, "Max GB"). `captureone_backup.py` keeps the old copy under its name until the new one is safe and checks a row without a hash against its source. `mobile_backup.py` 0.1.2 deletes nothing of a source it was not given or could not read, and saves its state more often. Two changes copy less on purpose (a folder matching a mode's `Exclude` is never walked; a folder skipped by its name, such as `$RECYCLE.BIN` or one of `--exclude-folders`, is skipped everywhere, inside `AddFolders` too) and one more (`Originals=raw` keeps a photo whose only original is a TIFF, PNG, HEIC or PSD). [Details](docs/version_history.md#v0121).
 
 **v0.12.0** made sure a file never counts as saved when the right content cannot be restored (eight fixes from an audit) and added `manifest_backup.py --verify`.
 
-**507 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
+**522 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
 
 ## Changelog
 

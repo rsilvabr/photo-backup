@@ -607,13 +607,17 @@ class _Planner:
         if self.skip_paths:
             dirs = [item for item in dirs
                     if os.path.normcase(item[1]) not in self.skip_paths]
+        # skipped by its name everywhere, also inside an AddFolders folder, an
+        # export or a Capture One folder: every walk lists through here (R2)
+        dirs = [item for item in dirs if not self._skipped_by_name(*item)]
         return files, dirs
 
     def _skipped_by_name(self, name, dpath):
-        """True for a folder of SYSTEM_SKIP_FOLDERS or --exclude-folders. It is
-        not listed at all (a System Volume Information cannot be read, and a
-        folder may be excluded because it gives errors): its files are not
-        counted one by one, the folder itself is named, once per planner."""
+        """True for a folder of SYSTEM_SKIP_FOLDERS or --exclude-folders, at any
+        depth and in every mode (_list_dir leaves it out). It is not listed at
+        all (a System Volume Information cannot be read, and a folder may be
+        excluded because it gives errors): its files are not counted one by
+        one, the folder itself is named, once per planner."""
         if name.casefold() not in self.skip_folder_names:
             return False
         key = os.path.normcase(dpath)
@@ -990,8 +994,6 @@ class _Planner:
             files, dirs = self._list_dir(path)
             for name, dpath in dirs:
                 folded = name.casefold()
-                if self._skipped_by_name(name, dpath):
-                    continue
                 if self._excluded(name, dpath):
                     continue
                 if folded in self.c1_names:
@@ -1028,9 +1030,6 @@ class _Planner:
         while stack:
             path, base, inside, added = stack.pop()
             files, dirs = self._list_dir(path)
-            if added is None:   # inside an AddFolders folder v0.12.0 walked them too
-                dirs = [(name, dpath) for name, dpath in dirs
-                        if not self._skipped_by_name(name, dpath)]
             exports = [(name, dpath) for name, dpath in dirs if self._is_export_name(name)]
             c1_dirs = [(name, dpath) for name, dpath in dirs if name.casefold() in self.c1_names]
             nx_dirs = [(name, dpath) for name, dpath in dirs if name.casefold() in self.nx_names]
@@ -1924,7 +1923,10 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None):
     """Copy what the plan says. `stop_info` (a dict) receives why the copy
     stopped early and what was left, when the destination stopped taking
     writes: after DEST_CHECK_AFTER_ERRORS failed copies in a row the
-    destination is tested, and a test that fails stops the reading too (B16)."""
+    destination is tested, and a test that fails stops the reading too (B16).
+    A catalog that can no longer be written (sqlite3.Error) is a destination
+    that stopped taking writes too: nothing more is tried, and `unrecorded`
+    says how many copies have their final name but no row (R1)."""
     to_copy = [status for status in statuses if _will_copy(status, args)]
     total_bytes = sum(status.planned.size for status in to_copy)
     done = 0
@@ -1932,6 +1934,8 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None):
     error_count = 0
     in_a_row = 0
     uncommitted = 0
+    unrecorded = 0
+    catalog_error = None
     started = time.monotonic()
     last_report = started
     log.log(f"Copying {_num(len(to_copy))} files / {_gb(total_bytes)}")
@@ -1942,14 +1946,44 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None):
                                 READ_AHEAD_MB * 1024 * 1024)
     flush_pool = ThreadPoolExecutor(max_workers=max(FLUSH_THREADS, 1))
 
+    def catalog_failed(exc):
+        """The rows not committed yet are lost with the transaction: those
+        copies keep their final names, and the next run adopts them by their
+        size and date (_adopt_rows)."""
+        nonlocal catalog_error, unrecorded, uncommitted
+        if catalog_error is None:
+            catalog_error = str(exc) or type(exc).__name__
+            log.log(f"CATALOG NOT WRITTEN ({catalog_error}): the copy stops")
+        unrecorded += uncommitted
+        uncommitted = 0
+
+    def commit():
+        nonlocal uncommitted
+        if catalog_error is not None:
+            return
+        try:
+            catalog.commit()
+        except sqlite3.Error as exc:
+            catalog_failed(exc)
+            return
+        uncommitted = 0
+
     def record(status, sha256, size, mtime_ns):
-        nonlocal done, done_bytes, uncommitted, in_a_row
-        catalog.upsert(status.planned, sha256, size, mtime_ns)
+        nonlocal done, done_bytes, uncommitted, in_a_row, unrecorded
         done += 1
         done_bytes += status.planned.size
-        uncommitted += 1
         in_a_row = 0
         log.log(f"COPY {status.planned.rel}")
+        if catalog_error is not None:
+            unrecorded += 1
+            return
+        try:
+            catalog.upsert(status.planned, sha256, size, mtime_ns)
+        except sqlite3.Error as exc:
+            unrecorded += 1
+            catalog_failed(exc)
+            return
+        uncommitted += 1
 
     def failed(status, exc):
         nonlocal error_count, in_a_row
@@ -1961,11 +1995,12 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None):
         """Flush the waiting temp files together. Only a file already on the
         disk gets its final name, and only then does the catalog list it: a
         crash must not leave a garbage file that looks like a finished copy."""
-        nonlocal uncommitted
         flush_errors = list(flush_pool.map(_flush_error, [item.tmp for item in pending]))
         for flush_error in flush_errors:
             item = pending[0]
             try:
+                if catalog_error is not None:
+                    raise OSError(f"not finished: the catalog cannot be written ({catalog_error})")
                 if flush_error is not None:
                     raise flush_error
                 record(item.status, *_finish_temp(
@@ -1975,8 +2010,7 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None):
                 _remove_temp(item.tmp)
                 failed(item.status, exc)
             pending.pop(0)
-        catalog.commit()
-        uncommitted = 0
+        commit()
 
     stopped = None
     try:
@@ -1997,6 +2031,12 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None):
             except Exception as exc:
                 failed(status, exc)
             source.drain()
+            if uncommitted >= max(FLUSH_BATCH_FILES, 1):
+                commit()
+            if catalog_error is not None:
+                stopped = (f"the catalog could not be written: {catalog_error}", None,
+                           to_copy[index + 1:])
+                break
             now = time.monotonic()
             if to_copy and now - last_report >= PROGRESS_EVERY_S:
                 elapsed = max(now - started, 1e-6)
@@ -2005,9 +2045,6 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None):
                 print(f"[{done}/{len(to_copy)}] {_gb(done_bytes)}/{_gb(total_bytes)}  "
                       f"{speed / 1e6:.0f} MB/s  ETA {_hms(eta)}")
                 last_report = now
-            if uncommitted >= max(FLUSH_BATCH_FILES, 1):
-                catalog.commit()
-                uncommitted = 0
             if DEST_CHECK_AFTER_ERRORS > 0 and in_a_row >= DEST_CHECK_AFTER_ERRORS:
                 reason = _dest_accepts_writes(dest)
                 log.log(f"DEST CHECK after {in_a_row} failed copies in a row: "
@@ -2018,16 +2055,23 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None):
                     break
                 in_a_row = 0
         finish_pending()
+        if stopped is None and catalog_error is not None:
+            # the last commit failed: every file was tried, none is left
+            stopped = (f"the catalog could not be written: {catalog_error}", None, [])
         if stopped is not None:
             reason, failures, left = stopped
             log.log(f"STOPPED: {_num(len(left))} files not attempted")
+            if unrecorded:
+                log.log(f"CATALOG: {_num(unrecorded)} copied files have no row "
+                        f"({catalog_error})")
             if stop_info is not None:
                 stop_info.update(reason=reason, failures=failures, left=len(left),
-                                 left_bytes=sum(item.planned.size for item in left))
+                                 left_bytes=sum(item.planned.size for item in left),
+                                 unrecorded=unrecorded)
     except KeyboardInterrupt:
         for item in pending:
             _remove_temp(item.tmp)
-        catalog.commit()
+        commit()
         print(f"Interrupted: {done} copied, {error_count} errors")
         log.log(f"INTERRUPTED after {done} copied, {error_count} errors")
         return done, done_bytes, error_count, True
@@ -2309,6 +2353,11 @@ def _run_backup(args, log, stamp, plan_fn=None):
         print(str(exc), file=sys.stderr)
         log.log(f"ERROR {exc}")
         return 2
+    except OSError as exc:      # an invalid name ("E:\x|y"), a drive that went away
+        message = f"Destination not available: {dest} ({exc.strerror or exc})"
+        print(message, file=sys.stderr)
+        log.log(f"ERROR {message}")
+        return 2
     done = done_bytes = error_count = 0
     moved = moved_bytes = move_errors = 0
     interrupted = False
@@ -2331,10 +2380,16 @@ def _run_backup(args, log, stamp, plan_fn=None):
         if error_count or move_errors:
             log.out(f"ERRORS: {_num(error_count + move_errors)} files were NOT copied -> {log.path}")
         if stop_info:
+            why = stop_info["reason"]
+            if stop_info["failures"] is not None:
+                why += f"; tested after {_num(stop_info['failures'])} failed copies in a row"
             log.out(f"STOPPED: the destination no longer takes writes "
-                    f"({stop_info['reason']}; tested after {_num(stop_info['failures'])} "
-                    f"failed copies in a row): {_num(stop_info['left'])} files / "
+                    f"({why}): {_num(stop_info['left'])} files / "
                     f"{_gb(stop_info['left_bytes'])} were left to copy and not read")
+            if stop_info.get("unrecorded"):
+                log.out(f"CATALOG: {_num(stop_info['unrecorded'])} copied files have no row "
+                        f"in the catalog (it could not be written); they keep their final "
+                        f"names and the next run adopts them by their size and date")
         if interrupted:
             return 130
         if args.move_orphans and stop_info:
