@@ -9,7 +9,8 @@ releases are also published as
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **[v0.11.0](#v0110)** | 2026-11-10 | A manifest line can leave a folder out (`skip`) or keep only one type of file in it (`raw-only`, `jpeg-only`, `jxl-only`) |
+| **[v0.12.0](#v0120)** | 2026-11-10 | A file never counts as saved when the right content cannot be restored: eight fixes from an audit; `manifest_backup.py --verify` |
+| [v0.11.0](#v0110) | 2026-11-10 | A manifest line can leave a folder out (`skip`) or keep only one type of file in it (`raw-only`, `jpeg-only`, `jxl-only`) |
 | [v0.10.0](#v0100) | 2026-11-10 | Modes `1+` to `5+`: a folder not exported yet is copied whole, so what has not been edited is not left out |
 | [v0.9.0](#v090) | 2026-11-09 | Each folder with its own backup mode, from a manifest; `--analyze` shows the size of every mode first |
 | [v0.8.1](#v081) | 2026-11-09 | The versions folder keeps only real old versions: an old copy identical to the new one is no longer kept |
@@ -23,6 +24,45 @@ releases are also published as
 | v0.1.0 | 2026-10-06 | First implementation, not released |
 
 `mobile_backup.py` has its own version: [see the end of this page](#mobile_backuppy).
+
+---
+
+## v0.12.0
+
+**Released 2026-11-10.** Nothing to do when upgrading. An audit asked one
+question of the whole cycle, from the selection to the restore: can a file
+count as saved when the right content cannot be restored? It found these.
+
+- **An original edited while it was being copied.** The copy got the date the
+  original had at the END of the copy. An original rewritten by another
+  program in between, with the same size, became old bytes under the new date,
+  and every later run called it up to date. The copy now carries the date of
+  the bytes it holds, so the next run sees the file as changed.
+- **Two files with one place in the backup are an error.** Two sources on
+  different drives with the same folders, or two names that differ only for
+  Windows (`Straße.jpg` and `Strasse.jpg`): the second file was left out with
+  a line in the log file only. It is now counted under `Errors:` and the run
+  exits 1.
+- **`manifest_backup.py --verify quick|full`** (and `[3] Verify` in the menu's
+  Manifest). `selective_backup.py --verify` does not know the manifest: it
+  could say `OK` with a file of the manifest missing.
+- **The old copy of a changed file keeps its name** until the new one is on the
+  disk. It used to move to the versions folder before the new copy started; a
+  copy that failed, or a power cut, left nothing under that name.
+- **A read-only temp file left by a crash** no longer blocks that file on every
+  later run.
+- **The restore checks the size** of each backup file against the catalog. A
+  file without a hash that had lost bytes was restored as
+  `RESTORED_UNVERIFIED`; it is now `CORRUPT_IN_BACKUP`.
+- **Copy errors are said on the screen**, not only in the log and the exit
+  code: `ERRORS: N files were NOT copied`.
+- **The restore and the dry-run never write to the backup**, also when a run
+  was killed in the middle of a catalog update: the catalog is then read from
+  a private copy.
+
+Measured in the same audit, documented but not changed: `--verify-copy hash`
+re-reads the copy from the Windows cache, not from the disk. The check of the
+disk is a `--verify full` after the disk was removed and connected again.
 
 ---
 

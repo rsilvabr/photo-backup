@@ -146,7 +146,7 @@ python photo_backup.py
 - **[4] Settings** shows where the remembered choices live (`~/.photo_backup_config.json`, or `$PHOTOBACKUP_CONFIG`) and the defaults of `selective_backup.py`. The menu reads those defaults from `selective_backup.py` itself: edit the top of that file and the menu follows.
 - **[5] Restore** lists the backup's top folders, asks what to restore and where to (the original places or another folder), runs a dry-run and then restores after a yes.
 - **[6] Capture One only** backs up just Capture One to a folder you choose, restores from one, force-restores and undoes the last force restore; see [Capture One's own files](#capture-ones-own-files-captureone_backuppy-v060).
-- **[7] Manifest** asks for a manifest and a destination and offers `[1] Analyze only` (how many bytes each mode would take in each folder) or `[2] Back up` (a dry-run first, then the copy after a yes); see [Per-folder modes](#per-folder-modes-manifest_backuppy).
+- **[7] Manifest** asks for a manifest and a destination and offers `[1] Analyze only` (how many bytes each mode would take in each folder), `[2] Back up` (a dry-run first, then the copy after a yes) or `[3] Verify` (the backup against what the manifest selects); see [Per-folder modes](#per-folder-modes-manifest_backuppy).
 
 > **Tip:** The value shown in `[brackets]` is the default — just press Enter to accept it.
 
@@ -448,8 +448,15 @@ Options of `manifest_backup.py`:
 | `--space-margin-gb N` | free space kept on the destination, in GB (default: `20.0`, from `selective_backup.py`) |
 | `--export-formats SPEC` | `all`, `a>b>c` fallback or `a+b` multiple (default: `jxl>tif>jpg`, from `selective_backup.py`) |
 | `--expect-backup-id ID` | abort (exit 2) unless the destination holds this backup ID |
+| `--verify {quick,full}` | verify the backup against what the manifest selects; copies nothing. Same statuses and exit codes as `selective_backup.py --verify` |
+| `--max-gb N` | with `--verify full`: verify at most N GB in this run, oldest verification first (default: `0.0` = everything, from `selective_backup.py`) |
 | `--version` | print the version and exit |
 | `--help` | print the usage and exit |
+
+Verify a backup made from a manifest with `manifest_backup.py --verify`, not
+with `selective_backup.py --verify`: only the manifest knows which files each
+line selects. A file a line selects that is not on the backup is
+`NOT_BACKED_UP`; a folder a line leaves out is not reported.
 
 `--analyze` plans every mode of the table with every `Originals` value through
 the same `_Planner` the copy uses, sharing the folder scan between the modes,
@@ -618,8 +625,12 @@ intact one is `SOURCE_MISSING` / `SOURCE_CHANGED` with the detail "backup
 copy hash verified".
 
 Note: the `hash` mode of `--verify-copy` re-reads the temp file right after
-writing, which the OS cache usually serves from memory. It catches write
-errors; the real check of the media is a `--verify full` on another day.
+writing, and Windows serves that read from its cache, not from the disk
+(measured: 0 MB read from the disk while 2 GB were re-read). It catches a copy
+damaged in memory, not a bad write on the media. The real check of the media
+is a `--verify full` with a cold cache: after the backup disk was safely
+removed and connected again, or after a restart. Run right after the backup,
+a `--verify full` can come out of the cache too.
 
 ## Rolling verify
 
@@ -793,7 +804,7 @@ default everywhere.
 | `MTIME_TOLERANCE_S` | `2.0` | mtime tolerance (FAT/exFAT stores 2 s steps) |
 | `COPY_CHUNK_MB` | `8` | read/write block size |
 | `READ_AHEAD_MB` | `512` | backup: source data read ahead in RAM while the destination writes (`0` = one disk at a time) |
-| `SMALL_FILE_KB` | `1024` | backup: files below this are flushed to disk in batches |
+| `SMALL_FILE_KB` | `102400` | backup: files below this are flushed to disk in batches |
 | `FLUSH_BATCH_FILES` | `50` | backup: files per flush batch and per catalog commit (`1` = flush each file) |
 | `FLUSH_THREADS` | `8` | backup: simultaneous flushes of a batch |
 | `TEMP_SUFFIX` | `.pbtmp` | in-progress copy suffix |
@@ -851,19 +862,20 @@ Japanese file names.
 
 ## Current version
 
-**v0.11.0** (2026-11-10).
+**v0.12.0** (2026-11-10).
 
-- A manifest line can leave a folder out (`skip`) or keep one type of file in it (`raw-only`, `jpeg-only`, `jxl-only`, or your own `Only` list). [Details](#per-folder-modes-manifest_backuppy). Nothing to do when upgrading: tables without the new columns keep working.
+- Eight fixes from an audit of one question: can a file count as saved when the right content cannot be restored? The main one: an original edited by another program while the backup was copying it could end up as old bytes under the new date, and every later run trusted it. `manifest_backup.py` gains `--verify`. [Details](docs/version_history.md#v0120). Nothing to do when upgrading.
 
-**v0.10.0** added the modes `1+` to `5+`: a folder not exported yet is copied whole.
+**v0.11.0** added manifest lines that leave a folder out or keep one type of file in it.
 
-**269 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
+**278 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
 
 ## Changelog
 
 | Version | Date | What it added |
 |---------|------|---------------|
-| **v0.11.0** | 2026-11-10 | A manifest line can leave a folder out or keep only one type of file in it |
+| **v0.12.0** | 2026-11-10 | A file never counts as saved when the right content cannot be restored: eight fixes; `manifest_backup.py --verify` |
+| v0.11.0 | 2026-11-10 | A manifest line can leave a folder out or keep only one type of file in it |
 | v0.10.0 | 2026-11-10 | Modes `1+` to `5+`: a folder not exported yet is copied whole |
 | v0.9.0 | 2026-11-09 | Per-folder backup modes from a manifest, with `--analyze` to see the size of each mode first |
 | v0.8.1 | 2026-11-09 | The versions folder no longer keeps an old copy identical to the new one |

@@ -24,7 +24,9 @@ from the command line. A future job (e.g. a full mirror) is a new
   `selective_backup._run_backup(..., plan_fn=...)` — the copy, catalog, space
   check, versions, moves and orphans are the selective backup's own.
   `--analyze` plans every mode through the same `_Planner` and writes
-  `<stamp>_analysis.csv`. Never duplicate a copy or catalog routine here.
+  `<stamp>_analysis.csv`. `--verify` hands the same joined plan to
+  `selective_backup._run_verify(..., plan_fn=...)`: only the manifest knows
+  what each line selects. Never duplicate a copy or catalog routine here.
 - `photo_backup.py` — interactive menu + presets (`--run-preset`). It
   never copies by itself: it builds an argv and runs `selective_backup.py` (or
   `restore_backup.py`, via `run_restore`) as a child process (`run_backend`).
@@ -112,6 +114,19 @@ from the command line. A future job (e.g. a full mirror) is a new
 - **A manifest never hides a loss.** An export folder cannot have its own line
   below another line (the line above would stop being a session and lose its
   originals), and `--analyze` exits 1 when a folder could not be read.
+- **A copy carries the dates of the bytes it holds (v0.12.0).** `_finish_temp`
+  sets the temp's times from `stat0` (taken when the file was read), never from
+  the source as it is at that moment: a file edited after it was read must show
+  as CHANGED on the next run, not as old bytes under a new date.
+- **The old copy of a CHANGED file keeps its name until the new one is on the
+  disk (v0.12.0).** `_handle_old_copy` only decides; the move to the versions
+  folder happens in `before_final`, for every size.
+- **Two source files with one destination path are an error (v0.12.0)**, never
+  a line in the log only: `_Planner._add` puts them in `errors` (summary,
+  exit 1). The same file planned twice stays a warning.
+- **Reading the catalog never writes to the backup (v0.12.0).** A read-only
+  `_Catalog` with a pending `-journal` beside it reads a private copy
+  (`scratch`); only a run that may write rolls the journal back.
 
 ## Settings are never hardcoded
 Every user-editable setting lives at the TOP of `selective_backup.py`

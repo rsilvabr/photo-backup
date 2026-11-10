@@ -24,7 +24,7 @@ import string
 import subprocess
 import sys
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
@@ -670,11 +670,25 @@ def manifest_flow(config):
     save_config(config)
     say("  [1] Analyze only (how many bytes each mode would take in each folder)")
     say("  [2] Back up (dry-run first, then copy)")
+    say("  [3] Verify the backup against this manifest")
     choice = ask("Choose", "2")
     if choice == "1":
         rc = run_manifest(["--manifest", manifest, "--analyze"])
         say(f"Analyze: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.",
             "green" if rc == 0 else "yellow")
+        return rc
+    if choice == "3":
+        mode = choose("Verify", [
+            ("quick", "sizes and dates only (seconds)"),
+            ("full", "re-read and hash both sides (hours on a big backup)")], VERIFY_MODE)
+        title(f"Verifying ({mode})")
+        rc = run_manifest(["--manifest", manifest, "--dest", dest, "--verify", mode])
+        if rc == 0:
+            say("Verify: everything matches.", "green")
+        elif rc == 1:
+            say("Verify: problems found - see the statuses above and the _verify.csv.", "yellow")
+        else:
+            say(f"Verify: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "red")
         return rc
     if choice != "2":
         return 0

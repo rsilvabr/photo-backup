@@ -35,7 +35,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 # ---- Settings -------------------------------------------------------------------
 MODES_FILE = "backup_modes.csv"     # next to this script; --modes reads another
@@ -302,6 +302,8 @@ def _backend_args(parsed, rows, dest):
         argv.append("--dry-run")
     if parsed.yes:
         argv.append("--yes")
+    if parsed.verify:
+        argv += ["--verify", parsed.verify, "--max-gb", str(parsed.max_gb)]
     return sb._build_parser().parse_args(argv)
 
 
@@ -334,7 +336,7 @@ def _new_log(stamp, kind):
 
 def _run(parsed, rows, modes, stamp, argv):
     backend_args = _backend_args(parsed, rows, os.path.abspath(parsed.dest))
-    log = _new_log(stamp, "manifest")
+    log = _new_log(stamp, "manifest_verify" if parsed.verify else "manifest")
     if log is None:
         return 2
     try:
@@ -352,6 +354,13 @@ def _run(parsed, rows, modes, stamp, argv):
         def plan_fn(plan_args):
             return _plan_rows(rows, modes, plan_args, list_cache)
 
+        if parsed.verify:
+            try:
+                return sb._run_verify(backend_args, log, plan_fn=plan_fn)
+            except KeyboardInterrupt:
+                print("Interrupted.", file=sys.stderr)
+                log.log("Interrupted.")
+                return 130
         return sb._run_backup(backend_args, log, stamp, plan_fn=plan_fn)
     finally:
         log.close()
@@ -475,6 +484,11 @@ def build_parser():
                         help="all, a>b>c fallback, or a+b multiple (default: %(default)s)")
     parser.add_argument("--expect-backup-id", default=None, metavar="ID",
                         help="abort unless the destination holds this backup ID")
+    parser.add_argument("--verify", choices=("quick", "full"), default=None,
+                        help="verify the backup against what the manifest selects (no copy)")
+    parser.add_argument("--max-gb", type=float, default=sb.VERIFY_MAX_GB, metavar="N",
+                        help="with --verify full: verify at most N GB, oldest verification "
+                             "first (default: %(default)s = everything)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
@@ -494,6 +508,9 @@ def main(argv=None):
         return int(code) if isinstance(code, int) else 2
     if not args.analyze and not args.dest:
         print("--dest is required unless --analyze is given", file=sys.stderr)
+        return 2
+    if args.analyze and args.verify:
+        print("--verify cannot be combined with --analyze", file=sys.stderr)
         return 2
     try:
         modes = read_modes(args.modes)

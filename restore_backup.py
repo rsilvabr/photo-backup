@@ -25,7 +25,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 # ---- Settings -------------------------------------------------------------------
 SPACE_MARGIN_GB = 5.0     # free space kept on each restore target drive (default --space-margin-gb)
@@ -251,6 +251,11 @@ def main(argv=None):
                     log.log(f"{outcome} {row.rel}")
                     continue
                 try:
+                    backup_size = os.stat(sb._io(src)).st_size
+                    if backup_size != row.size:
+                        raise RuntimeError(
+                            f"content differs from the catalog: backup file size "
+                            f"{backup_size} != {row.size} (backup copy corrupt?)")
                     planned = sb.PlannedFile(src, row.rel, row.size, row.mtime_ns, "restore")
                     sb._copy_file(planned, target, "hash", expected_sha256=row.sha256,
                                   no_clobber=True)

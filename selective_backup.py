@@ -24,6 +24,7 @@ import shutil
 import sqlite3
 import struct
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -31,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -86,7 +87,7 @@ SPACE_MARGIN_GB = 20.0              # free space kept on the destination (defaul
 MTIME_TOLERANCE_S = 2.0             # FAT/exFAT store mtimes in 2 s steps
 COPY_CHUNK_MB = 8
 READ_AHEAD_MB = 512                 # backup: source data read ahead in RAM while the destination writes; 0 = one disk at a time
-SMALL_FILE_KB = 1024                # backup: files below this are flushed to disk in batches
+SMALL_FILE_KB = 102400              # backup: files below this are flushed to disk in batches
 FLUSH_BATCH_FILES = 50              # backup: files per flush batch and per catalog commit; 1 = flush each file
 FLUSH_THREADS = 8                   # backup: simultaneous flushes of a batch (measured on a USB HDD: 8 beat 1 and 32)
 TEMP_SUFFIX = ".pbtmp"              # in-progress copy, next to its final name
@@ -507,7 +508,13 @@ class _Planner:
     def _add(self, planned):
         key = planned.rel.casefold()
         if key in self.seen:
-            self.warnings.append(f"WARNING duplicate {planned.rel} (kept {self.seen[key].src})")
+            kept = self.seen[key].src
+            if os.path.normcase(kept) == os.path.normcase(planned.src):
+                self.warnings.append(f"WARNING duplicate {planned.rel} (kept {kept})")
+            else:
+                # Another file with the same destination path: it has no copy.
+                self.errors.append(f"ERROR duplicate {planned.rel}: {planned.src} is NOT "
+                                   f"backed up (same destination path as {kept})")
             return
         self.seen[key] = planned
         self.files.append(planned)
@@ -971,8 +978,23 @@ class _Catalog:
             raise FileNotFoundError(f"catalog does not exist: {self.path}")
         if create and not readonly:
             os.makedirs(_io(self.dir), exist_ok=True)
+        self.conn = None
+        self.scratch = None
+        database = self.path
+        if readonly and _exists(self.path + "-journal"):
+            # An interrupted commit left its journal: reading the catalog here
+            # would roll it back INSIDE the backup. Read a private copy instead;
+            # the next backup run, which may write, does the real rollback.
+            self.scratch = tempfile.mkdtemp(prefix="photo_backup_catalog_")
+            database = os.path.join(self.scratch, "catalog.sqlite")
+            try:
+                for suffix in ("", "-journal"):
+                    shutil.copyfile(_io(self.path + suffix), _io(database + suffix))
+            except OSError as exc:
+                shutil.rmtree(self.scratch, ignore_errors=True)
+                raise RuntimeError(f"cannot read catalog {self.path}: {exc}")
         try:
-            self.conn = sqlite3.connect(_io(self.path))
+            self.conn = sqlite3.connect(_io(database))
             if readonly:
                 try:
                     row = self.conn.execute(
@@ -1003,7 +1025,11 @@ class _Catalog:
                     raise RuntimeError(
                         f"catalog schema_version {row[0]} != {SCHEMA_VERSION}: {self.path}")
         except sqlite3.Error as exc:
+            self.close()
             raise RuntimeError(f"cannot open catalog {self.path}: {exc}")
+        except RuntimeError:
+            self.close()
+            raise
 
     def all_rows(self):
         cursor = self.conn.execute(
@@ -1059,9 +1085,13 @@ class _Catalog:
 
     def close(self):
         try:
-            self.conn.close()
+            if self.conn is not None:
+                self.conn.close()
         except sqlite3.Error:
             pass
+        if self.scratch is not None:
+            shutil.rmtree(self.scratch, ignore_errors=True)
+            self.scratch = None
 
 
 @dataclass
@@ -1119,19 +1149,19 @@ def _move_to_versions(dest, stamp, status, log):
 
 
 def _handle_old_copy(dest, stamp, status, log):
-    """The destination's old copy of a CHANGED file. A different size proves
-    different content: it goes to the versions folder now. With the same size
-    the choice waits for the returned callback, which gets the hash of the
-    bytes really copied: only a new file identical byte for byte leaves the old
-    one out of the versions folder (Capture One rewrites every .cos it opens,
-    new date, same bytes). The new file is copied either way."""
-    if os.stat(_io(status.dst)).st_size != status.planned.size:
-        _move_to_versions(dest, stamp, status, log)
-        return None
-    old_sha256 = _sha256_file(status.dst)
+    """The destination's old copy of a CHANGED file. It keeps its name until
+    the returned callback runs, right before the new file takes that name: a
+    copy that fails, or a crash before that, leaves the old copy where it was.
+    A different size proves different content: the callback moves it to the
+    versions folder. With the same size the callback compares it with the hash
+    of the bytes really copied: only a new file identical byte for byte leaves
+    the old one out of the versions folder (Capture One rewrites every .cos it
+    opens, new date, same bytes). The new file is copied either way."""
+    same_size = os.stat(_io(status.dst)).st_size == status.planned.size
+    old_sha256 = _sha256_file(status.dst) if same_size else None
 
     def before_final(new_sha256):
-        if new_sha256 != old_sha256:
+        if old_sha256 is None or new_sha256 != old_sha256:
             _move_to_versions(dest, stamp, status, log)
             return
         # Windows refuses to replace a read-only file
@@ -1270,10 +1300,21 @@ class _ReadAhead:
         self._thread.join(5)
 
 
+def _delete_temp(tmp):
+    """Remove one of our own temp files. The copied attributes can make a temp
+    read-only, and a crash can leave that temp behind: Windows refuses to
+    remove it until it is writable again."""
+    try:
+        os.remove(_io(tmp))
+    except PermissionError:
+        os.chmod(_io(tmp), os.stat(_io(tmp)).st_mode | 0o200)
+        os.remove(_io(tmp))
+
+
 def _remove_temp(tmp):
     try:
         if _exists(tmp):
-            os.remove(_io(tmp))
+            _delete_temp(tmp)
     except OSError:
         pass
 
@@ -1281,7 +1322,7 @@ def _remove_temp(tmp):
 def _write_temp(planned, tmp, source, flush):
     """Write `source` to the temp file; `flush` waits until it is on the disk."""
     if _exists(tmp):
-        os.remove(_io(tmp))
+        _delete_temp(tmp)
     with open(_io(tmp), "xb") as handle:
         for chunk in source:
             handle.write(chunk)
@@ -1313,6 +1354,10 @@ def _finish_temp(planned, tmp, dst, verify, digest, stat0, expected_sha256=None,
     if expected_sha256 is not None and digest != expected_sha256:
         raise RuntimeError("content differs from the catalog sha256 (backup copy corrupt?)")
     shutil.copystat(_io(planned.src), _io(tmp))
+    # The dates of the bytes really copied (stat0), not of the source as it is
+    # now: a file edited after it was read keeps its old date here, so the next
+    # run sees it as CHANGED instead of trusting old bytes under a new date.
+    os.utime(_io(tmp), ns=(stat0.st_atime_ns, stat0.st_mtime_ns))
     if verify == "size":
         if os.stat(_io(tmp)).st_size != stat0.st_size:
             raise RuntimeError("size mismatch after copy")
@@ -1915,7 +1960,9 @@ def _run_backup(args, log, stamp, plan_fn=None):
         done, done_bytes, error_count, interrupted = _copy_all(
             args, statuses, dest, stamp, catalog, log)
         log.log(f"moved {moved} files / {_gb(moved_bytes)}")
-        log.log(f"copied {done} files / {_gb(done_bytes)}; {error_count} errors")
+        log.out(f"copied {done} files / {_gb(done_bytes)}; {error_count} errors")
+        if error_count or move_errors:
+            log.out(f"ERRORS: {_num(error_count + move_errors)} files were NOT copied -> {log.path}")
         if interrupted:
             return 130
         if args.move_orphans:
@@ -1991,7 +2038,7 @@ def _key_under_prefixes(key, prefixes):
     return False
 
 
-def _run_verify(args, log):
+def _run_verify(args, log, plan_fn=None):
     dest = os.path.abspath(args.dest)
     if not os.path.isdir(_io(dest)):
         print(f"destination does not exist: {dest}", file=sys.stderr)
@@ -2014,7 +2061,7 @@ def _run_verify(args, log):
     if not deep and args.max_gb > 0:
         log.log("max-gb ignored (quick verify)")
     try:
-        planned = plan(args)
+        planned = (plan_fn or plan)(args)
         for error in planned.errors:
             log.log(error)
         for warning in planned.warnings:
