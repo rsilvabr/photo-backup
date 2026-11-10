@@ -159,6 +159,9 @@ def test_r1_a_destination_drive_that_goes_away_for_real(tmp_path, monkeypatch, c
         with monkeypatch.context() as patch:
             patch.setattr(sb, "SMALL_FILE_KB", 0)
             patch.setattr(sb, "DEST_CHECK_AFTER_ERRORS", 20)
+            # a small read-ahead, as in the simulated tests: with the default
+            # the whole 5 MB source fits in it and may be read before the stop
+            patch.setattr(sb, "READ_AHEAD_MB", 0.002)
             opened = counting_reads(patch)
             real = sb._copy_file
             calls = {"n": 0}

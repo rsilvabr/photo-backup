@@ -289,10 +289,14 @@ def test_b10_unexported_copy_takes_capture_one_of_a_folder_without_files(tmp_pat
 def test_b10_capture_one_inside_a_session_is_counted(tmp_path):
     folder = sweep_tree(tmp_path / "G")
     without = plan_rows([(folder, "3", "raw")], tmp_path)
-    # day2 (NEF + .cos), _OUTTAKES/old, _OUTTAKES_DROP, and the film session has none
-    sizes = 52 + 51 + 36 + 50
-    assert without.stats.inside_shoot_skipped == 4
-    assert without.stats.inside_shoot_skipped_bytes == sizes
+    # _OUTTAKES/old and _OUTTAKES_DROP; the film session has none. Since v0.13.0
+    # day2 (NEF + .cos) is not named by LeaveOut: a folder without an export, its
+    # Capture One counted there (until v0.12.1: 4 files / 189 bytes inside sessions)
+    assert without.stats.inside_shoot_skipped == 2
+    assert without.stats.inside_shoot_skipped_bytes == 36 + 50
+    day2 = [item for item in without.unexported_folders if Path(item.path).name == "day2"]
+    assert len(day2) == 1 and not day2[0].copied
+    assert (day2[0].files, day2[0].nbytes, day2[0].c1_files, day2[0].c1_nbytes) == (1, 52, 1, 51)
 
 
 # ---- B9 -----------------------------------------------------------------------------------
@@ -436,25 +440,31 @@ def test_b2_inside_csv_and_the_biggest_names(tmp_path, capsys, photobackup_log_d
     out = capsys.readouterr().out.splitlines()
     rows = list(csv.DictReader(io.StringIO(latest_csv(photobackup_log_dir, "_inside.csv"))))
     by_sub = {(Path(row["session"]).name, row["subfolder"]): row for row in rows}
-    assert by_sub[("Untitled folder", "Birthday party")]["files"] == "2"
-    assert by_sub[("Untitled folder", "Birthday party")]["bytes"] == "10000"
+    # v0.13.0: Birthday party is not named by LeaveOut (until v0.12.1 it was a row
+    # here, 2 files / 10000 bytes, and the first name of the summary)
+    assert set(by_sub) == {("Untitled folder", "_OUTTAKES"), ("shoot", "_OUTTAKES")}
     assert by_sub[("Untitled folder", "_OUTTAKES")]["bytes"] == "300"
     assert by_sub[("shoot", "_OUTTAKES")]["bytes"] == "200"
     start = next(i for i, text in enumerate(out) if "inside sessions" in text)
+    assert "inside sessions (subfolders the mode leaves out): 2 /" in out[start]
     names = out[start + 1:start + 3]
-    assert "Birthday party" in names[0]
-    assert "_OUTTAKES" in names[1] and "2 files" in names[1]     # grouped by name
+    assert "_OUTTAKES" in names[0] and "2 files" in names[0]     # grouped by name
+    assert "Birthday party" not in names[1]
 
 
-def test_b2_guard_the_selection_does_not_change(tmp_path):
-    """guard: B2 only reports; the rule of what is a session waits for the owner."""
+def test_b2_a_session_subfolder_the_mode_does_not_name_is_judged_alone(tmp_path):
+    """v0.13.0 (the owner's decision on B2): what is a session does not change, what
+    it leaves out does. Until v0.12.1 Birthday party was left out in every mode."""
     make_tree(tmp_path, {
         "G/2026/Untitled folder/_EXPORT/x.jpg": 10,
         "G/2026/Untitled folder/chat_photo.jpeg": 11,
         "G/2026/Untitled folder/Birthday party/IMG_1.JPG": 50,
     })
     plan = plan_rows([(tmp_path / "G" / "2026", "3+", "raw")], tmp_path)
+    assert [item.category for item in plan.files if "Birthday party" in item.src]         == [sb.CAT_UNEXPORTED]
+    plan = plan_rows([(tmp_path / "G" / "2026", "3", "raw")], tmp_path)
     assert not any("Birthday party" in item.src for item in plan.files)
+    assert [Path(item.path).name for item in plan.unexported_folders] == ["Birthday party"]
 
 
 # ---- B4 -----------------------------------------------------------------------------------

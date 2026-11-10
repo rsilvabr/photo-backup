@@ -579,7 +579,9 @@ def test_unselected_raw_is_unchanged(tmp_path):
 def full_tree(root):
     """The invariant tree: the round-1 tree, an export inside the added folders, the
     originals above, a $RECYCLE.BIN outside an added folder and a folder named in
-    --exclude-folders (S4/S9), also inside an added folder (R2 of round 3)."""
+    --exclude-folders (S4/S9), also inside an added folder (R2 of round 3), and
+    session subfolders without a special name, with and without an export of
+    their own, also inside _OUTTAKES_KEEP and _OUTTAKES (LeaveOut, v0.13.0)."""
     folder = sweep_tree(root)
     export_in_added_tree(root)
     originals_tree(root)
@@ -593,6 +595,29 @@ def full_tree(root):
         "shoot/_OUTTAKES_KEEP/sub/Skipme/k2.NEF": 11,
         "shoot/_OUTTAKES_KEEP/_EXPORT/Skipme/k3.jpg": 12,
         "shoot/CaptureOne/Skipme/k4.cos": 13,
+        # session subfolders the mode does not name (LeaveOut, v0.13.0): judged alone
+        "shoot/Other event/IMG_0101.JPG": 14,
+        "shoot/Other event/IMG_0102.JPG": 15,
+        "shoot/Other event/clip.mp4": 16,
+        "shoot/Other event/CaptureOne/Settings166/IMG_0101.JPG.cos": 17,
+        "shoot/Other event/CaptureOne/Cache/Proxies/IMG_0101.cop": 18,
+        "shoot/Other event/deeper/IMG_0103.JPG": 19,
+        "shoot/Other event/_OUTTAKES/IMG_0104.JPG": 20,
+        # ... with an export and an original of its own: a session
+        "shoot/Selected/DSC_0070.NEF": 21,
+        "shoot/Selected/DSC_0071.NEF": 22,
+        "shoot/Selected/_EXPORT/DSC_0070_v1.jxl": 23,
+        "shoot/Selected/_OUTTAKES/DSC_0072.NEF": 24,
+        "shoot/Selected/rejects/DSC_0073.NEF": 25,
+        # ... with an export and no original beside it
+        "shoot/Edited/_EXPORT/edit_v1.jpg": 26,
+        "shoot/Edited/cam2/DSC_0080.NEF": 27,
+        # ... inside _OUTTAKES_KEEP and _OUTTAKES (both sessions here)
+        "shoot/_OUTTAKES_KEEP/Picked/DSC_0090.NEF": 28,
+        "shoot/_OUTTAKES_KEEP/Picked/DSC_0090.JPG": 29,
+        "shoot/_OUTTAKES_KEEP/Picked/clip.mov": 30,
+        "shoot/_OUTTAKES/Picked/DSC_0062.NEF": 31,
+        f"{folder.name}/250101_Shoot/_OUTTAKES_DROP/old/DSC_0021.NEF": 32,
     })
     return root / "2025"
 

@@ -1,16 +1,16 @@
-Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Only,Skip,Description
-1,no,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,,,Exports and the originals of the exported photos
-1+,no,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,yes,,,Mode 1 where there is an export; the whole folder where there is none
-2,yes,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,,,Mode 1 + unselected originals
-2+,yes,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,yes,,,Mode 2 where there is an export; the whole folder where there is none
-3,yes,_OUTTAKES_KEEP,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,,,Mode 2 + _OUTTAKES_KEEP
-3+,yes,_OUTTAKES_KEEP,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,yes,,,Mode 3 where there is an export; the whole folder where there is none
-4,yes,_OUTTAKES_KEEP;_OUTTAKES,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,,,Mode 3 + _OUTTAKES
-4+,yes,_OUTTAKES_KEEP;_OUTTAKES,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,yes,,,Mode 4 where there is an export; the whole folder where there is none
-5,yes,_OUTTAKES*,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,,,Mode 4 + every _OUTTAKES*
-5+,yes,_OUTTAKES*,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,yes,,,Mode 5 where there is an export; the whole folder where there is none
-6,no,,,,yes,no,,,The whole folder
-raw-only,no,,,,yes,no,raw;.xmp;.dop;.pp3;.cos;.comask;.nksc,no,Only the RAW files of the folder and their sidecars and edit settings
-jpeg-only,no,,,,yes,no,jpeg,no,Only the JPEG files of the folder
-jxl-only,no,,,,yes,no,jxl,no,Only the JXL files of the folder
-skip,no,,,,no,no,,yes,This folder stays out of the backup
+Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Only,Skip,LeaveOut,Description
+1,no,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,,,_OUTTAKES*,Exports and the originals of the exported photos
+1+,no,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,yes,,,_OUTTAKES*,Mode 1 where there is an export; the whole folder where there is none
+2,yes,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,,,_OUTTAKES*,Mode 1 + unselected originals
+2+,yes,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,yes,,,_OUTTAKES*,Mode 2 where there is an export; the whole folder where there is none
+3,yes,_OUTTAKES_KEEP,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,,,_OUTTAKES*,Mode 2 + _OUTTAKES_KEEP
+3+,yes,_OUTTAKES_KEEP,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,yes,,,_OUTTAKES*,Mode 3 where there is an export; the whole folder where there is none
+4,yes,_OUTTAKES_KEEP;_OUTTAKES,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,,,_OUTTAKES*,Mode 3 + _OUTTAKES
+4+,yes,_OUTTAKES_KEEP;_OUTTAKES,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,yes,,,_OUTTAKES*,Mode 4 where there is an export; the whole folder where there is none
+5,yes,_OUTTAKES*,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,,,_OUTTAKES*,Mode 4 + every _OUTTAKES*
+5+,yes,_OUTTAKES*,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,yes,,,_OUTTAKES*,Mode 5 where there is an export; the whole folder where there is none
+6,no,,,,yes,no,,,,The whole folder
+raw-only,no,,,,yes,no,raw;.xmp;.dop;.pp3;.cos;.comask;.nksc,no,,Only the RAW files of the folder and their sidecars and edit settings
+jpeg-only,no,,,,yes,no,jpeg,no,,Only the JPEG files of the folder
+jxl-only,no,,,,yes,no,jxl,no,,Only the JXL files of the folder
+skip,no,,,,no,no,,yes,,This folder stays out of the backup

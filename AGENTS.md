@@ -124,7 +124,20 @@ from the command line. A future job (e.g. a full mirror) is a new
   `tests/test_bug_sweep_round2.py`).
 - **A folder not exported yet is not lost in a `+` mode.** `Unexported=yes`
   in the modes table copies a folder without an export whole (`--unexported
-  copy`, per line); a folder with one follows the rest of the mode.
+  copy`, per line) -- also a subfolder of a session that `LeaveOut` does not
+  name (v0.13.0); a folder with an export follows the rest of the mode.
+- **A session leaves out only what the table names; the rest is judged alone
+  (v0.13.0).** A direct subfolder of a session (export + an original beside
+  it) goes "inside sessions" only when it matches the mode's `LeaveOut`
+  (`FolderRules.leave_out`; `SESSION_LEAVE_OUT`, `*`, for `selective_backup.py`
+  alone and for a table without the column). Any other one keeps the
+  session's own `inside` in `build`, as the subfolder of a folder with an
+  export and no original beside it always did: a session if it holds an
+  export, a folder without an export if not. Order: `Exclude`, `AddWhole`,
+  `AddFolders`, then `LeaveOut`. A table without the column, or with `*`,
+  plans exactly what v0.12.1 planned (`tests/test_leave_out.py` keeps the
+  v0.12.1 plans of the invariant tree as a fixed list), and no mode copies
+  less than v0.12.1. The code never names `_OUTTAKES`: the table does.
 - **Leaving out by a manifest line is the owner's explicit choice, and it is
   reported.** `Skip=yes` plans nothing and `Only` keeps only those extensions
   (both in `_Planner.build`, so analysis, dry-run and copy agree); the summary

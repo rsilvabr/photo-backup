@@ -38,7 +38,8 @@ def rules_from_mode(mode, originals="raw"):
     return sb.FolderRules(add_filtered=tuple(mode.add_folders),
                           add_whole=tuple(mode.add_whole), exclude=tuple(mode.exclude),
                           whole=mode.whole,
-                          originals=mb.ORIGINALS_VALUES[originals])
+                          originals=mb.ORIGINALS_VALUES[originals],
+                          leave_out=tuple(mode.leave_out))
 
 
 def planner_for(source, tmp_path, *extra, rules=None, skip_paths=frozenset()):

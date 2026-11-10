@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 
-__version__ = "0.12.1"
+__version__ = "0.13.0"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -76,6 +76,13 @@ NXSTUDIO_FOLDER_NAMES = "NKSC_PARAM"         # ';'-separated (any case); always 
 
 # ---- Folders without an export ----------------------------------------------
 UNEXPORTED = "skip"                 # default --unexported: skip | copy
+
+# ---- Inside sessions ----------------------------------------------------------
+SESSION_LEAVE_OUT = "*"             # ';'-separated direct subfolders of a session (a folder with an export and
+                                    # an original beside it) left out with all below them, "inside sessions";
+                                    # '*' = every one that is not an export, Capture One or NKSC_PARAM folder.
+                                    # manifest_backup.py's LeaveOut column replaces it per mode; a modes table
+                                    # without that column uses it. Any other subfolder is judged alone.
 
 # ---- Walk ---------------------------------------------------------------------
 EXCLUDE_FOLDERS = ""                # ';'-separated folder names (any case) skipped anywhere
@@ -494,6 +501,9 @@ class FolderRules:
     originals: str = "raw_or_jpeg"
     skip: bool = False          # this folder stays out: nothing planned, its size reported
     only: tuple = ()            # lower-case extensions: every other planned file is left out
+    leave_out: tuple = field(default_factory=lambda: tuple(_split_names(SESSION_LEAVE_OUT)))
+                                # patterns: direct subfolders of a session left out ("inside
+                                # sessions"); any other one is judged alone (v0.13.0)
 
 
 class _Planner:
@@ -502,6 +512,7 @@ class _Planner:
         self.list_cache = list_cache
         self.skip_paths = frozenset(os.path.normcase(path) for path in skip_paths)
         self.rules = rules
+        self.leave_out = (rules if rules is not None else FolderRules()).leave_out
         self.stats = Stats()
         self.errors = []
         self.warnings = []
@@ -936,9 +947,9 @@ class _Planner:
             self._add_tree(dpath, base, CAT_ADDED)
 
     def _inside_folder(self, inside, files, editor_dirs):
-        """A folder inside a session that is not copied: its files, and those
-        of its Capture One and NKSC_PARAM folders, count as inside sessions,
-        under the session's direct subfolder it belongs to (_inside.csv)."""
+        """A folder inside a subfolder a session leaves out (LeaveOut), not
+        copied: its files, and those of its Capture One and NKSC_PARAM folders,
+        count as inside sessions, under that subfolder (_inside.csv)."""
         count = len(files)
         nbytes = sum(item[2] for item in files)
         for _, dpath in editor_dirs:
@@ -1007,8 +1018,14 @@ class _Planner:
     def build(self):
         """Walk every source. A stack item is (path, base, inside, added):
         inside = (session, its direct subfolder) once the walk is inside a
-        session (None outside); added = the Originals filter once it is inside
-        an AddFolders folder (None outside)."""
+        subfolder a session leaves out (None outside); added = the Originals
+        filter once it is inside an AddFolders folder (None outside).
+
+        A session leaves out only its direct subfolders that match `leave_out`
+        (v0.13.0). Any other one keeps the `inside` of the session, as the
+        subfolder of a folder with an export and no original beside it always
+        did: judged alone, a session if it holds an export, a folder without an
+        export if not -- copied whole with --unexported copy, listed if not."""
         stack = []
         whole = self.rules is not None and self.rules.whole
         for source in self.args.source:
@@ -1040,7 +1057,8 @@ class _Planner:
             if exports:
                 has_originals = self._session(path, base, files, exports, c1_dirs, nx_dirs, added)
                 for name, dpath in others:
-                    child_inside = (path, dpath) if has_originals else inside
+                    left_out = has_originals and _folder_matches(name, self.leave_out)
+                    child_inside = (path, dpath) if left_out else inside
                     if self.rules is not None and _folder_matches(name, self.rules.add_whole):
                         self._add_tree(dpath, base, CAT_ADDED, self.cache_skip_direct)
                     elif self.rules is not None and _folder_matches(name, self.rules.add_filtered):
@@ -2147,7 +2165,7 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
         lines.append(f"  left out by a mode's Only filter: {_num(planned.stats.only_filtered)} / "
                      f"{_gb(planned.stats.only_filtered_bytes)}")
     inside_csv = f"   -> {log_paths['inside']}" if planned.inside else ""
-    lines.append(f"  inside sessions (_OUTTAKES, OLD_TIFFs, ...): "
+    lines.append(f"  inside sessions (subfolders the mode leaves out): "
                  f"{_num(planned.stats.inside_shoot_skipped)} / "
                  f"{_gb(planned.stats.inside_shoot_skipped_bytes)}{inside_csv}")
     lines.extend(_inside_name_lines(planned.inside))

@@ -9,7 +9,8 @@ releases are also published as
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **[v0.12.1](#v0121)** | 2026-11-11 | Bug sweep: nothing left out without a count, a bigger mode never copies less, a source that cannot be read is not a source that is gone, the rolling verify keeps turning; `Originals=raw` keeps a photo whose only original is a TIFF, PNG, HEIC or PSD; `[7] Manifest` does what `[1]` does |
+| **[v0.13.0](#v0130)** | 2026-11-11 | A session leaves out only the subfolders its mode names (`LeaveOut`, `_OUTTAKES*` in the shipped modes); any other one is judged alone, so a `+` mode copies it |
+| [v0.12.1](#v0121) | 2026-11-11 | Bug sweep: nothing left out without a count, a bigger mode never copies less, a source that cannot be read is not a source that is gone, the rolling verify keeps turning; `Originals=raw` keeps a photo whose only original is a TIFF, PNG, HEIC or PSD; `[7] Manifest` does what `[1]` does |
 | [v0.12.0](#v0120) | 2026-11-10 | A file never counts as saved when the right content cannot be restored: eight fixes from an audit; `manifest_backup.py --verify` |
 | [v0.11.0](#v0110) | 2026-11-10 | A manifest line can leave a folder out (`skip`) or keep only one type of file in it (`raw-only`, `jpeg-only`, `jxl-only`) |
 | [v0.10.0](#v0100) | 2026-11-10 | Modes `1+` to `5+`: a folder not exported yet is copied whole, so what has not been edited is not left out |
@@ -25,6 +26,80 @@ releases are also published as
 | v0.1.0 | 2026-10-06 | First implementation, not released |
 
 `mobile_backup.py` has its own version: [see the end of this page](#mobile_backuppy).
+
+---
+
+## v0.13.0
+
+**Released 2026-11-11.** A session leaves out only the subfolders its mode
+names. What is a session does not change: a folder with an export folder and
+an original beside it.
+
+**Before.** Every direct subfolder of a session that was not an export,
+`CaptureOne` or `NKSC_PARAM` folder stayed out ("inside sessions"), unless the
+mode added it (`AddFolders`, `AddWhole`). That was meant for the outtakes, but
+it took any folder: one loose JPEG beside an export folder made a session, and
+a folder with 240 photos of another event, put beside that export, had no copy
+in mode `3+`. Measured on the owner's archive (all years planned in mode 3):
+86 `_OUTTAKES` / `_OUTTAKES_DROP` folders left out inside sessions (190 636
+files, 2 325 GB), as intended, and 84 folders with other names (2 841 files,
+24.6 GB: alternative scans, "Selected" and "Edited" folders, the one above)
+that nobody asked to leave out.
+
+**Now.** The modes table has a new optional column, **`LeaveOut`**:
+`;`-separated patterns (only `*` is a wildcard) of the direct subfolders of a
+session that stay out, with everything below them, counted under "inside
+sessions" and listed in `_inside.csv` as before. Any other direct subfolder of
+a session is judged alone, exactly as the subfolder of a folder with an export
+and no original beside it always was: a session if it holds an export folder; a
+folder without an export if not — copied whole in a `+` mode, listed in
+`_unexported.csv` in the others. The order is `Exclude`, `AddWhole`,
+`AddFolders`, then `LeaveOut`: `_OUTTAKES_KEEP` matches `_OUTTAKES*` and mode 3
+still adds it. The shipped `backup_modes.csv` has `LeaveOut = _OUTTAKES*` in
+modes 1 to 5 and `1+` to `5+`, and an empty cell in the `Whole`, `Only` and
+`skip` modes. To leave out one more name, add it: `_OUTTAKES*;rejects`.
+
+- A table **without** the column (written before this version) reads it as
+  `*`: every subfolder, the v0.12.1 behaviour, nothing changes.
+- A column that is there with an **empty** cell leaves nothing out.
+- `LeaveOut` with `Whole=yes` or `Skip=yes` aborts (exit 2), as the other
+  combinations that make no sense: those modes walk no session.
+- `selective_backup.py` on its own, without a modes table, does not change and
+  has no new option; the menu does not change. Its new setting
+  `SESSION_LEAVE_OUT` (`*`) is what a session leaves out when no table says
+  otherwise.
+- The summary line reads `inside sessions (subfolders the mode leaves out)`.
+
+**Copies more on purpose.** A subfolder that is no longer "inside" a session is
+handled as the subfolder of a folder with an export and no original beside it,
+a path that already existed. In a mode without `+` it is still not copied (it
+moves from `_inside.csv` to `_unexported.csv`); in a `+` mode it is copied. No
+mode copies less than v0.12.1, on any tree: the test suite holds the plans of
+v0.12.1 on its invariant tree, every mode, as a fixed list, and checks that a
+table without `LeaveOut`, or with `*`, plans exactly that and that the new
+table plans at least that. On the owner's archive (the owner's manifest:
+1991–2023 in mode 6, 2024–2026 in `3+`, a dry-run of both versions compared
+file by file): 254 files / 2.13 GB more, none less, all under four session
+subfolders of 2024–2026 — the 240 photos of the case above, two small folders
+(2 and 4 files) and one that only holds a `CaptureOne` folder (8 `.cos`).
+"Inside sessions" goes from 190 890 to 190 636 files, and `_inside.csv` now
+lists only `_OUTTAKES*` folders. `--analyze` of both versions, combination by
+combination (855): none has fewer files or bytes; the modes without `+` do not
+change; every `+` mode grows by 2 841 files / 24.6 GB over the whole archive,
+of which 2 587 files / 22.4 GB in the years the manifest backs up whole
+(1991–2023), had they been in `3+`.
+
+**When upgrading.**
+
+- **A modes table of your own without the column** (`--modes`): nothing
+  changes. Add the column when you want the new rule.
+- **With the new shipped table:** the next backup in a `+` mode copies the
+  session subfolders that used to stay out. A `manifest_backup.py --verify`
+  run before that backup shows them as `NOT_BACKED_UP`, exit 1 (the manifest
+  selects them now, and they are not on the backup yet): expected, the next
+  backup copies them. Look at the dry-run's `_unexported.csv` (with `copied = yes`) to see
+  which folders they are. In a mode without `+` they stay without a copy and
+  appear in `_unexported.csv` instead of `_inside.csv`.
 
 ---
 

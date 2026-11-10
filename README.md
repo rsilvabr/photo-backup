@@ -445,19 +445,28 @@ Capture One and NKSC_PARAM folders are also copied — also for a folder that ha
 subfolders and a `CaptureOne` folder *(v0.12.1)*: a parent folder above a
 session counts as a folder without an export (it has no export of its own).
 
-Folders inside a session that are not export, Capture One or NKSC_PARAM
-(`_OUTTAKES`, `OLD_TIFFs`, `tiff_zip`, ...) are never copied; their files, and
-those of their own `CaptureOne` and `NKSC_PARAM` folders, are counted as
-"inside sessions". `_inside.csv` has one line per direct subfolder of a session
-left out (session, subfolder, files, bytes), and the summary names the five
-biggest, grouped by name *(v0.12.1)*, so a folder that is not an outtake stands
-out next to `_OUTTAKES`:
+**Inside sessions.** `selective_backup.py` on its own leaves out every direct
+subfolder of a session that is not an export, Capture One or NKSC_PARAM folder
+(`_OUTTAKES`, `OLD_TIFFs`, `tiff_zip`, ...), with everything below it
+(`SESSION_LEAVE_OUT = "*"`). With a modes table *(v0.13.0)*, a session leaves
+out only the subfolders its mode names in `LeaveOut` — `_OUTTAKES*` in the
+shipped table — and any other direct subfolder is **judged alone**, exactly as
+the subfolder of a folder with an export and no original beside it (below): a
+session if it holds an export folder; a folder without an export if not, copied
+whole in a `+` mode and listed in `_unexported.csv` in the others. So a folder
+with the photos of another event, put beside the export of a session, is no
+longer left out in a `+` mode.
+
+What a session leaves out — the files, and those of the left-out folder's own
+`CaptureOne` and `NKSC_PARAM` folders — is counted as "inside sessions".
+`_inside.csv` has one line per direct subfolder of a session left out
+(session, subfolder, files, bytes), and the summary names the five biggest,
+grouped by name *(v0.12.1)*:
 
 ```
-  inside sessions (_OUTTAKES, OLD_TIFFs, ...): 1600 / 60.5 GB   -> <log>_inside.csv
+  inside sessions (subfolders the mode leaves out): 1550 / 58.4 GB   -> <log>_inside.csv
       _OUTTAKES          1200 files      48.0 GB
       _OUTTAKES_DROP      350 files      10.4 GB
-      Birthday party       50 files       2.1 GB
 ```
 
 A folder that holds an export folder but **no original beside it** is not a
@@ -479,7 +488,7 @@ another set in another. Two CSV files say what to do:
   stays out of git; `backup_manifest.example.csv` shows the format.
 - **The modes table** (`--modes`, default `backup_modes.csv` beside the
   script) says what each mode copies:
-  `Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Only,Skip,Description`.
+  `Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Only,Skip,LeaveOut,Description`.
 
 | Column | Meaning |
 |---|---|
@@ -492,11 +501,17 @@ another set in another. Two CSV files say what to do:
 | `Unexported` | `yes`/`no`, optional: a folder without an export is copied whole; a folder with one follows the rest of the mode |
 | `Only` | optional, `;`-separated: copy only these types. A group (`raw`, `jpeg`, `jpg`, `jxl`, `tif`, `png`, `heic`, `psd`, `dng`) or an extension (`.xmp`) |
 | `Skip` | `yes`/`no`, optional: this folder stays out of the backup |
+| `LeaveOut` | optional, `;`-separated patterns *(v0.13.0)*: the direct subfolders of a session (a folder with an export folder and an original beside it) left out, with everything below them — "inside sessions", `_inside.csv`. Any other direct subfolder of a session is judged alone: a session if it holds an export folder, a folder without an export if not (copied whole with `Unexported=yes`, listed in `_unexported.csv` without). Checked after `Exclude`, `AddWhole` and `AddFolders`: `_OUTTAKES_KEEP` matches `_OUTTAKES*` and mode 3 still adds it. An empty cell leaves nothing out. A table without the column (written before v0.13.0) reads it as `*`: every subfolder, as v0.12.1. With `Whole=yes` or `Skip=yes` it must be empty (they walk no session; abort, exit 2) |
 | `Description` | free text shown nowhere; for the owner |
 
 A pattern is matched against the folder name, case-insensitively; only `*` is
 a wildcard, everything else is literal (so `[FINAL]` is a name, not a
 character class). `yes`/`no` are case-insensitive.
+
+**Leaving out one more name inside sessions.** Add it to `LeaveOut`: with
+`_OUTTAKES*;rejects`, a session's `rejects` folder is left out too, in that
+mode, counted under "inside sessions" and listed in `_inside.csv`. Without it,
+`rejects` is judged alone (copied whole in a `+` mode).
 
 **`Originals`** chooses how the photos that were not exported are kept:
 
@@ -542,25 +557,31 @@ selects stays on the destination and appears as a `not_selected` orphan in
 The modes shipped in `backup_modes.csv`:
 
 ```csv
-Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Description
-1,no,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,Exports and the originals of the exported photos
-2,yes,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,Mode 1 + unselected originals
-3,yes,_OUTTAKES_KEEP,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,Mode 2 + _OUTTAKES_KEEP
-4,yes,_OUTTAKES_KEEP;_OUTTAKES,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,Mode 3 + _OUTTAKES
-5,yes,_OUTTAKES*,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,Mode 4 + every _OUTTAKES*
-6,no,,,,yes,no,The whole folder
+Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,LeaveOut,Description
+1,no,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,_OUTTAKES*,Exports and the originals of the exported photos
+2,yes,,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,_OUTTAKES*,Mode 1 + unselected originals
+3,yes,_OUTTAKES_KEEP,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,_OUTTAKES*,Mode 2 + _OUTTAKES_KEEP
+4,yes,_OUTTAKES_KEEP;_OUTTAKES,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,_OUTTAKES*,Mode 3 + _OUTTAKES
+5,yes,_OUTTAKES*,RAW SCANS*;RAW TIFF*;RAW GAMMA*,,no,no,_OUTTAKES*,Mode 4 + every _OUTTAKES*
+6,no,,,,yes,no,,The whole folder
 ```
 
 (Shown without the `Only` and `Skip` columns, which are empty in these six.)
 
+In modes 1 to 5 a session leaves out its `_OUTTAKES*` folders (those the mode
+does not add); every other subfolder of a session is judged alone *(v0.13.0)*.
 Modes `1+` to `5+` are the same five with `Unexported=yes`: a folder with an
-export follows the mode, and a folder not exported yet is copied whole, so what
-has not been edited or selected is not left out.
+export follows the mode, and a folder not exported yet is copied whole — also
+a subfolder of a session that `LeaveOut` does not name — so what has not been
+edited or selected is not left out.
 
 A bigger mode never copies less *(v0.12.1)*: whatever mode `N` copies, mode
 `N+1` and mode `N+` copy too (`_OUTTAKES\_EXPORT` is a session in mode 3 and
 stays one when mode 4 adds `_OUTTAKES`). The test suite checks it on a tree with
-outtakes, exports inside outtakes, film scans and folders not exported yet.
+outtakes, exports inside outtakes, film scans, folders not exported yet and
+session subfolders without a special name, with and without an export of their
+own *(v0.13.0)*. A table without `LeaveOut`, or with `*`, plans exactly what
+v0.12.1 planned on that tree.
 
 Measured with `--analyze` on one 11 TB drive listed as a single line
 (2026-11-09). The `all` column also carries loose TIFF, JXL and other files:
@@ -984,6 +1005,7 @@ default everywhere.
 | `XMP_SCAN_LIMIT_MB` | `4` | the boxes read before the image data, at most, per JXL |
 | `NXSTUDIO_FOLDER_NAMES` | `NKSC_PARAM` | `;`-separated NX Studio folder names |
 | `UNEXPORTED` | `skip` | default `--unexported` |
+| `SESSION_LEAVE_OUT` | `*` | `;`-separated direct subfolders of a session left out ("inside sessions") when no modes table says otherwise: `selective_backup.py` on its own, and a modes table without the `LeaveOut` column. `*` = every one, as up to v0.12.1 *(v0.13.0)* |
 | `EXCLUDE_FOLDERS` | (empty) | `;`-separated folder names skipped anywhere |
 | `SYSTEM_SKIP_FOLDERS` | `$RECYCLE.BIN;System Volume Information` | always skipped |
 | `VERIFY_COPY` | `hash` | default `--verify-copy` |
@@ -1030,7 +1052,8 @@ Every run writes `<LOG_DIR>\<YYMMDD_HHMMSS>_backup` (or `_verify`) plus:
   *v0.12.1*);
 - `_unmatched.csv` — `session,export_file`;
 - `_inside.csv` — `session,subfolder,files,bytes`: every direct subfolder of a
-  session left out ("inside sessions"), with what it holds *(v0.12.1)*;
+  session left out ("inside sessions"), with what it holds *(v0.12.1)*; with a
+  modes table, only those its `LeaveOut` names *(v0.13.0)*;
 - `_by_folder.csv` — `folder,files,bytes,cumulative_bytes` for what would be
   copied, by top folder (always written; the summary shows at most
   `SUMMARY_FOLDER_LINES` of them);
@@ -1057,19 +1080,24 @@ Japanese file names.
 
 ## Current version
 
-**v0.12.1** (2026-11-11).
+**v0.13.0** (2026-11-11).
+
+- A session leaves out only the subfolders its mode names. The modes table has a new column, `LeaveOut` (`_OUTTAKES*` in the shipped modes); any other subfolder of a session — scans, a "Selected" folder, the photos of another event put beside the export — is judged alone: a session if it holds an export, a folder without an export if not, copied whole in a `+` mode and listed in `_unexported.csv` in the others. **Copies more on purpose** in the `+` modes; no mode copies less. A modes table of your own without the column keeps the v0.12.1 behaviour, and so does `selective_backup.py` on its own. [Details](docs/version_history.md#v0130).
+
+**v0.12.1** (2026-11-11):
 
 - Fixes from a bug sweep. Every file under a source is now in the plan or in exactly one line of `Not copied:` (what `AddFolders` leaves out, the Capture One folders inside sessions, the links and junctions not followed; a folder skipped by its name is named), and a bigger mode never copies less: `_OUTTAKES\_EXPORT` stays a session when mode 4 adds `_OUTTAKES`. A source that cannot be read is no longer treated as gone by `--move-orphans`, the move detection or `--verify`. The rolling verify no longer stops behind rows with a problem, and a `--verify quick` no longer sends it back to the start. A destination that stops taking writes stops the backup, also when its catalog can no longer be written. The menu keeps `raw_or_jpeg`, always says "no" on the command line, and `[7] Manifest` does what `[1]` does (Capture One, `--update-changed`, "Max GB"). `captureone_backup.py` keeps the old copy under its name until the new one is safe and checks a row without a hash against its source. `mobile_backup.py` 0.1.2 deletes nothing of a source it was not given or could not read, and saves its state more often. Two changes copy less on purpose (a folder matching a mode's `Exclude` is never walked; a folder skipped by its name, such as `$RECYCLE.BIN` or one of `--exclude-folders`, is skipped everywhere, inside `AddFolders` too) and one more (`Originals=raw` keeps a photo whose only original is a TIFF, PNG, HEIC or PSD). [Details](docs/version_history.md#v0121).
 
 **v0.12.0** made sure a file never counts as saved when the right content cannot be restored (eight fixes from an audit) and added `manifest_backup.py --verify`.
 
-**522 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
+**668 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
 
 ## Changelog
 
 | Version | Date | What it added |
 |---------|------|---------------|
-| **v0.12.1** | 2026-11-11 | Bug sweep: nothing left out without a count, a bigger mode never copies less, an unreadable source is not a source that is gone, the rolling verify keeps turning; `Originals=raw` keeps TIFF/PNG/HEIC/PSD-only photos; `[7] Manifest` does what `[1]` does |
+| **v0.13.0** | 2026-11-11 | A session leaves out only the subfolders its mode names (`LeaveOut`, `_OUTTAKES*`); any other one is judged alone, copied whole in a `+` mode |
+| v0.12.1 | 2026-11-11 | Bug sweep: nothing left out without a count, a bigger mode never copies less, an unreadable source is not a source that is gone, the rolling verify keeps turning; `Originals=raw` keeps TIFF/PNG/HEIC/PSD-only photos; `[7] Manifest` does what `[1]` does |
 | v0.12.0 | 2026-11-10 | A file never counts as saved when the right content cannot be restored: eight fixes; `manifest_backup.py --verify` |
 | v0.11.0 | 2026-11-10 | A manifest line can leave a folder out or keep only one type of file in it |
 | v0.10.0 | 2026-11-10 | Modes `1+` to `5+`: a folder not exported yet is copied whole |

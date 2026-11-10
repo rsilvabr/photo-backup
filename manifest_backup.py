@@ -35,7 +35,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.12.1"
+__version__ = "0.13.0"
 
 # ---- Settings -------------------------------------------------------------------
 MODES_FILE = "backup_modes.csv"     # next to this script; --modes reads another
@@ -50,7 +50,8 @@ ONLY_GROUPS = {**sb.FORMAT_GROUPS,    # names usable in the Only column -> exten
                "raw": sb.RAW_EXTENSIONS, "jpeg": sb.JPEG_EXTENSIONS}
 MODE_COLUMNS = ("Mode", "Unselected", "AddFolders", "AddWhole", "Exclude", "Whole",
                 "Description")
-MODE_OPTIONAL_COLUMNS = ("Unexported", "Only", "Skip")   # a table written before them keeps working
+MODE_OPTIONAL_COLUMNS = ("Unexported", "Only", "Skip",   # a table written before them keeps working
+                         "LeaveOut")                     # (without LeaveOut: selective_backup.SESSION_LEAVE_OUT)
 MANIFEST_COLUMNS = ("Folder", "Mode", "Originals")
 
 
@@ -70,6 +71,8 @@ class Mode:
     unexported: bool = False    # folders without an export are copied whole
     skip: bool = False          # this folder stays out of the backup
     only: tuple = ()            # lower-case extensions; every other file is left out
+    leave_out: tuple = dataclasses.field(              # session subfolders left out (LeaveOut)
+        default_factory=lambda: tuple(sb._split_names(sb.SESSION_LEAVE_OUT)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -184,8 +187,17 @@ def read_modes(path):
         if skip and (unselected or whole or add_folders or add_whole or unexported or only):
             raise ManifestError(f"{path} line {line}: Skip=yes cannot be combined with "
                                 f"anything that copies files")
+        if "LeaveOut" in row:       # the column is there; an empty cell leaves nothing out
+            leave_out = tuple(sb._split_names(row.get("LeaveOut") or ""))
+        else:                       # a table written before it: as v0.12.1 (every subfolder)
+            leave_out = tuple(sb._split_names(sb.SESSION_LEAVE_OUT))
+        if "LeaveOut" in row and leave_out and (whole or skip):
+            raise ManifestError(f"{path} line {line}: LeaveOut cannot be combined with "
+                                f"{'Whole=yes' if whole else 'Skip=yes'}: that mode walks "
+                                f"no session (leave LeaveOut empty)")
         modes[name] = Mode(name, unselected, add_folders, add_whole, exclude, whole,
-                           str(row.get("Description") or "").strip(), unexported, skip, only)
+                           str(row.get("Description") or "").strip(), unexported, skip, only,
+                           leave_out)
     return modes
 
 
@@ -242,7 +254,7 @@ def _row_rules(mode, originals):
     return sb.FolderRules(add_filtered=mode.add_folders, add_whole=mode.add_whole,
                           exclude=mode.exclude, whole=mode.whole,
                           originals=ORIGINALS_VALUES[originals],
-                          skip=mode.skip, only=mode.only)
+                          skip=mode.skip, only=mode.only, leave_out=mode.leave_out)
 
 
 def _skip_paths_for(folder, rows):
