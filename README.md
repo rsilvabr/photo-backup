@@ -2,7 +2,7 @@
 
 You shoot 400 frames, the RAWs land in one folder, and the 30 you keep are exported into an `_EXPORT` folder inside it. photo-backup reads that export folder and backs up **those 30 photos**: the exports, plus — picked out of the 400 — their RAW, camera JPEG, edited TIFF and sidecars, plus your Capture One and NX Studio edits. The rest stays behind, or comes along folder by folder if you choose. Read-only on the source, never deletes on the destination, and verifies the backup on any later day with SHA-256. Tested on a 9 TB archive of Capture One, Lightroom and NX Studio sessions from 1991 to 2026.
 
-Every backup from the menu also keeps **Capture One itself**. Your `.cos` edits only *name* the ICC profiles, film curves and styles they use; on a computer without those files the same edit looks different. The backup keeps them, with your presets, recipes, shortcuts and workspaces, and a double-click restore (no Python needed) puts them back on a new computer: Capture One opens your photos with the same look and the same setup. Login data and the licence stay out. [Details](#capture-ones-own-files-captureone_backuppy-v060).
+A backup from the menu (`[1] Back up` or a preset) also keeps **Capture One itself**. Your `.cos` edits only *name* the ICC profiles, film curves and styles they use; on a computer without those files the same edit looks different. The backup keeps them, with your presets, recipes, shortcuts and workspaces, and a double-click restore (no Python needed) puts them back on a new computer: Capture One opens your photos with the same look and the same setup. Login data and the licence stay out. [Details](#capture-ones-own-files-captureone_backuppy-v060).
 
 **Windows program, no Python needed:** [photo-backup-exe](https://github.com/rsilvabr/photo-backup-exe/releases/latest) — unzip and double-click.
 
@@ -64,6 +64,22 @@ G:\2025\250129_Flores\                        a session: it holds an export fold
 └── _OUTTAKES\                                ✗  the rejects (a per-folder mode can add them)
 ```
 
+**One photo through three programs.** A RAW developed in NX Studio into a TIFF beside it, that TIFF edited in Capture One and exported: everything is kept. From the real session the tool was tested on:
+
+```
+_DSC6491.NEF                                           ✓  the RAW
+_DSC6491.JPG                                           ✓  the camera JPEG
+_DSC6491.xmp                                           ✓  its sidecar
+_DSC6491_NXstudio.tif                                  ✓  developed in NX Studio, beside the RAW
+_DSC6491_NXstudio.xmp                                  ✓  its sidecar
+NKSC_PARAM\_DSC6491.NEF.nksc                           ✓  the NX Studio edit of the RAW
+CaptureOne\Settings166\_DSC6491_NXstudio.TIF.cos       ✓  the Capture One edit of the TIFF
+_EXPORT\16B_JXL\_DSC6491_NXstudio_ProPhoto-g22_v1.jxl  ✓  exported from the edited TIFF
+_EXPORT\TIFF16\_DSC6491_NXstudio_ProPhoto-g22_v1.tif   ✗  same photo, it has a JXL
+```
+
+The export is matched to the shortest original name it starts with, `_DSC6491`, and every file beside the export folder whose name starts with that name comes along. It makes no difference whether you exported from the RAW or from the TIFF. The TIFF beside the RAW is an original, so the export formats do not filter it; only the files inside `_EXPORT` are.
+
 Sessions are found at any depth. A folder without an export is not copied, but it is listed:
 
 ```
@@ -86,7 +102,7 @@ What they cannot do is the choice in the session above: `DSC_9360.NEF` and `DSC_
 
 - **The originals of what you exported.** Each export is matched to the real file names beside the export folder: `DSC_9360_ProPhoto-g22_v1.jxl` → `DSC_9360.NEF`, `.JPG`, `.xmp`. Nikon's `DSC_` and `_DSC`, Canon's `IMG_`, film scans and phone names all work; a name is never cut at the first underscore. [How a photo is selected](#how-a-photo-is-selected).
 - **One export format per photo.** `jxl>tif>jpg` keeps a photo's JXL; its TIFF when it has no JXL; its JPEG when it has neither — per photo, not per folder. [Export formats](#export-formats).
-- **No photo left without a copy.** When the photos you did not export come along too, a manifest's `Originals=raw` keeps every RAW with its sidecars, and a JPEG only when no RAW of the same photo is beside it: a JPEG-only photo is kept, the JPEG twin of a RAW is not. [Originals that were not exported](#originals-that-were-not-exported---unselected).
+- **No camera photo left without a copy.** When the photos you did not export come along too, a manifest's `Originals=raw` keeps every RAW with its sidecars, and a JPEG only when no RAW of the same photo is beside it: a JPEG-only photo is kept, the JPEG twin of a RAW is not. A photo whose only original is a TIFF, HEIC, PNG or PSD needs `Originals=all`. [Originals that were not exported](#originals-that-were-not-exported---unselected).
 - **A checksum from the day of the copy.** The catalog keeps the SHA-256 of every file copied, so `--verify full` tells a damaged backup copy from an original that changed without changing its date (bit rot). Comparing the two sides only says that they differ. [Verifying a backup](#verifying-a-backup).
 
 **Different rules per folder, in one run.** A manifest CSV gives each folder its own mode — old years whole, recent years with their exports and originals — and every mode starts from the export selection above, then adds the originals that were not exported, `_OUTTAKES_KEEP`, `_OUTTAKES` or the whole folder. `--analyze` shows how many TB each mode would take before you choose. [Per-folder modes](#per-folder-modes-manifest_backuppy).
@@ -544,7 +560,7 @@ folder, move detection and orphan report.
 
 ## Capture One's own files (`captureone_backup.py`) *(v0.6.0)*
 
-The `.cos` files beside your photos hold the edits, but they only **name** the ICC profile, film curve and style they use. On a computer without those files, Capture One shows the edit differently. Every backup from the menu (and every preset) therefore also keeps, in `<destination>\_captureone`:
+The `.cos` files beside your photos hold the edits, but they only **name** the ICC profile, film curve and style they use. On a computer without those files, Capture One shows the edit differently. Every backup from the menu's `[1] Back up` (and every preset) therefore also keeps, in `<destination>\_captureone`:
 
 | Folder in the backup | Where it comes from | What it holds |
 |---|---|---|
@@ -552,6 +568,8 @@ The `.cos` files beside your photos hold the edits, but they only **name** the I
 | `Preferences` | `%LOCALAPPDATA%\Capture_One` | `user.config` of each version |
 | `Installed` | `Color Profiles` and `Film Curves` of the install folder | the profiles the `.cos` files name, in case a later version drops one |
 | `WindowsColor` | the Windows colour folder | its `.icc`/`.icm` files (export and monitor profiles) |
+
+`[7] Manifest` and the command-line scripts do not keep these: with them, also run `[6] Capture One only` (or `captureone_backup.py --dest`) to the same destination.
 
 Left out on purpose: login data and cookies (`MSALCache*`, the WebView folders), the licence file, `Logs`, `Stability`, and the program itself. `WHERE_EACH_FOLDER_GOES.txt` in that folder says where each part came from.
 
