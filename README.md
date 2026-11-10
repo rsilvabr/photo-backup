@@ -2,6 +2,8 @@
 
 A selective backup for photographers' archives. It backs up **the photos you exported** — the exports themselves, plus the RAW, camera JPEG, edited TIFF and sidecars they came from, plus your Capture One and NX Studio edits — and leaves the outtakes behind. Read-only on the source, never deletes on the destination, and verifies the backup on any later day with SHA-256. Tested on a 9 TB archive of Capture One, Lightroom and NX Studio sessions from 1991 to 2026.
 
+**Windows program, no Python needed:** [photo-backup-exe](https://github.com/rsilvabr/photo-backup-exe/releases/latest) — unzip and double-click.
+
 ---
 
 ## Contents
