@@ -1,6 +1,6 @@
 # photo-backup — back up the photos you actually kept
 
-A selective backup for photographers' archives. It backs up **the photos you exported** — the exports themselves, plus the RAW, camera JPEG, edited TIFF and sidecars they came from, plus your Capture One and NX Studio edits — and leaves the outtakes behind. Read-only on the source, never deletes on the destination, and verifies the backup on any later day with SHA-256. Tested on a 9 TB archive of Capture One, Lightroom and NX Studio sessions from 1991 to 2026.
+You shoot 400 frames, the RAWs land in one folder, and the 30 you keep are exported into an `_EXPORT` folder inside it. photo-backup reads that export folder and backs up **those 30 photos**: the exports, plus — picked out of the 400 — their RAW, camera JPEG, edited TIFF and sidecars, plus your Capture One and NX Studio edits. The rest stays behind, or comes along folder by folder if you choose. Read-only on the source, never deletes on the destination, and verifies the backup on any later day with SHA-256. Tested on a 9 TB archive of Capture One, Lightroom and NX Studio sessions from 1991 to 2026.
 
 **Windows program, no Python needed:** [photo-backup-exe](https://github.com/rsilvabr/photo-backup-exe/releases/latest) — unzip and double-click.
 
@@ -8,7 +8,7 @@ A selective backup for photographers' archives. It backs up **the photos you exp
 
 ## Contents
 
-- [Why a selective backup?](#why-a-selective-backup)
+- [Why a selective backup?](#why-a-selective-backup) · [Does it fit your archive?](#does-it-fit-your-archive)
 - [Features](#features)
 - [Requirements & Installation](#requirements--installation)
 - [Scripts](#scripts)
@@ -36,16 +36,76 @@ A selective backup for photographers' archives. It backs up **the photos you exp
 
 ## Why a selective backup?
 
-A photo archive is mostly photos nobody will ever look at again. In the archive this was built for, the year folders hold ~9.3 TB, but the photos that were actually edited and exported — with their originals and edits — fit in **~1.2 TB**. A mirror tool (FreeFileSync, robocopy) copies all 9 TB or nothing; it cannot tell a kept photo from an outtake.
+A photo archive is mostly photos nobody will ever look at again. In the archive this was built for, the year folders hold ~9.3 TB, but the photos that were actually edited and exported — with their originals and edits — fit in **~1.2 TB**. photo-backup reads the decision you already made: **if a photo has an export, it matters.**
 
-photo-backup reads the decision you already made: **if a photo has an export, it matters.** For every folder that holds an export folder (`_EXPORT`, `Lightroom_Export`, `C1_Export_WEB`, ... — any name containing "export"), it copies:
+### How the archive is organized
 
-- the files inside the export folders (default: the best available format per photo, `jxl>tif>jpg`),
-- the originals beside the export folder that produced those exports (RAW, camera JPEG, NX Studio TIFF, `.xmp`/`.dop`/`.pp3` sidecars),
-- the Capture One folders (`Settings*`; `Cache` is skipped by default),
-- the NX Studio `NKSC_PARAM` folder.
+One folder per shoot, the originals directly in it, and the exports in a folder inside it whose name contains "export". Such a folder is a **session**. A typical one, and what a backup with the default settings takes from it:
 
-The folder tree is mirrored on the destination, so `--source G:\` and `--source G:\2025` produce the same layout and later runs add to the previous backup. Everything it did **not** copy is listed (folders without an export, outtakes, filtered formats), so nothing is left out without you knowing.
+```
+G:\2025\250129_Flores\                        a session: it holds an export folder
+├── DSC_9358.NEF                              ✗  not exported
+├── DSC_9358.JPG                              ✗
+├── DSC_9359.NEF                              ✗  not exported
+├── DSC_9360.NEF                              ✓  exported (see _EXPORT): its RAW,
+├── DSC_9360.JPG                              ✓  its camera JPEG
+├── DSC_9360.xmp                              ✓  and its sidecar
+├── DSC_9361.NEF                              ✗  not exported
+├── _EXPORT\                                     any folder whose name contains "export"
+│   ├── 16B_JXL\DSC_9360_ProPhoto-g22_v1.jxl  ✓  the best format of the photo (jxl>tif>jpg)
+│   ├── TIFF16\DSC_9360_ProPhoto-g22_v1.tif   ✗  same photo, it has a JXL
+│   └── sRGB\DSC_9360_sRGB.jpg                ✗  same photo, it has a JXL
+├── CaptureOne\
+│   ├── Settings166\                          ✓  the Capture One edits (.cos)
+│   └── Cache\                                ✗  previews; Capture One rebuilds them
+├── NKSC_PARAM\                               ✓  the NX Studio edits
+└── _OUTTAKES\                                ✗  the rejects (a per-folder mode can add them)
+```
+
+Sessions are found at any depth. A folder without an export is not copied, but it is listed:
+
+```
+G:\2025\
+├── 250129_Flores\        session (holds _EXPORT)
+├── 250214_Trip\
+│   ├── 01_D810\          session (holds Lightroom_Export)
+│   └── 02_D200\          session (holds _EXPORT)
+└── 250301_New\           no export yet: listed in _unexported.csv; copied whole
+                          with --unexported copy or a "+" mode
+```
+
+The tree is mirrored on the destination (`G:\2025\250214_Trip\01_D810\DSC_0001.NEF` → `H:\BACKUP\2025\250214_Trip\01_D810\DSC_0001.NEF`), so `--source G:\` and `--source G:\2025` produce the same layout and later runs add to the previous backup.
+
+### What a sync tool cannot do
+
+FreeFileSync, robocopy and the like select by name and by folder: leave `_OUTTAKES` out, take only `*.NEF`, give another folder other rules. If that is all you need, they do it well.
+
+What they cannot do is the choice in the session above: `DSC_9360.NEF` and `DSC_9361.NEF` sit in the same folder with the same type, and only the export folder says that one of them was kept. photo-backup makes that choice photo by photo:
+
+- **The originals of what you exported.** Each export is matched to the real file names beside the export folder: `DSC_9360_ProPhoto-g22_v1.jxl` → `DSC_9360.NEF`, `.JPG`, `.xmp`. Nikon's `DSC_` and `_DSC`, Canon's `IMG_`, film scans and phone names all work; a name is never cut at the first underscore. [How a photo is selected](#how-a-photo-is-selected).
+- **One export format per photo.** `jxl>tif>jpg` keeps a photo's JXL; its TIFF when it has no JXL; its JPEG when it has neither — per photo, not per folder. [Export formats](#export-formats).
+- **No photo left without a copy.** When the photos you did not export come along too, a manifest's `Originals=raw` keeps every RAW with its sidecars, and a JPEG only when no RAW of the same photo is beside it: a JPEG-only photo is kept, the JPEG twin of a RAW is not. [Originals that were not exported](#originals-that-were-not-exported---unselected).
+- **A checksum from the day of the copy.** The catalog keeps the SHA-256 of every file copied, so `--verify full` tells a damaged backup copy from an original that changed without changing its date (bit rot). Comparing the two sides only says that they differ. [Verifying a backup](#verifying-a-backup).
+
+**Different rules per folder, in one run.** A manifest CSV gives each folder its own mode — old years whole, recent years with their exports and originals — and every mode starts from the export selection above, then adds the originals that were not exported, `_OUTTAKES_KEEP`, `_OUTTAKES` or the whole folder. `--analyze` shows how many TB each mode would take before you choose. [Per-folder modes](#per-folder-modes-manifest_backuppy).
+
+Everything it did **not** copy is listed (folders without an export, outtakes, filtered formats), so nothing is left out without you knowing.
+
+### Does it fit your archive?
+
+It fits when:
+
+- the photos you keep are **exported**, into a folder whose name contains `export` in any case (`_EXPORT`, `Lightroom_Export`, `C1_Export_WEB`, `Exported`; the word is a [setting](#settings)), with subfolders inside it if you like (`16B_JXL`, `sRGB`, `WEB`);
+- that export folder is **directly inside the folder that holds the originals**. Lightroom and Capture One can both export this way, depending on how the export is set up;
+- an export's name **starts with the name of its original**: `DSC_9360.NEF` → `DSC_9360_anything.jxl`, `DSC_9360-2.jpg`, `DSC_9360 web.jpg`.
+
+It falls short when:
+
+- **exports are renamed** (`Flores_001.jpg`): they are copied, but their originals are not found; they are listed in `_unmatched.csv`;
+- **exports are not inside the originals' folder**: one `Pictures\Exports\` for everything, or an export folder beside the originals' folder instead of inside it. No original is selected, because only the files beside an export folder are its originals (the exports themselves are still copied when their folder's name contains `export`);
+- **the choice lives only in a catalog** (Lightroom stars, picks or collections, never exported): photo-backup reads folders, not catalogs. A per-folder mode that also keeps the originals that were not exported, or the whole folder, still backs these photos up.
+
+A `--dry-run` on one of your folders shows what it would take before anything is written.
 
 ---
 
