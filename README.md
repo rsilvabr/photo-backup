@@ -102,12 +102,12 @@ What they cannot do is the choice in the session above: `DSC_9360.NEF` and `DSC_
 
 - **The originals of what you exported.** Each export is matched to the real file names beside the export folder: `DSC_9360_ProPhoto-g22_v1.jxl` → `DSC_9360.NEF`, `.JPG`, `.xmp`. Nikon's `DSC_` and `_DSC`, Canon's `IMG_`, film scans and phone names all work; a name is never cut at the first underscore. [How a photo is selected](#how-a-photo-is-selected).
 - **One export format per photo.** `jxl>tif>jpg` keeps a photo's JXL; its TIFF when it has no JXL; its JPEG when it has neither — per photo, not per folder. [Export formats](#export-formats).
-- **No camera photo left without a copy.** When the photos you did not export come along too, a manifest's `Originals=raw` keeps every RAW with its sidecars, and a JPEG only when no RAW of the same photo is beside it: a JPEG-only photo is kept, the JPEG twin of a RAW is not. A photo whose only original is a TIFF, HEIC, PNG or PSD needs `Originals=all`. [Originals that were not exported](#originals-that-were-not-exported---unselected).
+- **No camera photo left without a copy.** When the photos you did not export come along too, a manifest's `Originals=raw` keeps every RAW with its sidecars, and a JPEG, TIFF, PNG, HEIC or PSD only when no RAW of the same photo is beside it: a JPEG-only or TIFF-only photo is kept, the JPEG twin of a RAW or a TIFF developed from it is not. [Originals that were not exported](#originals-that-were-not-exported---unselected).
 - **A checksum from the day of the copy.** The catalog keeps the SHA-256 of every file copied, so `--verify full` tells a damaged backup copy from an original that changed without changing its date (bit rot). Comparing the two sides only says that they differ. [Verifying a backup](#verifying-a-backup).
 
 **Different rules per folder, in one run.** A manifest CSV gives each folder its own mode — old years whole, recent years with their exports and originals — and every mode starts from the export selection above, then adds the originals that were not exported, `_OUTTAKES_KEEP`, `_OUTTAKES` or the whole folder. `--analyze` shows how many TB each mode would take before you choose. [Per-folder modes](#per-folder-modes-manifest_backuppy).
 
-Everything it did **not** copy is listed (folders without an export, outtakes, filtered formats), so nothing is left out without you knowing.
+Everything it did **not** copy is counted in the summary and listed in the CSVs (folders without an export, outtakes, filtered formats), so nothing is left out without you knowing. The one exception is a folder skipped by its name (`$RECYCLE.BIN`, `System Volume Information`, `--exclude-folders`): it is not read at all, so it is named in the summary and the log, not counted file by file.
 
 ### Does it fit your archive?
 
@@ -192,7 +192,7 @@ The menu never copies anything itself — it runs `selective_backup.py` (or `res
 > Rather not install Python? A Windows program packages everything: see
 > [photo-backup-exe](#related-project-photo-backup-as-a-windows-program).
 
-- **Python 3.12 or newer.** Nothing else: the standard library only — no packages, no external tools.
+- **Python 3.12 or newer.** Nothing else: the standard library only — no packages, no external tools. (`mobile_backup.py`, the phone mirror, also needs [ExifTool](https://exiftool.org/) to read the shot times; see [its README](README_mobile_backup.md).)
 - **Windows.** All file I/O uses extended-length `\\?\` paths, so paths longer than 260 characters (Japanese folder names, deep sessions) work.
 
 ```console
@@ -223,14 +223,14 @@ python photo_backup.py
   [0] Exit
 ```
 
-- **[1] Back up** asks for the folders to back up, the destination (it lists the connected drives with their free space), the export formats, the subfolders to skip and the other options — then runs a **dry-run** with those choices. You read what would be copied, what would not, and whether it fits; only then it asks **"copy now?"**. If some folders could not be read, it says so and asks again before copying the rest.
+- **[1] Back up** asks for the folders to back up, the destination (it lists the connected drives with their free space), the export formats, the subfolders to skip and the other options (every `--unselected` value the backend accepts; whether to copy the Capture One cache, the jxl-photo derivatives and Capture One's own files) — then runs a **dry-run** with those choices. The command line it runs always names each choice, also a "no" (`--no-c1-cache`, `--no-derivatives`), so a default changed at the top of `selective_backup.py` never turns what the menu showed into something else. You read what would be copied, what would not, and whether it fits; only then it asks **"copy now?"**. If some folders could not be read, it says so and asks again before copying the rest.
 - Your choices are remembered: the next time, it shows them and asks **"Use these settings?"** — Enter, and the dry-run starts.
-- **[2] Verify** runs `--verify quick` or `--verify full` on a backup. With `full` it also asks **"Max GB to verify in this run (0 = everything)"** — see [Rolling verify](#rolling-verify).
+- **[2] Verify** runs `--verify quick` or `--verify full` on a backup. With `full` it also asks **"Max GB to verify in this run (0 = everything)"** — see [Rolling verify](#rolling-verify). Its question "Also verify Capture One's own files?" is remembered apart from the backup's: a "no" here does not turn off the Capture One step of the next backup.
 - **[3] Presets**: after a backup the menu offers to save its settings (and the backup's ID) under a name. A preset runs from the menu (dry-run first) or unattended; if the drive letter changed, the menu finds the backup by its ID.
 - **[4] Settings** shows where the remembered choices live (`~/.photo_backup_config.json`, or `$PHOTOBACKUP_CONFIG`) and the defaults of `selective_backup.py`. The menu reads those defaults from `selective_backup.py` itself: edit the top of that file and the menu follows.
 - **[5] Restore** lists the backup's top folders, asks what to restore and where to (the original places or another folder), runs a dry-run and then restores after a yes.
 - **[6] Capture One only** backs up just Capture One to a folder you choose, restores from one, force-restores and undoes the last force restore; see [Capture One's own files](#capture-ones-own-files-captureone_backuppy-v060).
-- **[7] Manifest** asks for a manifest and a destination and offers `[1] Analyze only` (how many bytes each mode would take in each folder), `[2] Back up` (a dry-run first, then the copy after a yes) or `[3] Verify` (the backup against what the manifest selects); see [Per-folder modes](#per-folder-modes-manifest_backuppy).
+- **[7] Manifest** asks for a manifest and a destination and offers `[1] Analyze only` (how many bytes each mode would take in each folder), `[2] Back up` or `[3] Verify` (the backup against what the manifest selects); see [Per-folder modes](#per-folder-modes-manifest_backuppy). `[2] Back up` does what `[1]` does: it asks whether to back up Capture One's own files too and whether to replace originals/exports that changed since the last backup (`--update-changed`; the answers are remembered for the next manifest run), then runs a dry-run — the Capture One step too — and the copy after a yes. `[3] Verify` asks quick or full, with `full` the "Max GB" (default `VERIFY_MAX_GB` of `selective_backup.py`), and verifies `_captureone` too when the backup has one.
 
 > **Tip:** The value shown in `[brackets]` is the default — just press Enter to accept it.
 
@@ -280,17 +280,39 @@ python selective_backup.py --source "G:\2025" --dest "H:\BACKUP" --verify full
   folder first, never overwritten in place. The one exception is a new file
   identical byte for byte to the old one, which takes its place: nothing is
   lost, and the versions folder only holds real old versions. The only file the
-  tool removes is its own temp file (`*` + `.pbtmp`) after a failed copy or a
-  crash.
+  tool removes is its own temp file (`*` + `.pbtmp`): after a failed copy or a
+  crash, and the one it writes to test that the destination still takes
+  writes (`DEST_CHECK_AFTER_ERRORS`).
 - **Fail closed.** Not enough space, a destination drive that is not
   connected, an unreadable catalog, a closed stdin without `--yes`, a
   destination inside a source (or the reverse): the tool aborts BEFORE the
   first byte is copied, exit code 2.
 - **Nothing is skipped silently.** A folder or file that cannot be read is
   logged, counted on the console (`Errors: N ... NOT backed up`) and makes the
-  run exit 1 — a dry-run too.
+  run exit 1 — a dry-run too. Every file under a source is either in the plan
+  or in exactly one line of the summary's `Not copied:` *(v0.12.1)*, and the
+  links and junctions it does not follow are counted and logged. The exception
+  is a folder skipped by its name (`SYSTEM_SKIP_FOLDERS`, `--exclude-folders`):
+  it is never listed (a `System Volume Information` cannot be read, and a
+  folder may be excluded because it gives errors), so its files are not
+  counted; the folder itself is named (`folders skipped by name` in the
+  summary, `SKIPPED FOLDER <path>` in the log).
+- **A source that cannot be read is not a source that is gone** *(v0.12.1)*.
+  A backup file counts as "source gone" only with proof: the system answered
+  "does not exist" and the nearest folder above that does exist could be
+  listed. Access denied, a drive that is not connected, a share that does not
+  answer: `source_unreadable`, never moved by `--move-orphans` or by the move
+  detection. A file of another source (a second drive with the same folder
+  names) is `other_source`. A run with read errors moves no orphan at all.
 - A copy is written to a temp file next to its final name, verified, then
   `os.replace`d — a crash never leaves a half file under the final name.
+- **A destination that stops taking writes stops the backup** *(v0.12.1)*.
+  After `DEST_CHECK_AFTER_ERRORS` failed copies in a row (a USB disk pulled
+  out, a full disk) the tool writes and removes a test file of its own on the
+  destination. If that fails too, it stops reading the source, records what
+  was already copied, prints the normal summary with a `STOPPED:` line (why,
+  and how many files were left to copy) and exits 1. If it works, the backup
+  goes on.
 
 ## How a photo is selected
 
@@ -388,9 +410,14 @@ left out: `jxl-photo derivatives (their master is copied ...)`.
 - `skip` (default): not copied, counted in the summary.
 - `raw`: copy RAW files, plus sidecars (`.xmp`, `.dop`, `.pp3`) whose stem
   prefix matches an unselected RAW of that folder.
-- `raw_or_jpeg`: `raw`, plus every JPEG (`.jpg`, `.jpeg`) that has no RAW of
-  the same photo beside it — no camera photo is left without a copy.
-- `raw_jpeg`: `raw`, plus every JPEG of the session.
+- `raw_or_jpeg`: `raw`, plus every JPEG (`.jpg`, `.jpeg`), TIFF, PNG, HEIC
+  (`.heic`, `.heif`, `.hif`) or PSD that has no RAW of the same photo beside
+  it, and the sidecars of those photos — no photo is left without a copy
+  *(v0.12.1: the TIFF, PNG, HEIC and PSD too)*. "The same photo" is the rule of
+  the photo key: `DSC_4321_NXstudio.TIF` beside `DSC_4321.NEF`, or
+  `P1010099.tif` beside `P1010099.ORF`, is that RAW's photo and stays out;
+  `X (2).tif` is another file, not a variant of `X.NEF`, and is kept.
+- `raw_jpeg`: `raw_or_jpeg`, plus every JPEG of the session.
 - `all`: copy every direct file of the session.
 
 `raw_or_jpeg` and `raw_jpeg` were added for the manifest's `Originals` column
@@ -404,21 +431,38 @@ actually selected for the backup (after format filtering and
 ## Folders without an export
 
 A folder with no export subfolder is listed in `_unexported.csv` (path, number
-of direct files, bytes, Capture One bytes without cache, NKSC_PARAM bytes).
-With `--unexported copy` the direct files, Capture One and NKSC_PARAM folders
-are also copied: a parent folder above a session counts as a folder without an
-export (it has no export of its own).
+of direct files, bytes, Capture One bytes without cache, NKSC_PARAM bytes, and
+`copied`: `yes` when this run copies it). The summary's `folders without
+export` line, under `Not copied:`, counts only those that are not copied
+*(v0.12.1)*; the CSV lists all of them.
+With `--unexported copy` (or a `+` mode of the manifest) the direct files,
+Capture One and NKSC_PARAM folders are also copied — also for a folder that has no file of its own, only
+subfolders and a `CaptureOne` folder *(v0.12.1)*: a parent folder above a
+session counts as a folder without an export (it has no export of its own).
 
 Folders inside a session that are not export, Capture One or NKSC_PARAM
-(`_OUTTAKES`, `OLD_TIFFs`, `tiff_zip`, ...) are never copied; their files are
-counted as "inside sessions".
+(`_OUTTAKES`, `OLD_TIFFs`, `tiff_zip`, ...) are never copied; their files, and
+those of their own `CaptureOne` and `NKSC_PARAM` folders, are counted as
+"inside sessions". `_inside.csv` has one line per direct subfolder of a session
+left out (session, subfolder, files, bytes), and the summary names the five
+biggest, grouped by name *(v0.12.1)*, so a folder that is not an outtake stands
+out next to `_OUTTAKES`:
+
+```
+  inside sessions (_OUTTAKES, OLD_TIFFs, ...): 1600 / 60.5 GB   -> <log>_inside.csv
+      _OUTTAKES          1200 files      48.0 GB
+      _OUTTAKES_DROP      350 files      10.4 GB
+      Birthday party       50 files       2.1 GB
+```
 
 A folder that holds an export folder but **no original beside it** is not a
 session for its subfolders: `G:\2017` holding `171230_Lightroom_Export`, or a
 drive root holding `04_ Exported_OLD`. Its export files are copied (and listed
 as exports without a matching original), but its subfolders keep their own
 classification — a trip folder below it is still a folder without an export,
-listed and copied with `--unexported copy`.
+listed and copied with `--unexported copy`. A manifest mode's `AddWhole` and
+`AddFolders` still apply to its direct subfolders *(v0.12.1)*: a film session
+whose only originals are in `RAW SCANS` keeps them.
 
 ## Per-folder modes (`manifest_backup.py`)
 
@@ -436,9 +480,9 @@ another set in another. Two CSV files say what to do:
 |---|---|
 | `Mode` | the name used in the manifest's `Mode` column |
 | `Unselected` | `yes`/`no`: also copy the originals of the photos that were not exported |
-| `AddFolders` | `;`-separated patterns of direct subfolders of a session, copied with the filter of `Originals` |
-| `AddWhole` | `;`-separated patterns of direct subfolders of a session, copied whole |
-| `Exclude` | `;`-separated patterns never added, at any depth |
+| `AddFolders` | `;`-separated patterns of direct subfolders of a folder with an export folder (with or without an original beside it), copied with the filter of `Originals`. A folder inside it that has an export folder is a session (its exports and their originals are copied too), and a file is copied when either the session or the filter keeps it, also inside those export folders. What neither keeps is counted: `left out inside added folders (Originals filter)`. One exception copies less than v0.12.0: a `Cache` folder deeper than the first level of a `CaptureOne` folder inside such an export folder is counted as Capture One cache (it is made again) |
+| `AddWhole` | `;`-separated patterns of direct subfolders of a folder with an export folder (with or without an original beside it), copied whole |
+| `Exclude` | `;`-separated patterns of folders never walked, at any depth and in every mode; what they hold is counted: `excluded by the mode (Exclude)`. The export, Capture One and NKSC_PARAM folders of a session are not affected (inside an export folder, use `--exclude-export-subfolders`) |
 | `Whole` | `yes`/`no`: the whole folder, session or not |
 | `Unexported` | `yes`/`no`, optional: a folder without an export is copied whole; a folder with one follows the rest of the mode |
 | `Only` | optional, `;`-separated: copy only these types. A group (`raw`, `jpeg`, `jpg`, `jxl`, `tif`, `png`, `heic`, `psd`, `dng`) or an extension (`.xmp`) |
@@ -453,8 +497,8 @@ character class). `yes`/`no` are case-insensitive.
 
 | Value | Copies |
 |---|---|
-| `raw` (empty = this) | RAW + sidecars + every JPEG that has no RAW of the same photo beside it (`DSC_0001 (2).JPG` is its own photo) |
-| `raw+jpeg` | RAW + sidecars + every JPEG |
+| `raw` (empty = this) | RAW + sidecars + every JPEG, TIFF, PNG, HEIC or PSD that has no RAW of the same photo beside it (`DSC_0001 (2).JPG` is its own photo) |
+| `raw+jpeg` | `raw` + every JPEG |
 | `all` | everything |
 
 **The most specific line wins.** With `G:\2025` in mode 3 and
@@ -463,8 +507,12 @@ never plans a file inside it. An export folder cannot have its own line below
 another line (the line above would no longer see its session's export). A
 folder repeated in the manifest aborts (exit 2), as does a file that is not
 UTF-8 (in Excel, save as "CSV UTF-8"), a mode that does not exist, a folder that does not exist, folders
-on more than one drive, and every other invalid table value — before any photo
-is read.
+on more than one drive, a column the table does not know (a header typed
+`Unexported ` with a space would otherwise be ignored and the mode would lose
+its `+`), an empty column name in the header (an extra comma at the end of
+every line, often a cell left in Excel: the message says so) or a line with
+more values than columns *(v0.12.1)*, and every other
+invalid table value — before any photo is read.
 
 **Leaving a folder out, or keeping one type.** Give that folder its own line
 below the larger one, with one of the modes `skip`, `raw-only`, `jpeg-only` or
@@ -503,6 +551,11 @@ Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Description
 Modes `1+` to `5+` are the same five with `Unexported=yes`: a folder with an
 export follows the mode, and a folder not exported yet is copied whole, so what
 has not been edited or selected is not left out.
+
+A bigger mode never copies less *(v0.12.1)*: whatever mode `N` copies, mode
+`N+1` and mode `N+` copy too (`_OUTTAKES\_EXPORT` is a session in mode 3 and
+stays one when mode 4 adds `_OUTTAKES`). The test suite checks it on a tree with
+outtakes, exports inside outtakes, film scans and folders not exported yet.
 
 Measured with `--analyze` on one 11 TB drive listed as a single line
 (2026-11-09). The `all` column also carries loose TIFF, JXL and other files:
@@ -560,7 +613,7 @@ folder, move detection and orphan report.
 
 ## Capture One's own files (`captureone_backup.py`) *(v0.6.0)*
 
-The `.cos` files beside your photos hold the edits, but they only **name** the ICC profile, film curve and style they use. On a computer without those files, Capture One shows the edit differently. Every backup from the menu's `[1] Back up` (and every preset) therefore also keeps, in `<destination>\_captureone`:
+The `.cos` files beside your photos hold the edits, but they only **name** the ICC profile, film curve and style they use. On a computer without those files, Capture One shows the edit differently. Every backup from the menu's `[1] Back up` and `[7] Manifest` (and every preset) therefore also keeps, in `<destination>\_captureone`:
 
 | Folder in the backup | Where it comes from | What it holds |
 |---|---|---|
@@ -569,7 +622,7 @@ The `.cos` files beside your photos hold the edits, but they only **name** the I
 | `Installed` | `Color Profiles` and `Film Curves` of the install folder | the profiles the `.cos` files name, in case a later version drops one |
 | `WindowsColor` | the Windows colour folder | its `.icc`/`.icm` files (export and monitor profiles) |
 
-`[7] Manifest` and the command-line scripts do not keep these: with them, also run `[6] Capture One only` (or `captureone_backup.py --dest`) to the same destination.
+The command-line scripts (`selective_backup.py`, `manifest_backup.py`) do not keep these: with them, also run `[6] Capture One only` (or `captureone_backup.py --dest`) to the same destination.
 
 Left out on purpose: login data and cookies (`MSALCache*`, the WebView folders), the licence file, `Logs`, `Stability`, and the program itself. `WHERE_EACH_FOLDER_GOES.txt` in that folder says where each part came from.
 
@@ -597,7 +650,7 @@ python captureone_backup.py --revert-last
 | Option | Meaning |
 |---|---|
 | `--dest PATH` | back up to `PATH\_captureone` |
-| `--verify PATH` | re-read and hash the backup under `PATH` |
+| `--verify PATH` | re-read and hash the backup under `PATH` against its catalog. A row without a hash (the catalog was made again, or a run was stopped) is checked against its source on this computer: when the source still has the size and date of the row, its bytes are compared with the copy — the same bytes record the hash (`HASH_FILLED`), other bytes are `DEST_DIFFERS` (exit 1); otherwise only the size is checked (`OK_SIZE_ONLY`, exit 0) and the summary says how many files were not checked by hash |
 | `--restore-from PATH` | restore from the backup under `PATH` |
 | `--also NAME` | restore this part too: `Preferences`, or a folder of `UserData` (`_Instalador`, `Batch*`); repeatable |
 | `--to PATH` | restore under `PATH` instead of the original places |
@@ -609,9 +662,9 @@ python captureone_backup.py --revert-last
 | `--dry-run` | plan and report, write nothing |
 | `--yes` | do not ask for confirmation |
 
-A restore brings back the profiles, styles, defaults, presets, recipes, shortcuts and workspaces, plus any missing file of `Installed` and `WindowsColor`. The batch queue, `ImageCore`, plugins, `Preferences` and your own folders stay in the backup unless you name them with `--also`. It refuses to run while Capture One is open, and reports what needs an administrator instead of failing half-way. As everywhere in this tool, nothing in the backup is deleted: the old copy of a file that really changed goes to the versions folder.
+A restore brings back the profiles, styles, defaults, presets, recipes, shortcuts and workspaces, plus any missing file of `Installed` and `WindowsColor`. The batch queue, `ImageCore`, plugins, `Preferences` and your own folders stay in the backup unless you name them with `--also`. It refuses to run while Capture One is open, and reports what needs an administrator instead of failing half-way. As everywhere in this tool, nothing in the backup is deleted: the old copy of a file that really changed goes to the versions folder, and only once the new copy is on the disk — a copy that fails leaves the old one under its name *(v0.12.1)*. A file whose catalog row has no hash is restored after a size check only, as `RESTORED_UNVERIFIED` (counted apart in the result); a copy of another size is not restored (`CORRUPT_IN_BACKUP`, exit 1).
 
-**Force restore and undo** *(v0.7.0)*. A normal restore only adds what is missing. `--force` also replaces what differs, after keeping the current file in `%LOCALAPPDATA%\CaptureOne_old\old_<date>_<time>_<ms>`; only files that really differ go there, and they are never removed for you. `--revert-last` puts the newest `old_` folder back and takes out what the force added. It keeps what it replaces in a `revert_old_…` folder, which is never taken for the last one.
+**Force restore and undo** *(v0.7.0)*. A normal restore only adds what is missing. `--force` also replaces what differs, after keeping the current file in `%LOCALAPPDATA%\CaptureOne_old\old_<date>_<time>_<ms>`; only files that really differ go there, and they are never removed for you. `--revert-last` puts the newest `old_` folder back and takes out what the force added (a file is journaled as added only after the force's copy of it is there: a file another program put there meanwhile is never taken out, *v0.12.1*). It keeps what it replaces in a `revert_old_…` folder, which is never taken for the last one.
 
 - To make `--revert-last` skip a folder, rename it so it ends with `_not`.
 - To redo a force you undid, rename its `revert_old_…` folder to `old_…` (remove the `revert_`) and run `--revert-last` again.
@@ -672,21 +725,45 @@ everything again and leaving the old copy behind, the tool:
 `--no-detect-moves` turns the whole detection off (everything is copied
 again), and `DETECT_MOVES = False` does the same by default.
 
+The space check still counts a possible move as a copy: it is only confirmed
+by hash during the run. When that makes the backup not fit, the message says
+how much of what is needed may be moves *(v0.12.1)*: `Not enough space: need
+..., free ..., margin ...; 120.0 GB of it may be files moved inside the backup
+(possible moves, ...)`. Make room, or use `--no-detect-moves` knowing that
+everything is then copied again.
+
 A backup file whose source no longer exists is an **orphan** (an original you
 deleted after it was exported). Every run writes `<log>_orphans.csv` with the
 reason for each:
 
-- `source_missing` — the original is gone;
+- `source_missing` — the original is gone (proven: see below);
 - `not_selected` — the original still exists, but the current selection does
-  not include it any more (for example you changed `--export-formats`).
+  not include it any more (for example you changed `--export-formats`);
+- `source_unreadable` *(v0.12.1)* — the original could not be checked (access
+  denied, a drive that is not connected): not proof that it is gone;
+- `other_source` *(v0.12.1)* — the file came from a source that is not given in
+  this run (two drives with the same folder names backed up to one
+  destination): not checked.
+
+"Gone" needs proof: the system answered "does not exist" and the nearest
+folder above that does exist could be listed. The move detection above uses
+the same proof. The proof is by **path**: another disk mounted on the same
+letter, with the same folders, passes it — after changing the source disk,
+look at a dry-run before using `--move-orphans`. And the catalog keeps the
+source path a file had when it was copied: if the source moves to another
+letter or folder, what is deleted there later shows as `other_source` and is
+never moved by `--move-orphans`.
 
 Orphans are only reported by default. `--move-orphans` (real copies only)
 moves the `source_missing` ones to
 `<dest>\_photo_backup\orphans\<YYMMDD_HHMMSS>\<rel>`, removes their catalog
 rows and cleans the folders the move left empty; `not_selected` files are
-never touched. Since the old copy is only moved inside the backup, the space
-does not shrink until you delete the orphans folder yourself — that is
-outside this tool's scope.
+never touched, and neither are the other reasons. A run with an error in its
+plan (a folder or file that could not be read, two files with one destination
+path) moves no orphan at all, and says so: `--move-orphans: nothing moved: N
+errors in the plan of this run`. Since the old
+copy is only moved inside the backup, the space does not shrink until you
+delete the orphans folder yourself — that is outside this tool's scope.
 
 ## Verifying a backup
 
@@ -698,11 +775,20 @@ copies, never asks for confirmation and never creates the destination
 backed up with.
 
 Statuses: `OK`, `HASH_FILLED` (an adopted file's hash was recorded),
-`NOT_BACKED_UP`, `DEST_MISSING`, `DEST_SIZE`, `SOURCE_MISSING`,
-`SOURCE_CHANGED`, `DEST_CORRUPT`, `DEST_DIFFERS`, `SOURCE_CORRUPT_SUSPECT`
-(the source content changed without changing size or mtime — the most
-important to report). The results go to the console and to `_verify.csv`.
-Exit 0 only if every file is `OK` or `HASH_FILLED`.
+`NOT_BACKED_UP`, `DEST_MISSING`, `DEST_SIZE`, `SOURCE_MISSING` (the original
+is proven gone, as for the orphans), `SOURCE_UNREADABLE` *(v0.12.1: the
+original could not be checked)*, `SOURCE_CHANGED`, `DEST_CORRUPT`,
+`DEST_DIFFERS`, `SOURCE_CORRUPT_SUSPECT` (the source content changed without
+changing size or mtime — the most important to report). The results go to the
+console and to `_verify.csv`. Exit 0 only if every file is `OK` or
+`HASH_FILLED`.
+
+Only the catalog rows under the given sources are checked. The others are
+counted *(v0.12.1)*, without changing the exit code:
+
+```
+2 files / 0.0 GB of the catalog are outside these sources: not checked
+```
 
 With `--verify full`, the backup copy is hashed **before** the source is
 looked at: when the original was deleted or changed, the copy may be the only
@@ -732,9 +818,16 @@ Rolling verify: checked 250 files / 100.0 GB, deferred 900 files / 350.0 GB (old
 The deferred files are not checked and do not affect the exit code; the next
 run picks them up. A corrupted backup copy is still reported immediately. A
 file whose source is gone but whose copy is intact gets its `verified_at`
-advanced too, so the wheel keeps turning. `--max-gb` only applies to
-`--verify full`; with `quick` it is ignored (the log says so). The default is
-`VERIFY_MAX_GB` (0 = verify everything).
+advanced too. A row that stays without `verified_at` (`DEST_CORRUPT`,
+`DEST_MISSING`, `DEST_SIZE`, ...) is checked again every run and keeps the exit
+code 1, but its size does not count against `--max-gb` *(v0.12.1)*: problems
+at the front of the queue never stop the rest of the backup from being
+verified, so the wheel keeps turning. `--max-gb` only applies to
+`--verify full`; with `quick` it is ignored (the log says so). Only a
+`--verify full` records `verified_at` *(v0.12.1)*: a `--verify quick` reads no
+file, and a nightly quick between the slices of a rolling full no longer
+sends the queue back to its start. The default is `VERIFY_MAX_GB` (0 = verify
+everything).
 
 ## Which disk is this? (backup ID)
 
@@ -776,7 +869,7 @@ restore_backup.py --backup PATH (--to PATH | --to-original) [options]
 | `--backup PATH` | backup root (the folder that holds `_photo_backup`); required |
 | `--to PATH` | restore each file under `PATH\<rel>` |
 | `--to-original` | restore each file to the `source_path` recorded in the catalog |
-| `--only REL` | restore only this folder or file (repeatable, case-insensitive); default: everything |
+| `--only REL` | restore only this folder or file (repeatable, case-insensitive); default: everything. An `--only` that matches nothing in the catalog is named (`--only REL: matches nothing in the catalog`), the others are restored, and the run exits 1 *(v0.12.1)* |
 | `--expect-backup-id ID` | abort unless the backup holds this backup ID |
 | `--space-margin-gb N` | free space kept on each target drive, in GB (default `5.0`) |
 | `--dry-run` | plan and report, restore nothing |
@@ -796,7 +889,8 @@ the console, in the log and in `<log>_restore.csv`:
   nothing is written to the target and the run exits 1;
 - `MISSING_IN_BACKUP`, `REFUSED`, `ERROR` — the backup file is gone, the
   `source_path` would land inside the backup (`--to-original`), or another
-  error; all exit 1.
+  error; all exit 1;
+- an `--only` that matches nothing also makes the run exit 1.
 
 Exit codes: 0 (everything restored or already there), 1 (any of the above),
 2 (aborted before restoring: no catalog, wrong backup ID, `--to` inside the
@@ -838,13 +932,15 @@ selective_backup.py --source PATH [--source PATH ...] --dest PATH [options]
 | `--unselected {skip,raw,raw_or_jpeg,raw_jpeg,all}` | originals of photos that were not exported (default `skip`; see [the values](#originals-that-were-not-exported---unselected)) |
 | `--unexported {skip,copy}` | folders without an export (default `skip`) |
 | `--c1-cache` | also copy the Capture One `Cache` folders |
+| `--no-c1-cache` | do not copy them, whatever `COPY_CAPTUREONE_CACHE` says *(v0.12.1; the menu always passes one of the two)* |
 | `--derivatives` | also copy the JXLs jxl-photo derived from a master that is copied ([details](#jxl-photo-derivatives---derivatives-v050)) |
+| `--no-derivatives` | skip those JXLs, whatever `COPY_JXLPHOTO_DERIVATIVES` says *(v0.12.1; the menu always passes one of the two)* |
 | `--exclude-folders NAMES` | `;`-separated folder names skipped anywhere |
 | `--verify-copy {none,size,hash}` | verification of each copy (default `hash`) |
 | `--update-changed` | move a changed destination file to the versions folder before copying the new one |
 | `--no-auto-update` | do not update changed edit settings/sidecars (`AUTO_UPDATE_EXTENSIONS`) unless `--update-changed` is given |
 | `--no-detect-moves` | copy a moved/renamed file again instead of moving its backup copy |
-| `--move-orphans` | move backup files whose source is gone into `_photo_backup\orphans\<stamp>` (real copies only) |
+| `--move-orphans` | move backup files whose source is proven gone into `_photo_backup\orphans\<stamp>` (real copies only; nothing in a run with an error in its plan, or one the destination stopped) |
 | `--expect-backup-id ID` | abort (exit 2) unless the destination holds this backup ID; also applies to `--verify` and `--dry-run` |
 | `--space-margin-gb N` | free space kept on the destination, in GB (default `20.0`) |
 | `--dry-run` | plan, print the summary and write the logs/CSVs; copy nothing |
@@ -894,6 +990,7 @@ default everywhere.
 | `FLUSH_BATCH_FILES` | `50` | backup: files per flush batch and per catalog commit (`1` = flush each file) |
 | `FLUSH_THREADS` | `8` | backup: simultaneous flushes of a batch |
 | `TEMP_SUFFIX` | `.pbtmp` | in-progress copy suffix |
+| `DEST_CHECK_AFTER_ERRORS` | `20` | backup: after this many failed copies in a row, the destination is tested (a file of its own, `*.pbtmp` in `CATALOG_FOLDER`, written and removed); when the test fails the backup stops (`0` = never test) *(v0.12.1)* |
 | `CATALOG_FOLDER` | `_photo_backup` | catalog and versions folder under the destination |
 | `PROGRESS_EVERY_S` | `5.0` | console progress interval |
 | `AUTO_UPDATE` | `True` | changed edit settings/sidecars are updated without `--update-changed` (`--no-auto-update` turns it off) |
@@ -903,6 +1000,7 @@ default everywhere.
 | `BACKUP_ID_FILE` | `volume.json` | under `CATALOG_FOLDER`: the backup identity (F2) |
 | `VERIFY_MAX_GB` | `0.0` | default `--max-gb` for `--verify full` (0 = everything) |
 | `SUMMARY_FOLDER_LINES` | `25` | lines of the per-folder table in the summary (the CSV has all) |
+| `SUMMARY_INSIDE_NAMES` | `5` | subfolder names shown under "inside sessions" in the summary (`_inside.csv` has all) |
 | `LOG_DIR` | `$PHOTOBACKUP_LOG_DIR` or `Logs\` next to the script | where the logs are written |
 
 `restore_backup.py` has its own setting at the top:
@@ -916,12 +1014,18 @@ default everywhere.
 Every run writes `<LOG_DIR>\<YYMMDD_HHMMSS>_backup` (or `_verify`) plus:
 
 - `.log` — command line, effective settings, summary, every `COPY`,
-  `SKIP CHANGED`, `VERSION` and `ERROR`, final summary;
+  `SKIP CHANGED`, `VERSION` and `ERROR`, every link or junction not followed
+  (`LINK not followed <path>`), every folder skipped by its name
+  (`SKIPPED FOLDER <path>`, *v0.12.1*), the destination tests
+  (`DEST CHECK ...`), final summary;
 - `_plan.csv` — `action,category,size,mtime,src,rel` for every planned file
   (written on every run, including `--dry-run`);
-- `_unexported.csv` — `folder,files,bytes,c1_bytes,nx_bytes` (always written,
-  even with `--unexported skip`);
+- `_unexported.csv` — `folder,files,bytes,c1_bytes,nx_bytes,copied` (always
+  written, even with `--unexported skip`; `copied` is `yes` or `no`,
+  *v0.12.1*);
 - `_unmatched.csv` — `session,export_file`;
+- `_inside.csv` — `session,subfolder,files,bytes`: every direct subfolder of a
+  session left out ("inside sessions"), with what it holds *(v0.12.1)*;
 - `_by_folder.csv` — `folder,files,bytes,cumulative_bytes` for what would be
   copied, by top folder (always written; the summary shows at most
   `SUMMARY_FOLDER_LINES` of them);
@@ -940,7 +1044,7 @@ Japanese file names.
 | Code | Meaning |
 |---|---|
 | 0 | everything fine (also a dry-run without read errors) |
-| 1 | finished with file errors or unreadable folders (a dry-run too), or verify found a problem |
+| 1 | finished with file errors or unreadable folders (a dry-run too), the destination stopped taking writes, or verify found a problem |
 | 2 | aborted before copying: usage error, not enough space, destination not available, no confirmation, bad catalog |
 | 130 | interrupted with Ctrl+C (partial summary; the temp file is removed) |
 
@@ -948,19 +1052,20 @@ Japanese file names.
 
 ## Current version
 
-**v0.12.0** (2026-11-10).
+**v0.12.1** (2026-11-11).
 
-- Eight fixes from an audit of one question: can a file count as saved when the right content cannot be restored? The main one: an original edited by another program while the backup was copying it could end up as old bytes under the new date, and every later run trusted it. `manifest_backup.py` gains `--verify`. [Details](docs/version_history.md#v0120). Nothing to do when upgrading.
+- Fixes from a bug sweep. Every file under a source is now in the plan or in exactly one line of `Not copied:` (what `AddFolders` leaves out, the Capture One folders inside sessions, the links and junctions not followed; a folder skipped by its name is named), and a bigger mode never copies less: `_OUTTAKES\_EXPORT` stays a session when mode 4 adds `_OUTTAKES`. A source that cannot be read is no longer treated as gone by `--move-orphans`, the move detection or `--verify`. The rolling verify no longer stops behind rows with a problem, and a `--verify quick` no longer sends it back to the start. A destination that stops taking writes stops the backup. The menu keeps `raw_or_jpeg`, always says "no" on the command line, and `[7] Manifest` does what `[1]` does (Capture One, `--update-changed`, "Max GB"). `captureone_backup.py` keeps the old copy under its name until the new one is safe and checks a row without a hash against its source. `mobile_backup.py` 0.1.2 deletes nothing of a source it was not given or could not read, and saves its state more often. One change copies less on purpose (a folder matching a mode's `Exclude` is never walked) and one more (`Originals=raw` keeps a photo whose only original is a TIFF, PNG, HEIC or PSD). [Details](docs/version_history.md#v0121).
 
-**v0.11.0** added manifest lines that leave a folder out or keep one type of file in it.
+**v0.12.0** made sure a file never counts as saved when the right content cannot be restored (eight fixes from an audit) and added `manifest_backup.py --verify`.
 
-**278 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
+**507 tests**, plus real checks on the archive (a dry-run of all of `G:` and a scratch copy on `E:`, hostile paths).
 
 ## Changelog
 
 | Version | Date | What it added |
 |---------|------|---------------|
-| **v0.12.0** | 2026-11-10 | A file never counts as saved when the right content cannot be restored: eight fixes; `manifest_backup.py --verify` |
+| **v0.12.1** | 2026-11-11 | Bug sweep: nothing left out without a count, a bigger mode never copies less, an unreadable source is not a source that is gone, the rolling verify keeps turning; `Originals=raw` keeps TIFF/PNG/HEIC/PSD-only photos; `[7] Manifest` does what `[1]` does |
+| v0.12.0 | 2026-11-10 | A file never counts as saved when the right content cannot be restored: eight fixes; `manifest_backup.py --verify` |
 | v0.11.0 | 2026-11-10 | A manifest line can leave a folder out or keep only one type of file in it |
 | v0.10.0 | 2026-11-10 | Modes `1+` to `5+`: a folder not exported yet is copied whole |
 | v0.9.0 | 2026-11-09 | Per-folder backup modes from a manifest, with `--analyze` to see the size of each mode first |

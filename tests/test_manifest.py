@@ -83,7 +83,9 @@ def test_t2_raw_or_jpeg():
 def test_t3_raw_jpeg():
     assert sb._original_kept("DSC_7.JPG", set(), "raw_jpeg", False)
     assert sb._original_kept("x.jpeg", set(), "raw_jpeg", False)
-    assert not sb._original_kept("scan.tif", set(), "raw_jpeg", False)
+    # a TIFF is kept only when no RAW of the photo is beside it (round 2 of the sweep)
+    assert sb._original_kept("scan.tif", set(), "raw_jpeg", False)
+    assert not sb._original_kept("scan.tif", {"scan"}, "raw_jpeg", False)
     assert sb._original_kept("scan.tif", set(), "all", False)
 
 
@@ -493,7 +495,8 @@ def test_menu_manifest_analyze_and_copy(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr(menu, "run_manifest", fake_run)
-    answers = iter(["7", str(manifest), str(tmp_path / "out"), "2", "y", "0"])
+    #               menu manifest dest choice  Capture One  replace  copy  exit
+    answers = iter(["7", str(manifest), str(tmp_path / "out"), "2", "n", "", "y", "0"])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
     assert menu.main([]) == 0
     assert len(calls) == 2
@@ -562,7 +565,7 @@ def test_review_c_analyze_does_not_hide_an_unreadable_folder(
         if os.path.basename(path) == "_OUTTAKES":
             self.errors.append(f"ERROR scan {path}: denied")
             self.stats.scan_errors += 1
-            return [], []
+            return [], [], []
         return real(self, path)
 
     monkeypatch.setattr(sb._Planner, "_scan_dir", unreadable)

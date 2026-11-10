@@ -35,7 +35,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.12.0"
+__version__ = "0.12.1"
 
 # ---- Settings -------------------------------------------------------------------
 MODES_FILE = "backup_modes.csv"     # next to this script; --modes reads another
@@ -50,6 +50,7 @@ ONLY_GROUPS = {**sb.FORMAT_GROUPS,    # names usable in the Only column -> exten
                "raw": sb.RAW_EXTENSIONS, "jpeg": sb.JPEG_EXTENSIONS}
 MODE_COLUMNS = ("Mode", "Unselected", "AddFolders", "AddWhole", "Exclude", "Whole",
                 "Description")
+MODE_OPTIONAL_COLUMNS = ("Unexported", "Only", "Skip")   # a table written before them keeps working
 MANIFEST_COLUMNS = ("Folder", "Mode", "Originals")
 
 
@@ -82,9 +83,12 @@ def _drive_key(path):
     return os.path.splitdrive(os.path.abspath(path))[0].casefold()
 
 
-def _read_csv(path, columns):
+def _read_csv(path, columns, optional=()):
     """[(line, DictReader row), ...] with the comment lines (first field starting
-    with '#') removed. A missing file or column is a ManifestError."""
+    with '#') removed. A missing file or column is a ManifestError, and so is a
+    column that is neither required nor `optional`: a header typed wrong
+    ('Unexported ' with a space) would otherwise be ignored and its column read
+    as empty."""
     try:
         with open(sb._io(path), newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
@@ -94,12 +98,27 @@ def _read_csv(path, columns):
             if missing:
                 raise ManifestError(
                     f"{path}: missing column(s): {', '.join(missing)}")
+            known = set(columns) | set(optional)
+            unknown = [column for column in reader.fieldnames if column not in known]
+            if any(not str(column).strip() for column in unknown):
+                raise ManifestError(
+                    f"{path}: the header has an empty column name: there is probably an "
+                    f"extra comma at the end of the lines (an empty cell left in Excel); "
+                    f"remove it (known columns: {', '.join(columns + tuple(optional))})")
+            if unknown:
+                raise ManifestError(
+                    f"{path}: unknown column(s): {', '.join(repr(c) for c in unknown)} "
+                    f"(known: {', '.join(columns + tuple(optional))})")
             rows = []
             first_name = reader.fieldnames[0]
             for line, row in enumerate(reader, 2):
                 first = row.get(first_name) or ""
                 if str(first).startswith("#"):
                     continue
+                extra = [value for value in (row.get(None) or []) if str(value).strip()]
+                if extra:
+                    raise ManifestError(f"{path} line {line}: more values than columns: "
+                                        + ", ".join(repr(value) for value in extra))
                 rows.append((line, row))
             return rows
     except ManifestError:
@@ -142,7 +161,7 @@ def _only_extensions(value, path, line):
 def read_modes(path):
     """The modes table: {mode name: Mode}, in file order."""
     modes = {}
-    for line, row in _read_csv(path, MODE_COLUMNS):
+    for line, row in _read_csv(path, MODE_COLUMNS, MODE_OPTIONAL_COLUMNS):
         name = str(row.get("Mode") or "").strip()
         if not name:
             raise ManifestError(f"{path} line {line}: empty Mode")
@@ -263,6 +282,9 @@ def _plan_rows(rows, modes, args, list_cache):
     errors = []
     warnings = []
     sources = []
+    links = []
+    inside = []
+    skipped_folders = []
     stats = sb.Stats()
     for row in rows:
         planner = _plan_row(row, rows, modes, args, list_cache)
@@ -272,12 +294,16 @@ def _plan_rows(rows, modes, args, list_cache):
         errors.extend(planner.errors)
         warnings.extend(planner.warnings)
         sources.extend(planner.sources)
+        links.extend(planner.links)
+        inside.extend(planner.inside_rows())
+        skipped_folders.extend(planner.skipped_folders)
         for field in dataclasses.fields(sb.Stats):
             setattr(stats, field.name,
                     getattr(stats, field.name) + getattr(planner.stats, field.name))
     return sb.Plan(files=files, stats=stats, unexported_folders=unexported_folders,
                    unmatched=unmatched, errors=errors, warnings=warnings,
-                   sources=sources)
+                   sources=sources, links=links, inside=inside,
+                   skipped_folders=skipped_folders)
 
 
 def _backend_args(parsed, rows, dest):
@@ -354,14 +380,14 @@ def _run(parsed, rows, modes, stamp, argv):
         def plan_fn(plan_args):
             return _plan_rows(rows, modes, plan_args, list_cache)
 
-        if parsed.verify:
-            try:
+        try:
+            if parsed.verify:
                 return sb._run_verify(backend_args, log, plan_fn=plan_fn)
-            except KeyboardInterrupt:
-                print("Interrupted.", file=sys.stderr)
-                log.log("Interrupted.")
-                return 130
-        return sb._run_backup(backend_args, log, stamp, plan_fn=plan_fn)
+            return sb._run_backup(backend_args, log, stamp, plan_fn=plan_fn)
+        except KeyboardInterrupt:       # while planning (the copy handles its own)
+            print("Interrupted.", file=sys.stderr)
+            log.log("Interrupted.")
+            return 130
     finally:
         log.close()
 
@@ -400,51 +426,61 @@ def _analyze(parsed, rows, modes, stamp, argv):
             f"{key}={value}" for key, value in sorted(vars(parsed).items())))
         log.log("manifest: " + os.path.abspath(parsed.manifest))
         log.log("modes: " + os.path.abspath(parsed.modes))
-        backend_args = _backend_args(parsed, rows, os.getcwd())
-        list_cache = {}
-        errors = []
-        results = []
-        total_files = 0
-        total_bytes = 0
-        started = time.monotonic()
-        for index, row in enumerate(rows, 1):
-            log.out(f"[{index}/{len(rows)}] {row.folder}  "
-                    f"({sb._hms(time.monotonic() - started)})")
-            line_rows = []
-            for mode in modes.values():
-                counts = _analysis_counts(row, rows, modes, backend_args, list_cache, mode, errors)
-                for originals in ANALYSIS_ORIGINALS:
-                    files, nbytes = counts[originals]
-                    chosen = mode.name == row.mode and originals == row.originals
-                    line_rows.append((row.folder, mode.name, originals, files, nbytes,
-                                      "yes" if chosen else ""))
-                    if chosen:
-                        total_files += files
-                        total_bytes += nbytes
-            log.out(f"    {'mode':<6} {'originals':<10} {'files':>10} {'bytes':>12}")
-            for _folder, mode_name, originals, files, nbytes, chosen in line_rows:
-                mark = "  <- chosen" if chosen else ""
-                log.out(f"    {mode_name:<6} {originals:<10} {sb._num(files):>10} "
-                        f"{sb._gb(nbytes):>12}{mark}")
-            results.extend(line_rows)
-        path = os.path.join(sb.LOG_DIR, f"{stamp}_analysis.csv")
-        os.makedirs(sb._io(sb.LOG_DIR), exist_ok=True)
-        with open(sb._io(path), "w", newline="", encoding="utf-8-sig") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(["folder", "mode", "originals", "files", "bytes", "chosen"])
-            writer.writerows(results)
-        log.out(f"Total (the mode chosen in each line): {sb._num(total_files)} files / "
-                f"{sb._gb(total_bytes)}")
-        log.out(f"Analysis: {path}")
-        for error in errors:
-            log.log(error)
-        if errors:
-            log.out(f"Errors: {sb._num(len(errors))} folders/files could not be read: "
-                    f"the numbers above are partial -> {log.path}")
-            return 1
-        return 0
+        try:
+            return _analyze_rows(parsed, rows, modes, stamp, log)
+        except KeyboardInterrupt:
+            print("Interrupted.", file=sys.stderr)
+            log.log("Interrupted.")
+            return 130
     finally:
         log.close()
+
+
+def _analyze_rows(parsed, rows, modes, stamp, log):
+    """The --analyze loop (log already open)."""
+    backend_args = _backend_args(parsed, rows, os.getcwd())
+    list_cache = {}
+    errors = []
+    results = []
+    total_files = 0
+    total_bytes = 0
+    started = time.monotonic()
+    for index, row in enumerate(rows, 1):
+        log.out(f"[{index}/{len(rows)}] {row.folder}  "
+                f"({sb._hms(time.monotonic() - started)})")
+        line_rows = []
+        for mode in modes.values():
+            counts = _analysis_counts(row, rows, modes, backend_args, list_cache, mode, errors)
+            for originals in ANALYSIS_ORIGINALS:
+                files, nbytes = counts[originals]
+                chosen = mode.name == row.mode and originals == row.originals
+                line_rows.append((row.folder, mode.name, originals, files, nbytes,
+                                  "yes" if chosen else ""))
+                if chosen:
+                    total_files += files
+                    total_bytes += nbytes
+        log.out(f"    {'mode':<6} {'originals':<10} {'files':>10} {'bytes':>12}")
+        for _folder, mode_name, originals, files, nbytes, chosen in line_rows:
+            mark = "  <- chosen" if chosen else ""
+            log.out(f"    {mode_name:<6} {originals:<10} {sb._num(files):>10} "
+                    f"{sb._gb(nbytes):>12}{mark}")
+        results.extend(line_rows)
+    path = os.path.join(sb.LOG_DIR, f"{stamp}_analysis.csv")
+    os.makedirs(sb._io(sb.LOG_DIR), exist_ok=True)
+    with open(sb._io(path), "w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["folder", "mode", "originals", "files", "bytes", "chosen"])
+        writer.writerows(results)
+    log.out(f"Total (the mode chosen in each line): {sb._num(total_files)} files / "
+            f"{sb._gb(total_bytes)}")
+    log.out(f"Analysis: {path}")
+    for error in errors:
+        log.log(error)
+    if errors:
+        log.out(f"Errors: {sb._num(len(errors))} folders/files could not be read: "
+                f"the numbers above are partial -> {log.path}")
+        return 1
+    return 0
 
 
 def build_parser():

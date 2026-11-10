@@ -58,6 +58,19 @@ from the command line. A future job (e.g. a full mirror) is a new
   `--force-installed`; a monitor calibration (`mntr` + `vcgt`, or a file that
   cannot be read as ICC) never. `--revert-last` picks only `old_*` not ending
   in `_not`; its own snapshots are `revert_old_*`, same journal format.
+  The old copy of a changed file keeps its name until the new one is on the
+  disk: the backup uses `selective_backup._handle_old_copy` / `before_final`,
+  never a routine of its own. `--force` journals `added` only after its copy
+  of that file succeeded (a target that appears meanwhile is someone else's and
+  `--revert-last` must never take it out); `--revert-last` does the same. A
+  catalog row without a hash is filled by `--verify` only from a source with the
+  row's size and date (`HASH_FILLED`), and its restore checks the size
+  (`RESTORED_UNVERIFIED`).
+- `mobile_backup.py` — mirrors the `JXL_mobile` folders to another disk as
+  one album per event, numbered in shot order (exiftool); its own version
+  (`0.1.x`) and its own README (`README_mobile_backup.md`). It is the one
+  script that deletes on its destination: see its safety rule below. It saves
+  its state right after the renames and every `STATE_SAVE_EVERY` copies.
 
 ## Safety rules (these are the product)
 - **The source is READ-ONLY.** No code path may open a source file for
@@ -72,7 +85,10 @@ from the command line. A future job (e.g. a full mirror) is a new
   before the final name), never with what the source held earlier, and the
   comparison only decides the versions folder, never whether to copy. The only
   file the tool removes is
-  its own temp file (`*` + `TEMP_SUFFIX`) after a failed copy. The one
+  its own temp file (`*` + `TEMP_SUFFIX`): after a failed copy, and the one
+  `_dest_accepts_writes` writes in `CATALOG_FOLDER` to test the destination
+  after `DEST_CHECK_AFTER_ERRORS` failed copies in a row (a test that fails
+  stops the copy and the reading, exit 1). The one
   exception: a folder left empty by one of our own moves (a detected
   move/rename, or `--move-orphans`) is removed with `os.rmdir` — never a
   file, and never anything inside `CATALOG_FOLDER`.
@@ -100,9 +116,12 @@ from the command line. A future job (e.g. a full mirror) is a new
   copied. Any new "skip" rule follows the same shape: positive evidence that
   the file can be remade from something this run copies.
 - **A manifest's `Originals=raw` never leaves a photo without a copy.** It
-  maps to `raw_or_jpeg`: RAW + sidecars + every JPEG that has no RAW of the
-  same photo beside it (`X (2).JPG` is another file, not a variant of `X`), and
-  the sidecars of what it keeps. `raw+jpeg` and `all` only copy more.
+  maps to `raw_or_jpeg`: RAW + sidecars + every JPEG, TIFF, PNG, HEIC or PSD
+  (`ANCHOR_EXTENSIONS`) that has no RAW of the same photo beside it (`X
+  (2).JPG` is another file, not a variant of `X`), and the sidecars of what it
+  keeps (`photo_stems`). `raw+jpeg` (`raw_jpeg`) adds every JPEG; `all` copies
+  everything: `raw` within `raw+jpeg` within `all`, in every mode (v0.12.1,
+  `tests/test_bug_sweep_round2.py`).
 - **A folder not exported yet is not lost in a `+` mode.** `Unexported=yes`
   in the modes table copies a folder without an export whole (`--unexported
   copy`, per line); a folder with one follows the rest of the mode.
@@ -127,6 +146,45 @@ from the command line. A future job (e.g. a full mirror) is a new
 - **Reading the catalog never writes to the backup (v0.12.0).** A read-only
   `_Catalog` with a pending `-journal` beside it reads a private copy
   (`scratch`); only a run that may write rolls the journal back.
+- **Every listed file is planned or counted once, and a bigger mode never
+  copies less (v0.12.1).** Each file under a source is in the plan or counted
+  exactly once under `Not copied:`: in one `Stats` counter, or, for a folder
+  without an export that is not copied, in its `unexported_folders` entry (a
+  new "leave out" branch gets its own counter and summary line; links/junctions
+  are counted in `_list_dir`, once per planner, cache or not). The exception: a
+  folder skipped by its name (`SYSTEM_SKIP_FOLDERS`, `--exclude-folders`) is
+  never listed, so its files are not counted; the folder is named instead
+  (`skipped_folders`, once per planner, `SKIPPED FOLDER` in the log).
+  `tests/test_bug_sweep_round2.py` checks this file by file (sizes `8**k`). Mode `N` ⊆ `N+1` and `N` ⊆
+  `N+`: a folder with an export inside an `AddFolders` folder is a session, and
+  a file there -- loose or inside its export folders (`_filter_keeps`) -- is
+  copied when either the session or the `Originals` filter keeps it, as v0.12.0
+  did. `tests/test_bug_sweep.py` checks both on synthetic trees;
+  a change to `_Planner.build` must keep them. The one rule allowed to copy
+  less is `Exclude` (the owner's explicit choice, counted), plus one declared
+  case: in an `AddFolders` folder, a `Cache` below the first level of a
+  `CaptureOne` inside an export folder counts as Capture One cache (v0.12.0
+  copied it; a cache is made again).
+- **A source that cannot be read is not a source that is gone (v0.12.1).**
+  `_source_state` says `missing` only with proof: `FileNotFoundError` AND the
+  nearest existing folder above could be listed; any other error is
+  `unreadable`. Orphans (`source_missing` vs `source_unreadable` /
+  `other_source`, the latter for a row whose `source_path` is under no
+  `--source` of this run), the move detection and `--verify`
+  (`SOURCE_UNREADABLE`) use it. `--move-orphans` moves only `source_missing`,
+  and nothing in a run with an error in its plan. Never use `_exists()` to
+  decide that a source is gone.
+- **Only `--verify full` records `verified_at` (v0.12.1).** A quick verify
+  reads no file; recording it would send the `--max-gb` queue back to its
+  start. The same for `manifest_backup.py --verify` (it uses `_run_verify`).
+- **`mobile_backup.py` deletes only with proof (0.1.2).** It is the one script
+  that deletes on its destination (a mirror). A photo is deleted or renumbered
+  only when its path is under a `--source` of this run (`_under_run`; never by
+  the root recorded in the state, which a narrower test run would pin), and
+  nothing is deleted or renamed in a run where `os.walk` (`onerror`) or a
+  `stat` failed on a source. A photo exiftool gave no record for keeps no `shot` in the state, so
+  the next run reads it again; a null `shot` of a state written before 0.1.2
+  is read once more.
 
 ## Settings are never hardcoded
 Every user-editable setting lives at the TOP of `selective_backup.py`
@@ -198,6 +256,8 @@ Same as the sibling repo `jxl-photo`. Documents live in `AI_tools/`
 ## Docs map
 - `README.md` — what it does, safety guarantees, every `--flag` (enforced by
   `tests/test_docs_cover_the_flags.py`), every setting, examples, exit codes.
+- `README_mobile_backup.md` — `mobile_backup.py`: usage, how it numbers,
+  the sync and delete rules, its settings.
 
 ## Pending list
 The owner keeps one list of everything still pending, across all repos, in

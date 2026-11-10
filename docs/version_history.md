@@ -9,7 +9,8 @@ releases are also published as
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **[v0.12.0](#v0120)** | 2026-11-10 | A file never counts as saved when the right content cannot be restored: eight fixes from an audit; `manifest_backup.py --verify` |
+| **[v0.12.1](#v0121)** | 2026-11-11 | Bug sweep: nothing left out without a count, a bigger mode never copies less, a source that cannot be read is not a source that is gone, the rolling verify keeps turning; `Originals=raw` keeps a photo whose only original is a TIFF, PNG, HEIC or PSD; `[7] Manifest` does what `[1]` does |
+| [v0.12.0](#v0120) | 2026-11-10 | A file never counts as saved when the right content cannot be restored: eight fixes from an audit; `manifest_backup.py --verify` |
 | [v0.11.0](#v0110) | 2026-11-10 | A manifest line can leave a folder out (`skip`) or keep only one type of file in it (`raw-only`, `jpeg-only`, `jxl-only`) |
 | [v0.10.0](#v0100) | 2026-11-10 | Modes `1+` to `5+`: a folder not exported yet is copied whole, so what has not been edited is not left out |
 | [v0.9.0](#v090) | 2026-11-09 | Each folder with its own backup mode, from a manifest; `--analyze` shows the size of every mode first |
@@ -24,6 +25,193 @@ releases are also published as
 | v0.1.0 | 2026-10-06 | First implementation, not released |
 
 `mobile_backup.py` has its own version: [see the end of this page](#mobile_backuppy).
+
+---
+
+## v0.12.1
+
+**Released 2026-11-11.** Nothing to do when upgrading, with two exceptions
+below (`Exclude` copies less; `Originals=raw` copies more). A sweep for bugs
+looked for what the backup leaves out without saying so, what it could lose,
+and what it calls a success when it is not; this version fixes what it found,
+in two rounds.
+
+**Nothing left out without a count.**
+
+- **`AddFolders`** (`_OUTTAKES_KEEP` in mode 3) left out the files its
+  `Originals` filter did not keep — JPEG twins of a RAW, TIFF, HEIC, PSD,
+  video — without counting them anywhere. On the owner's archive: 2 269 files,
+  30.5 GB. They are now a line of the summary: `left out inside added folders
+  (Originals filter)`.
+- **A bigger mode never copies less.** Mode 3 treats `_OUTTAKES\_EXPORT` as a
+  session (its exports and their originals are copied); mode 4, which adds
+  `_OUTTAKES`, filtered it like a folder of originals and lost those exports.
+  A folder with an export folder inside an `AddFolders` folder is now a session
+  too, and a file is copied when either rule keeps it: a loose file, and a file
+  of its export folders too (the JPEG of a photo that has a JXL, a sidecar, a
+  DNG, the `CaptureOne` folder of the export, which v0.12.0 copied there). The
+  test suite
+  checks `1 ⊆ 2 ⊆ 3 ⊆ 4 ⊆ 5 ⊆ 6` and `N ⊆ N+`, and that every file under a
+  manifest line is in the plan or in exactly one count of the summary.
+- **`CaptureOne` and `NKSC_PARAM` inside a session's subfolder** were neither
+  copied nor counted (88 124 files, 0.59 GB of outtake settings on the owner's
+  archive): they now count as "inside sessions". With `--unexported copy`, a
+  folder that has no file of its own, only subfolders and a `CaptureOne`
+  folder, has its Capture One and NKSC_PARAM folders copied.
+- **Links and junctions** that are not followed are counted (`links/junctions
+  not followed: N`) and each one is in the log. On the owner's archive: 429,
+  every one a `CaptureOne\Cache` moved to another disk. A listing shared
+  between the lines of a manifest no longer hides them.
+- **`_inside.csv`** lists every direct subfolder of a session left out, and the
+  summary names the five biggest by name under "inside sessions", so a folder
+  that is not an outtake (on the owner's archive, a folder of party photos
+  inside a folder made a session by one loose JPEG) stands out. The rule of what is a
+  session does not change in this version.
+- **`AddWhole` and `AddFolders`** apply to the subfolders of any folder with an
+  export folder, also when no original is beside it: a film session whose only
+  originals are in `RAW SCANS` keeps them in modes 1 to 5.
+- **A column the modes table or the manifest does not know aborts** (exit 2,
+  with its name), as does a line with more values than columns. A header typed
+  `Unexported ` with a space used to be ignored, and every `+` mode became its
+  base mode. An empty column name (an extra comma at the end of every line,
+  often a cell left in Excel) aborts too, and the message says so.
+- **Folders skipped by their name** (`$RECYCLE.BIN`, `System Volume
+  Information`, `--exclude-folders`) are never read, so what they hold is not
+  counted file by file; they are now named: `folders skipped by name (system /
+  --exclude-folders): N` in the summary, `SKIPPED FOLDER <path>` in the log.
+- **`folders without export`** under `Not copied:` counted also the folders a
+  `+` mode (or `--unexported copy`) copies. It now counts only those left out;
+  `_unexported.csv` still lists all of them, with a new last column `copied`
+  (`yes`/`no`).
+
+**Copies less on purpose: `Exclude`.** A folder that matches a mode's
+`Exclude` is now never walked, in every mode and at any depth, and what it
+holds is counted (`excluded by the mode (Exclude)`), as the README always said.
+Before, a session inside an excluded folder was still copied by a mode without
+`+` and dropped, without a count, by the same mode with `+`. The export,
+Capture One and NKSC_PARAM folders of a session are not affected. The shipped
+modes have no `Exclude`.
+
+A smaller case, also declared: in an `AddFolders` folder, a `Cache` folder
+deeper than the first level of a `CaptureOne` folder that is inside an export
+folder (`_OUTTAKES_KEEP\_EXPORT\CaptureOne\X\Cache`) is counted as Capture One
+cache, as in every export folder; v0.12.0 copied it there. A cache is made
+again by Capture One. No such folder exists in the owner's archive.
+
+**Copies more on purpose: `Originals=raw`.** It kept every RAW and a JPEG
+only when no RAW of the same photo was beside it; a photo whose only original
+is a TIFF, PNG, HEIC/HEIF/HIF or PSD (a camera that wrote TIFF, a developed
+TIFF whose RAW is not there, a screenshot) had no copy at all: on the owner's
+archive, 13 files / 0.62 GB in 2024 to 2026. Such a file is now kept, under
+`raw` and `raw+jpeg` (`--unselected raw_or_jpeg` / `raw_jpeg`), with the same
+rule of "the same photo" as the JPEG (`X (2).tif` is another file), and its
+sidecars too. The TIFF developed from a RAW that is beside it
+(`DSC_4321_NXstudio.TIF`, `P1010099.tif` with `P1010099.ORF`) still stays out.
+It applies everywhere the filter does: `--unselected`, `AddFolders`, and the
+export folders inside an added folder. `raw` within `raw+jpeg` within `all` is
+tested in every mode.
+
+**A source that cannot be read is not a source that is gone.**
+
+- **`--move-orphans`** moved good backup copies out of the backup tree and the
+  catalog when their source could not be reached: another drive with the same
+  folder names that was not connected, or a folder that could not be read. A
+  source now counts as gone only with proof: the system said "does not exist"
+  and the nearest existing folder above could be listed. Anything else is
+  `source_unreadable`; a file of a source not given in this run is
+  `other_source`. Only proven `source_missing` files are moved, and a run with
+  an error in its plan moves none (the summary says why: `N errors in the plan
+  of this run`, a duplicate destination path included). The proof is by path:
+  another disk on the same letter with the same folders passes it (the README
+  says to look at a dry-run after changing the source disk).
+- **The move detection** (a renamed folder moved inside the backup) uses the
+  same proof.
+- **`--verify`** says `SOURCE_UNREADABLE` (a problem, exit 1) where there is no
+  proof, instead of `SOURCE_MISSING`.
+
+**What the verify did not check.**
+
+- **The rolling verify (`--max-gb`)** kept the rows that never get a
+  `verified_at` (`DEST_CORRUPT`, `DEST_MISSING`, ...) at the front of the queue,
+  and they used up the budget every night: the rest of the backup stopped being
+  verified. Those rows are still checked every night and keep the exit code 1,
+  but their size no longer counts against `--max-gb`.
+- **`--verify`** now says how many catalog rows are outside the given sources
+  and were not checked.
+- **A `--verify quick` recorded `verified_at`** on every row it found in place,
+  without reading any file, and sent the rolling queue of a `--verify full
+  --max-gb` back to its start: a nightly quick between the slices meant the
+  same first slice every night. Only a full verify records `verified_at` now
+  (also for `manifest_backup.py --verify`).
+
+**The copy.**
+
+- **A destination that stops taking writes** (a USB disk pulled out, a full
+  disk) made the backup read the whole source to the end, file by file, only
+  to fail each one. After `DEST_CHECK_AFTER_ERRORS` (20) failed copies in a
+  row, the destination is tested with a file of its own (written and removed in
+  `_photo_backup`); when that fails, the backup stops reading, records what was
+  copied, prints the summary with a `STOPPED:` line and exits 1.
+- **Not enough space because of a renamed folder.** A possible move inside the
+  backup still counts as a copy in the space check (it is only confirmed by
+  hash later), but the message now says how much of what is needed may be
+  moves.
+- **Ctrl+C while a manifest, a restore or a Capture One job was still
+  planning** printed a traceback; it now says `Interrupted.` and exits 130, as
+  during the copy.
+- **Two files with one destination path**: the message now names both and says
+  which one has a copy; for a folder whose name ends with a dot or a space
+  (`Trip.` beside `Trip`, which Windows cannot read apart), it says that what is
+  in that folder is not backed up and why.
+
+**The restore.** An `--only` that matches nothing in the catalog is named on
+the screen and in the log, the others are restored, and the run exits 1 (it
+used to say "done").
+
+**Capture One's own files (`captureone_backup.py`).**
+
+- **The old copy of a changed file** went to the versions folder before the
+  new one was safe: a copy that failed (Capture One holding the file) left the
+  backup without that file. It now follows `selective_backup.py`'s rule: the
+  old copy keeps its name until the new one is on the disk.
+- **A catalog row without a hash** (the catalog was made again, or a run was
+  stopped) was `OK_SIZE_ONLY` forever, and its restore said `RESTORED` even
+  with damaged bytes. `--verify` now compares it with its source when the
+  source still has the size and date of the row: the same bytes record the
+  hash (`HASH_FILLED`), other bytes are `DEST_DIFFERS` (exit 1); what cannot be
+  checked stays `OK_SIZE_ONLY` and the summary counts it. Its restore checks
+  the size and says `RESTORED_UNVERIFIED`; another size is not restored.
+- **`--force` and a file that appears meanwhile.** A file restored by
+  `--force` was journaled as added before the copy; when another program
+  wrote that file in between, `--revert-last` took that program's file out.
+  It is now journaled only after the copy succeeded (also in `--revert-last`
+  itself).
+
+**The menu says what it shows.**
+
+- **`--unselected raw_or_jpeg`** (the default at the top of
+  `selective_backup.py`, or a remembered choice) became `skip` when you pressed
+  Enter: the menu offered only three of the five values. It now offers every
+  value the backend accepts, and the current one is always marked.
+- **`--no-c1-cache` and `--no-derivatives`.** With a `True` default at the top
+  of `selective_backup.py`, a "no" in the menu was not on the command line and
+  the backend copied anyway. The menu and the presets now always pass one of
+  the two forms. The menu also asks whether to copy the jxl-photo derivatives
+  and Capture One's own files, and no longer blames `COPY_CAPTUREONE_SETTINGS`
+  for a choice it remembered.
+- **A "no" to the Capture One question of `[2] Verify`** also turned the
+  Capture One step off for the next backup: the two questions shared one
+  remembered choice. The verify has its own now (a config without it uses the
+  backup's).
+- **`[7] Manifest` does what `[1]` does.** Its backup did not keep Capture
+  One's own files and never replaced a changed original or export
+  (`--update-changed`); its verify offered no "Max GB" and did not check
+  `_captureone`. It now asks the same questions (remembered for the next
+  manifest run) and runs the same steps.
+- The menu's description of `raw_or_jpeg` and `raw_jpeg` says what they keep
+  now.
+
+**`mobile_backup.py` 0.1.2** — see [below](#mobile_backuppy).
 
 ---
 
@@ -364,5 +552,37 @@ A separate script with its own version: it mirrors the phone-size
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| 0.1.2 | 2026-11-11 | Deletes only with proof: never a photo of a source not given in this run, nothing when a source folder could not be read; an exiftool failure is read again next time instead of becoming "no date"; the state is saved more often |
 | 0.1.1 | 2026-10-13 | Photos numbered camera by camera, each camera in its own shooting order (cameras' clocks disagree) |
 | 0.1.0 | 2026-10-13 | First version: one album per event, photos numbered in shooting order, synchronised (only its own files are renamed or removed) |
+
+### 0.1.2
+
+**Released 2026-11-11** with photo-backup v0.12.1. Nothing to do when
+upgrading: a state written by 0.1.1 keeps working, and its "no date" photos are
+read once more (see below).
+
+- **A run with fewer sources deleted the albums of the others.** A run now
+  only deletes or renumbers the photos whose path is under one of the sources it
+  was given; the others are left alone, and the summary says how many. (The
+  state also records each photo's source root. The decision is by the path, so
+  a test run with a narrower `--source` does not keep a photo deleted later in
+  the mirror.)
+- **A folder that could not be read looked empty**, and its photos were
+  deleted from the mirror (and then from the phone at the next sync), exit 0.
+  Now the run names the folder, deletes and renames nothing, copies only new
+  photos to free names, and exits 1.
+- **An exiftool failure** (not installed, a timeout, a crash) recorded every
+  photo of that batch as "no date" for good, numbered by name, exit 0. Those
+  photos are now read again on the next run, and the run exits 1. A photo
+  exiftool read and found no date in is still last of its camera, as before.
+  The README says that exiftool is required.
+- **A "no date" written by 0.1.1 after an exiftool failure** stayed for good.
+  When the state was written before 0.1.2, every photo without a date in it is
+  read once more; one really without a date is not read again after that.
+- **A run killed before the end** (not Ctrl+C) left the state of the run
+  before: the files it had renamed or copied were then unknown, and their album
+  was skipped on every run after. The state is now saved right after the
+  renames and every `STATE_SAVE_EVERY` (20) copies. What remains is a kill in
+  the middle of the renames or between a copy and the next save: that album is
+  skipped until the file is removed by hand.

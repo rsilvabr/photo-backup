@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.12.0"
+__version__ = "0.12.1"
 
 # ---- Settings -------------------------------------------------------------------
 BACKUP_SUBFOLDER = "_captureone"            # under --dest: this script's own backup root
@@ -478,13 +478,22 @@ def run_backup(args, log, stamp):
         last = time.time()
         for index, status in enumerate(to_copy, 1):
             try:
+                before_final = None
                 if status.status == sb.ST_CHANGED:
-                    # Capture One rewrites files with the same bytes: only a real
-                    # difference is worth an entry in the versions folder.
-                    if sb._sha256_file(status.planned.src) != sb._sha256_file(status.dst):
-                        sb._move_to_versions(backup, stamp, status, log)
-                        versions += 1
-                digest, size, mtime_ns = sb._copy_file(status.planned, status.dst, sb.VERIFY_COPY)
+                    # selective_backup's own rule (B12): the old copy keeps its
+                    # name until the new one is on the disk, and goes to the
+                    # versions folder only when the bytes really copied differ
+                    # (Capture One rewrites files with the same bytes).
+                    decide = sb._handle_old_copy(backup, stamp, status, log)
+
+                    def old_copy(digest, decide=decide, status=status):
+                        nonlocal versions
+                        decide(digest)
+                        if not sb._exists(status.dst):
+                            versions += 1
+                    before_final = old_copy
+                digest, size, mtime_ns = sb._copy_file(status.planned, status.dst, sb.VERIFY_COPY,
+                                                       before_final=before_final)
                 catalog.upsert(status.planned, digest, size, mtime_ns)
                 log.log(f"{status.status} {status.planned.rel}")
             except KeyboardInterrupt:
@@ -537,14 +546,51 @@ def _open_backup(path):
         catalog.close()
 
 
+GOOD_VERIFY = ("OK", "HASH_FILLED", "OK_SIZE_ONLY")
+
+
+def _current_source(row, roots):
+    """Where the file of a catalog row is on THIS computer (the label resolved
+    here, as the restore does), or None."""
+    label, _sep, rest = row.rel.partition(os.sep)
+    root = roots.get(label)
+    return os.path.join(root, rest) if root and rest else None
+
+
+def _unhashed_status(row, path, roots):
+    """(status, sha256) for a row without a catalog hash (B11). Its source still
+    there with the size and date of the row proves what the copy must hold:
+    the same bytes fill the hash (HASH_FILLED), other bytes are DEST_DIFFERS.
+    Without that proof only the size was checked: OK_SIZE_ONLY."""
+    source = _current_source(row, roots)
+    if source is None:
+        return "OK_SIZE_ONLY", None
+    tolerance = int(sb.MTIME_TOLERANCE_S * 1_000_000_000)
+    try:
+        stat = os.stat(sb._io(source), follow_symlinks=False)
+        if stat.st_size != row.size or abs(stat.st_mtime_ns - row.mtime_ns) > tolerance:
+            return "OK_SIZE_ONLY", None
+        source_hash = sb._sha256_file(source)
+        if os.stat(sb._io(source), follow_symlinks=False).st_mtime_ns != stat.st_mtime_ns:
+            return "OK_SIZE_ONLY", None         # changed while it was read
+    except OSError:
+        return "OK_SIZE_ONLY", None
+    copy_hash = sb._sha256_file(path)           # an error here is the backup's: ERROR
+    if copy_hash == source_hash:
+        return "HASH_FILLED", copy_hash
+    return "DEST_DIFFERS", None
+
+
 def run_verify(args, log):
     try:
         backup, rows = _open_backup(args.verify)
     except (FileNotFoundError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    roots, _version = _roots(args)
     counts = {}
     report = []
+    filled = []
     for row in rows:
         path = os.path.join(backup, row.rel)
         try:
@@ -552,7 +598,9 @@ def run_verify(args, log):
             if size != row.size:
                 status = "DEST_SIZE"
             elif row.sha256 is None:
-                status = "OK_SIZE_ONLY"
+                status, new_hash = _unhashed_status(row, path, roots)
+                if new_hash is not None:
+                    filled.append((row.key, new_hash))
             else:
                 status = "OK" if sb._sha256_file(path) == row.sha256 else "CORRUPT"
         except FileNotFoundError:
@@ -561,12 +609,30 @@ def run_verify(args, log):
             status = "ERROR"
             log.log(f"ERROR {row.rel}: {exc}")
         counts[status] = counts.get(status, 0) + 1
-        if not status.startswith("OK"):
+        if status == "DEST_DIFFERS":
+            log.log(f"DEST_DIFFERS {row.rel}: the copy differs from its source, which has the "
+                    f"size and date of the catalog")
+        if status not in GOOD_VERIFY:
             report.append((status, row.rel))
             log.out(f"  {status} {row.rel}")
+    if filled:
+        # Only a row proven by its source gets a hash; the catalog is opened
+        # for writing only then (reading it never writes to the backup).
+        catalog = sb._Catalog(backup, create=False)
+        try:
+            when = time.strftime("%Y-%m-%dT%H:%M:%S")
+            for key, sha256 in filled:
+                catalog.set_hash_verified(key, sha256, when)
+            catalog.commit()
+        finally:
+            catalog.close()
     log.csv("_verify.csv", ["status", "rel"], report)
     log.out("Verify: " + ("  ".join(f"{status} {sb._num(count)}"
                                     for status, count in sorted(counts.items())) or "(empty)"))
+    if counts.get("OK_SIZE_ONLY"):
+        log.out(f"  {sb._num(counts['OK_SIZE_ONLY'])} files were not checked by hash: the catalog "
+                f"has no hash for them and their source on this computer changed or is not "
+                f"there, so only their size was checked")
     return 1 if report else 0
 
 
@@ -580,6 +646,27 @@ def _selected_for_restore(label, rest, also):
     if label == LABEL_USER and os.sep in rest:
         return _matches(first, sb._split_names(RESTORE_USER_FOLDERS))
     return False
+
+
+def _backup_size(path):
+    try:
+        return os.stat(sb._io(path), follow_symlinks=False).st_size
+    except OSError:
+        return None
+
+
+def _size_check(target, row):
+    """before_final for a row without a catalog hash: the copy must at least
+    have the catalog's size, or it never takes the target's name."""
+    if row.sha256 is not None:
+        return None
+
+    def check(_digest):
+        size = _backup_size(target + sb.TEMP_SUFFIX)
+        if size != row.size:
+            raise RuntimeError(f"content differs from the catalog: size {size} != {row.size} "
+                               f"(backup copy corrupt?)")
+    return check
 
 
 def _existing_outcome(label, row, src, target):
@@ -710,6 +797,9 @@ def run_restore(args, log):
             target = os.path.join(root, rest)
         if not sb._exists(src):
             status = "MISSING_IN_BACKUP"
+        elif row.sha256 is None and _backup_size(src) != row.size:
+            # no hash to check the copy against: its size is all there is (B11)
+            status = "CORRUPT_IN_BACKUP"
         elif not to and label == LABEL_INSTALLED and not sb._exists(root):
             status = "NOT_INSTALLED"
         elif sb._exists(target):
@@ -792,11 +882,15 @@ def run_restore(args, log):
                                       expected_sha256=row.sha256)
                         status = "REPLACED"
                     else:
+                        sb._copy_file(planned, target, sb.VERIFY_COPY,
+                                      expected_sha256=row.sha256, no_clobber=True,
+                                      before_final=_size_check(target, row))
+                        # journaled only once the copy is there: a target that
+                        # appeared meanwhile is someone else's, and --revert-last
+                        # must never take it out (B22)
                         if snapshot is not None:
                             snapshot.note_added(row.rel)
-                        sb._copy_file(planned, target, sb.VERIFY_COPY,
-                                      expected_sha256=row.sha256, no_clobber=True)
-                        status = "RESTORED"
+                        status = "RESTORED" if row.sha256 else "RESTORED_UNVERIFIED"
                 except FileExistsError:
                     status = "CONFLICT"
                     detail = "the target appeared during the restore; left as it was"
@@ -822,6 +916,9 @@ def run_restore(args, log):
     for status, rel, _target, detail in results:
         if status in ("CONFLICT", "ERROR", "CORRUPT_IN_BACKUP", "MISSING_IN_BACKUP"):
             log.out(f"  {status} {rel}" + (f": {detail}" if detail else ""))
+    if final.get("RESTORED_UNVERIFIED"):
+        log.out(f"  {sb._num(final['RESTORED_UNVERIFIED'])} files restored without a catalog "
+                f"hash (RESTORED_UNVERIFIED): only their size was checked")
     if snapshot is not None and snapshot.folder is not None:
         log.out(f"Old files kept in: {snapshot.folder}  (undo: --revert-last)")
     return 1 if any(result[0] in BAD_RESTORE for result in results) else 0
@@ -937,11 +1034,12 @@ def run_revert(args, log):
             detail = ""
             try:
                 if status == "PUT_BACK":
-                    if sb._exists(target):
+                    existed = sb._exists(target)
+                    if existed:
                         snapshot.keep_current(rel, target)
-                    else:
-                        snapshot.note_added(rel)
                     sb._copy_file(sb.PlannedFile(snap, rel, 0, 0, "revert"), target, sb.VERIFY_COPY)
+                    if not existed:             # journaled once it is there (B22)
+                        snapshot.note_added(rel)
                     status = "PUT_BACK_DONE"
                 elif status == "TAKE_OUT":
                     # A file the force added leaves Capture One but is not lost.
@@ -1008,6 +1106,14 @@ def build_parser():
 
 
 def main(argv=None):
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:   # while planning; each job handles its own copy (B20)
+        print("Interrupted.", file=sys.stderr)
+        return 130
+
+
+def _main(argv):
     try:                        # a cp1252 console cannot print the owner's ～ paths
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, OSError):

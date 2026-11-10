@@ -29,10 +29,10 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
-__version__ = "0.12.0"
+__version__ = "0.12.1"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -58,7 +58,7 @@ ANCHOR_EXTENSIONS = RAW_EXTENSIONS + (".jpg", ".jpeg", ".tif", ".tiff", ".png",
                                       ".heic", ".heif", ".hif", ".psd")  # files whose stem can be a photo key
 SIDECAR_EXTENSIONS = (".xmp", ".dop", ".pp3")   # copied with an unselected RAW under --unselected raw
 NAME_SEPARATORS = "_-. ("           # a key must be followed by one of these in a longer name
-UNSELECTED = "skip"                 # default --unselected: skip | raw | all
+UNSELECTED = "skip"                 # default --unselected: skip | raw | raw_or_jpeg | raw_jpeg | all
 
 # ---- jxl-photo derivatives -------------------------------------------------------
 COPY_JXLPHOTO_DERIVATIVES = False   # default for --derivatives: a JXL that jxl-photo derived from a
@@ -91,6 +91,8 @@ SMALL_FILE_KB = 102400              # backup: files below this are flushed to di
 FLUSH_BATCH_FILES = 50              # backup: files per flush batch and per catalog commit; 1 = flush each file
 FLUSH_THREADS = 8                   # backup: simultaneous flushes of a batch (measured on a USB HDD: 8 beat 1 and 32)
 TEMP_SUFFIX = ".pbtmp"              # in-progress copy, next to its final name
+DEST_CHECK_AFTER_ERRORS = 20        # backup: after this many failed copies in a row, test the destination
+                                    # (write and remove a temp file in CATALOG_FOLDER); it fails = stop; 0 = never
 CATALOG_FOLDER = "_photo_backup"    # under the destination: catalog.sqlite + versions\
 PROGRESS_EVERY_S = 5.0
 AUTO_UPDATE = True                  # default: changed edit settings/sidecars are updated without --update-changed
@@ -101,6 +103,7 @@ ORPHANS_FOLDER = "orphans"          # under CATALOG_FOLDER: where --move-orphans
 BACKUP_ID_FILE = "volume.json"      # under CATALOG_FOLDER: the identity of this backup (F2)
 VERIFY_MAX_GB = 0.0                 # default --max-gb for --verify full: 0 = verify everything
 SUMMARY_FOLDER_LINES = 25           # lines of the per-folder table in the summary (the CSV has all)
+SUMMARY_INSIDE_NAMES = 5            # subfolder names shown under "inside sessions" (the _inside.csv has all)
 
 # ---- Logs ---------------------------------------------------------------------------
 LOG_DIR = os.environ.get("PHOTOBACKUP_LOG_DIR") or os.path.join(
@@ -147,6 +150,80 @@ def _exists(path):
     return os.path.exists(_io(path))
 
 
+SOURCE_PRESENT = "present"
+SOURCE_MISSING = "missing"
+SOURCE_UNREADABLE = "unreadable"
+
+
+def _source_state(path):
+    """SOURCE_PRESENT, SOURCE_MISSING or SOURCE_UNREADABLE for a source file.
+    MISSING needs positive proof: the system answered "does not exist" AND the
+    nearest folder above that does exist could be listed. Any other error --
+    access denied, a drive or share that does not answer, nothing above it
+    that exists (a drive not connected) -- is UNREADABLE: a source that cannot
+    be reached is never a source that is gone."""
+    try:
+        os.stat(_io(path), follow_symlinks=False)
+        return SOURCE_PRESENT
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return SOURCE_UNREADABLE
+    parent = os.path.abspath(path)
+    while True:
+        up = os.path.dirname(parent)
+        if up == parent:
+            return SOURCE_UNREADABLE
+        parent = up
+        try:
+            os.stat(_io(parent))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return SOURCE_UNREADABLE
+        try:
+            with os.scandir(_io(parent)) as entries:
+                next(entries, None)
+        except OSError:
+            return SOURCE_UNREADABLE
+        return SOURCE_MISSING
+
+
+def _trailing_dot_folder(path):
+    """The first part of `path` whose name ends in '.' or a space, or None.
+    Windows drops that ending when it opens the path: the part is read as the
+    folder without it, and what it really holds is never seen."""
+    drive, rest = os.path.splitdrive(path)
+    current = drive
+    for part in rest.replace("/", "\\").split("\\"):
+        if not part:
+            current += "\\"
+            continue
+        current = os.path.join(current, part) if current else part
+        if part not in (".", "..") and part[-1] in ". ":
+            return current
+    return None
+
+
+def _duplicate_message(rel, kept, other):
+    """The error of two planned files with one destination path (v0.12.0):
+    true in both cases (S8 of the 261111 review)."""
+    dotted = _trailing_dot_folder(kept) or _trailing_dot_folder(other)
+    if dotted is not None:
+        plain = dotted.rstrip(". ") or dotted
+        return (f"ERROR duplicate destination {rel}: {dotted} ends with a dot or a space, "
+                f"and Windows cannot read it apart from {plain}: what is in {dotted} is NOT "
+                f"backed up (rename it); {rel} holds the file of {plain} "
+                f"(read as {kept} and as {other})")
+    return (f"ERROR duplicate destination {rel}: {kept} and {other} are two files with the "
+            f"same destination path; only {kept} has a copy, {other} is NOT backed up")
+
+
+def _under_sources(path, sources):
+    """Whether `path` is under one of the (source, base) pairs of this run."""
+    return any(_is_under(path, source) for source, _base in sources)
+
+
 def _candidate_prefixes(stem):
     """Prefixes of `stem` that end right before a separator, shortest first,
     then `stem` itself. 'DSC_9360_ProPhoto-g22_v1' -> ['DSC', 'DSC_9360',
@@ -175,8 +252,11 @@ def _original_kept(name, raw_stems, originals, all_sidecars, photo_stems=None):
     all_sidecars every sidecar is kept; otherwise only the sidecars of a photo
     of the folder (photo_stems, default raw_stems). A JPEG is kept by raw_jpeg
     always and by raw_or_jpeg only when no RAW of the photo is beside it (the
-    photo would otherwise have no copy). "X (2).JPG" is another file, not a
-    variant of X: only a RAW named "X (2)" pairs with it."""
+    photo would otherwise have no copy). Any other photo file (a TIFF, PNG,
+    HEIC or PSD of ANCHOR_EXTENSIONS) is kept by both under that same rule:
+    a camera that wrote TIFF originals, a developed TIFF whose RAW is not
+    there. "X (2).JPG" is another file, not a variant of X: only a RAW named
+    "X (2)" pairs with it."""
     stem, ext = os.path.splitext(name)
     folded_ext = ext.casefold()
     if folded_ext in RAW_EXTENSIONS:
@@ -188,13 +268,11 @@ def _original_kept(name, raw_stems, originals, all_sidecars, photo_stems=None):
             return True
         stems = raw_stems if photo_stems is None else photo_stems
         return any(prefix.casefold() in stems for prefix in _candidate_prefixes(stem))
-    if folded_ext in JPEG_EXTENSIONS:
-        if originals == "raw_jpeg":
-            return True
-        if originals == "raw_or_jpeg":
-            prefixes = [stem] if _DUP_COUNTER.search(stem) else _candidate_prefixes(stem)
-            return not any(prefix.casefold() in raw_stems for prefix in prefixes)
-        return False
+    if folded_ext in JPEG_EXTENSIONS and originals == "raw_jpeg":
+        return True
+    if folded_ext in ANCHOR_EXTENSIONS and originals in ("raw_or_jpeg", "raw_jpeg"):
+        prefixes = [stem] if _DUP_COUNTER.search(stem) else _candidate_prefixes(stem)
+        return not any(prefix.casefold() in raw_stems for prefix in prefixes)
     return False
 
 
@@ -348,6 +426,10 @@ class Stats:
     only_filtered_bytes: int = 0
     skipped_links: int = 0
     scan_errors: int = 0
+    add_filtered_skipped: int = 0       # inside an AddFolders folder, left out by its Originals filter
+    add_filtered_skipped_bytes: int = 0
+    mode_excluded: int = 0              # under a folder that matches the mode's Exclude
+    mode_excluded_bytes: int = 0
 
 
 @dataclass
@@ -366,6 +448,9 @@ class UnexportedFolder:
     nbytes: int
     c1_nbytes: int
     nx_nbytes: int
+    c1_files: int = 0       # Capture One files without the cache (the cache is in Stats)
+    nx_files: int = 0
+    copied: bool = False    # copied whole (--unexported copy, or a + mode of the manifest)
 
 
 @dataclass
@@ -377,6 +462,9 @@ class Plan:
     errors: list
     warnings: list
     sources: list
+    links: list = field(default_factory=list)    # links/junctions not followed (paths)
+    inside: list = field(default_factory=list)   # (session, subfolder, files, bytes) left out
+    skipped_folders: list = field(default_factory=list)  # skipped by name, not listed (paths)
 
 
 @dataclass
@@ -400,7 +488,8 @@ class VerifyResult:
 class FolderRules:
     add_filtered: tuple = ()    # patterns: direct subfolders of a session, filtered by `originals`
     add_whole: tuple = ()       # patterns: direct subfolders of a session, copied whole
-    exclude: tuple = ()         # patterns: never added, at any depth
+    exclude: tuple = ()         # patterns: never walked, at any depth (not the export,
+                                # Capture One and NKSC_PARAM folders of a session)
     whole: bool = False         # the whole folder, session or not
     originals: str = "raw_or_jpeg"
     skip: bool = False          # this folder stays out: nothing planned, its size reported
@@ -421,6 +510,11 @@ class _Planner:
         self.unexported = []
         self.unmatched = []
         self.sources = []
+        self.links = []             # links/junctions not followed, each once
+        self._links_seen = set()
+        self.skipped_folders = []   # SYSTEM_SKIP_FOLDERS / --exclude-folders, each once (S4)
+        self._skipped_seen = set()
+        self.inside = {}            # session subfolder -> [session, subfolder, files, bytes]
         self.export_contains = args.export_name_contains.casefold()
         self.export_excludes = _fold_set(args.exclude_export_names)
         self.skip_folder_names = _fold_set(SYSTEM_SKIP_FOLDERS) | _fold_set(args.exclude_folders)
@@ -464,14 +558,17 @@ class _Planner:
         return self.export_contains in folded and folded not in self.export_excludes
 
     def _scan_dir(self, path):
+        """(files, dirs, links) of one folder. Links and junctions are never
+        followed; _list_dir counts them, once per planner, cache or not."""
         files = []
         dirs = []
+        links = []
         try:
             with os.scandir(_io(path)) as entries:
                 for entry in entries:
                     try:
                         if entry.is_symlink() or entry.is_junction():
-                            self.stats.skipped_links += 1
+                            links.append(os.path.join(path, entry.name))
                             continue
                         if entry.is_dir(follow_symlinks=False):
                             dirs.append((entry.name, os.path.join(path, entry.name)))
@@ -487,7 +584,8 @@ class _Planner:
             self.stats.scan_errors += 1
         files.sort(key=lambda item: item[0].casefold())
         dirs.sort(key=lambda item: item[0].casefold())
-        return files, dirs
+        links.sort(key=lambda item: item.casefold())
+        return files, dirs, links
 
     def _list_dir(self, path):
         key = os.path.normcase(path)
@@ -496,11 +594,33 @@ class _Planner:
             cached = self._scan_dir(path)
             if self.list_cache is not None:
                 self.list_cache[key] = cached
-        files, dirs = cached
+        files, dirs, links = cached
+        for link in links:
+            # counted here, not in _scan_dir: a listing shared with another
+            # planner (the manifest) or read twice must not lose or double it
+            link_key = os.path.normcase(link)
+            if link_key in self._links_seen or link_key in self.skip_paths:
+                continue
+            self._links_seen.add(link_key)
+            self.links.append(link)
+            self.stats.skipped_links += 1
         if self.skip_paths:
             dirs = [item for item in dirs
                     if os.path.normcase(item[1]) not in self.skip_paths]
         return files, dirs
+
+    def _skipped_by_name(self, name, dpath):
+        """True for a folder of SYSTEM_SKIP_FOLDERS or --exclude-folders. It is
+        not listed at all (a System Volume Information cannot be read, and a
+        folder may be excluded because it gives errors): its files are not
+        counted one by one, the folder itself is named, once per planner."""
+        if name.casefold() not in self.skip_folder_names:
+            return False
+        key = os.path.normcase(dpath)
+        if key not in self._skipped_seen:
+            self._skipped_seen.add(key)
+            self.skipped_folders.append(dpath)
+        return True
 
     def _rel(self, path, base):
         return os.path.relpath(path, base)
@@ -512,9 +632,7 @@ class _Planner:
             if os.path.normcase(kept) == os.path.normcase(planned.src):
                 self.warnings.append(f"WARNING duplicate {planned.rel} (kept {kept})")
             else:
-                # Another file with the same destination path: it has no copy.
-                self.errors.append(f"ERROR duplicate {planned.rel}: {planned.src} is NOT "
-                                   f"backed up (same destination path as {kept})")
+                self.errors.append(_duplicate_message(planned.rel, kept, planned.src))
             return
         self.seen[key] = planned
         self.files.append(planned)
@@ -533,9 +651,10 @@ class _Planner:
                 stack.append(dpath)
         return count, total
 
-    def _walk_usage(self, root, skip_direct=frozenset()):
-        count = 0
-        total = 0
+    def _split_usage(self, root, skip_direct=frozenset()):
+        """(files, bytes) under `root` without its direct subfolders named in
+        `skip_direct`, then (files, bytes) of those subfolders."""
+        count = total = skipped = skipped_bytes = 0
         stack = [(root, True)]
         while stack:
             path, top = stack.pop()
@@ -545,9 +664,22 @@ class _Planner:
                 total += size
             for name, dpath in dirs:
                 if top and name.casefold() in skip_direct:
+                    files_in, bytes_in = self._tree_usage(dpath)
+                    skipped += files_in
+                    skipped_bytes += bytes_in
                     continue
                 stack.append((dpath, False))
-        return count, total
+        return count, total, skipped, skipped_bytes
+
+    def _excluded(self, name, dpath):
+        """True when the folder matches the mode's Exclude: it is never walked,
+        and what it holds is counted as excluded by the mode."""
+        if self.rules is None or not _folder_matches(name, self.rules.exclude):
+            return False
+        count, nbytes = self._tree_usage(dpath)
+        self.stats.mode_excluded += count
+        self.stats.mode_excluded_bytes += nbytes
+        return True
 
     def _add_tree(self, root, base, category, skip_direct=frozenset()):
         stack = [(root, True)]
@@ -555,7 +687,7 @@ class _Planner:
             path, top = stack.pop()
             files, dirs = self._list_dir(path)
             for name, dpath in dirs:
-                if self.rules is not None and _folder_matches(name, self.rules.exclude):
+                if self._excluded(name, dpath):
                     continue
                 if top and name.casefold() in skip_direct:
                     count, nbytes = self._tree_usage(dpath)
@@ -566,7 +698,47 @@ class _Planner:
             for _, fpath, size, mtime_ns in files:
                 self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns, category))
 
-    def _collect_export(self, root, collected):
+    def _files_under(self, root):
+        """(path, size, mtime_ns) of every file under `root`."""
+        stack = [root]
+        while stack:
+            files, dirs = self._list_dir(stack.pop())
+            for _, fpath, size, mtime_ns in files:
+                yield fpath, size, mtime_ns
+            stack.extend(dpath for _, dpath in dirs)
+
+    def _filter_keeps(self, roots, originals):
+        """What v0.12.0 copied of these export folders when their session is
+        inside an AddFolders folder: its walk did not know they were exports and
+        kept what the Originals filter keeps, folder by folder, plus the Capture
+        One (without its cache) and NKSC_PARAM folders whole, leaving out the
+        mode's Exclude. Normcased paths: the session copies them too (M1 of the
+        261111 review), so adding a folder never copies less than v0.12.0."""
+        keep = set()
+        stack = [(root, False, False) for root in roots]    # path, inside Capture One, whole
+        while stack:
+            path, in_c1, whole = stack.pop()
+            files, dirs = self._list_dir(path)
+            raw_stems = {os.path.splitext(name)[0].casefold()
+                         for name, _, _, _ in files
+                         if os.path.splitext(name)[1].casefold() in RAW_EXTENSIONS}
+            for name, fpath, _size, _mtime_ns in files:
+                if whole or _original_kept(name, raw_stems, originals, all_sidecars=True):
+                    keep.add(os.path.normcase(fpath))
+            for name, dpath in dirs:
+                folded = name.casefold()
+                if self.rules is not None and _folder_matches(name, self.rules.exclude):
+                    continue
+                if in_c1 and folded in self.cache_names and not self.copy_cache:
+                    continue                # the cache _collect_export skips (and counts)
+                is_c1 = folded in self.c1_names
+                stack.append((dpath, in_c1 or is_c1, whole or is_c1 or folded in self.nx_names))
+        return keep
+
+    def _collect_export(self, root, collected, keep=frozenset(), rescued=None):
+        """Every file of an export folder into `collected`. A subfolder in
+        --exclude-export-subfolders is counted, except its files in `keep`,
+        which go to `rescued` (see _filter_keeps)."""
         stack = [(root, False)]
         while stack:
             path, in_c1 = stack.pop()
@@ -574,9 +746,12 @@ class _Planner:
             for name, dpath in dirs:
                 folded = name.casefold()
                 if folded in self.excluded_subfolders:
-                    count, nbytes = self._tree_usage(dpath)
-                    self.stats.export_excluded += count
-                    self.stats.export_excluded_bytes += nbytes
+                    for fpath, size, mtime_ns in self._files_under(dpath):
+                        if rescued is not None and os.path.normcase(fpath) in keep:
+                            rescued.append((fpath, size, mtime_ns))
+                        else:
+                            self.stats.export_excluded += 1
+                            self.stats.export_excluded_bytes += size
                     continue
                 if in_c1 and folded in self.cache_names and not self.copy_cache:
                     count, nbytes = self._tree_usage(dpath)
@@ -628,7 +803,27 @@ class _Planner:
         self.stats.export_filtered_bytes += sum(rec[3] for rec in filtered)
         return chosen
 
-    def _session(self, path, base, files, exports, c1_dirs, nx_dirs):
+    def _unselected_kept(self, name, stem, folded_ext, raw_stems, photo_stems,
+                         unselected_raw_stems):
+        """Whether an original of a photo that was not exported is copied under --unselected."""
+        if self.unselected == "raw":
+            if folded_ext in RAW_EXTENSIONS:
+                return True
+            return (folded_ext in SIDECAR_EXTENSIONS
+                    and any(prefix.casefold() in unselected_raw_stems
+                            for prefix in _candidate_prefixes(stem)))
+        if self.unselected in ("raw_or_jpeg", "raw_jpeg"):
+            return _original_kept(name, raw_stems, self.unselected, all_sidecars=False,
+                                  photo_stems=photo_stems)
+        return self.unselected == "all"
+
+    def _session(self, path, base, files, exports, c1_dirs, nx_dirs, added=None):
+        """A folder with an export folder. `added`: the Originals filter of the
+        AddFolders folder this session is in (None outside one). There, a file
+        the session leaves out -- a loose file, or a file of its export folders
+        (another format, a derivative, an excluded export subfolder) -- is still
+        copied when that filter keeps it, as v0.12.0 did: a session inside an
+        added folder never copies less than either rule."""
         self.stats.shoots += 1
         self.stats.export_folders += len(exports)
         anchors = set()
@@ -636,9 +831,12 @@ class _Planner:
             stem, ext = os.path.splitext(name)
             if ext.casefold() in ANCHOR_EXTENSIONS:
                 anchors.add(stem.casefold())
+        keep = (self._filter_keeps([dpath for _, dpath in exports], added)
+                if added is not None else frozenset())
+        rescued = []
         collected = []
         for _, dpath in exports:
-            self._collect_export(dpath, collected)
+            self._collect_export(dpath, collected, keep, rescued)
         records = []
         for fpath, size, mtime_ns in collected:
             stem, ext = os.path.splitext(os.path.basename(fpath))
@@ -647,19 +845,37 @@ class _Planner:
                 key = "?" + stem.casefold()
                 self.unmatched.append((path, fpath))
             records.append((key, ext.casefold(), fpath, size, mtime_ns))
-        chosen = self._drop_derivatives(self._apply_formats(records))
+        formatted = self._apply_formats(records)
+        chosen = self._drop_derivatives(formatted)
+        if keep:
+            chosen_ids = {id(rec) for rec in chosen}
+            formatted_ids = {id(rec) for rec in formatted}
+            for rec in records:
+                if id(rec) in chosen_ids or os.path.normcase(rec[2]) not in keep:
+                    continue
+                # left out as an export, kept by the AddFolders filter: copied,
+                # so it leaves the count that _apply_formats or _drop_derivatives made
+                if id(rec) in formatted_ids:
+                    self.stats.derivatives_skipped -= 1
+                    self.stats.derivatives_skipped_bytes -= rec[3]
+                else:
+                    self.stats.export_filtered -= 1
+                    self.stats.export_filtered_bytes -= rec[3]
+                rescued.append((rec[2], rec[3], rec[4]))
         selected_keys = set()
         for key, _, fpath, size, mtime_ns in chosen:
             self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns, CAT_EXPORT))
             if not key.startswith("?"):
                 selected_keys.add(key)
+        for fpath, size, mtime_ns in rescued:
+            self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns, CAT_ADDED))
         selected_keys = _source_keys(selected_keys)
         unselected_raw_stems = set()
         raw_stems = set()
         photo_stems = set()
         for name, _, _, _ in files:
             stem, ext = os.path.splitext(name)
-            if ext.casefold() in JPEG_EXTENSIONS:
+            if ext.casefold() in ANCHOR_EXTENSIONS:     # a JPEG, TIFF, PNG, HEIC or PSD photo
                 photo_stems.add(stem.casefold())
             if ext.casefold() in RAW_EXTENSIONS:
                 raw_stems.add(stem.casefold())
@@ -672,26 +888,14 @@ class _Planner:
             if self._stem_matches(stem, selected_keys):
                 self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns, CAT_SOURCE))
                 continue
-            if self.unselected == "raw":
-                copied = folded_ext in RAW_EXTENSIONS
-                if not copied and folded_ext in SIDECAR_EXTENSIONS:
-                    copied = any(prefix.casefold() in unselected_raw_stems
-                                 for prefix in _candidate_prefixes(stem))
-                if copied:
-                    self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns, CAT_UNSELECTED))
-                else:
-                    self.stats.unselected_skipped += 1
-                    self.stats.unselected_skipped_bytes += size
-            elif self.unselected in ("raw_or_jpeg", "raw_jpeg"):
-                if _original_kept(name, raw_stems, self.unselected, all_sidecars=False,
-                                  photo_stems=photo_stems):
-                    self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns,
-                                          CAT_UNSELECTED))
-                else:
-                    self.stats.unselected_skipped += 1
-                    self.stats.unselected_skipped_bytes += size
-            elif self.unselected == "all":
+            if self._unselected_kept(name, stem, folded_ext, raw_stems, photo_stems,
+                                     unselected_raw_stems):
                 self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns, CAT_UNSELECTED))
+            elif added is not None and _original_kept(name, raw_stems, added, all_sidecars=True):
+                self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns, CAT_ADDED))
+            elif added is not None:
+                self.stats.add_filtered_skipped += 1
+                self.stats.add_filtered_skipped_bytes += size
             else:
                 self.stats.unselected_skipped += 1
                 self.stats.unselected_skipped_bytes += size
@@ -704,28 +908,80 @@ class _Planner:
         # subfolders must keep their own classification.
         return bool(anchors)
 
-    def _add_filtered(self, root, base, originals):
-        stack = [root]
-        while stack:
-            path = stack.pop()
-            files, dirs = self._list_dir(path)
-            raw_stems = {os.path.splitext(name)[0].casefold()
-                         for name, _, _, _ in files
-                         if os.path.splitext(name)[1].casefold() in RAW_EXTENSIONS}
-            for name, fpath, size, mtime_ns in files:
-                if _original_kept(name, raw_stems, originals, all_sidecars=True):
-                    self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns,
-                                          CAT_ADDED))
-            for name, dpath in dirs:
-                folded = name.casefold()
-                if self.rules is not None and _folder_matches(name, self.rules.exclude):
-                    continue
-                if folded in self.c1_names:
-                    self._add_tree(dpath, base, CAT_ADDED, self.cache_skip_direct)
-                elif folded in self.nx_names:
-                    self._add_tree(dpath, base, CAT_ADDED)
-                else:
-                    stack.append(dpath)
+    def _added_folder(self, path, base, files, c1_dirs, nx_dirs, inside, originals):
+        """A folder without an export inside an AddFolders folder: its files
+        go through the Originals filter, and what it leaves out is counted.
+        Not inside a session (an added folder of a folder with no original
+        beside its export), --unexported copy still copies it whole: adding it
+        never copies less than walking it as a folder without an export."""
+        if inside is None and self.unexported_mode == "copy":
+            self._unexported_folder(path, base, files, c1_dirs, nx_dirs)
+            return
+        raw_stems = {os.path.splitext(name)[0].casefold()
+                     for name, _, _, _ in files
+                     if os.path.splitext(name)[1].casefold() in RAW_EXTENSIONS}
+        for name, fpath, size, mtime_ns in files:
+            if _original_kept(name, raw_stems, originals, all_sidecars=True):
+                self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns, CAT_ADDED))
+            else:
+                self.stats.add_filtered_skipped += 1
+                self.stats.add_filtered_skipped_bytes += size
+        for _, dpath in c1_dirs:
+            self._add_tree(dpath, base, CAT_ADDED, self.cache_skip_direct)
+        for _, dpath in nx_dirs:
+            self._add_tree(dpath, base, CAT_ADDED)
+
+    def _inside_folder(self, inside, files, editor_dirs):
+        """A folder inside a session that is not copied: its files, and those
+        of its Capture One and NKSC_PARAM folders, count as inside sessions,
+        under the session's direct subfolder it belongs to (_inside.csv)."""
+        count = len(files)
+        nbytes = sum(item[2] for item in files)
+        for _, dpath in editor_dirs:
+            files_in, bytes_in = self._tree_usage(dpath)
+            count += files_in
+            nbytes += bytes_in
+        if not count:
+            return
+        self.stats.inside_shoot_skipped += count
+        self.stats.inside_shoot_skipped_bytes += nbytes
+        session, subfolder = inside
+        entry = self.inside.setdefault(os.path.normcase(subfolder), [session, subfolder, 0, 0])
+        entry[2] += count
+        entry[3] += nbytes
+
+    def _unexported_folder(self, path, base, files, c1_dirs, nx_dirs):
+        """A folder without an export, not inside a session: listed, and copied
+        with --unexported copy -- its Capture One and NKSC_PARAM folders too,
+        also when it has no file of its own."""
+        if not (files or c1_dirs or nx_dirs):
+            return
+        c1_files = c1_nbytes = cache_files = cache_bytes = 0
+        for _, dpath in c1_dirs:
+            count, nbytes, skipped, skipped_bytes = self._split_usage(dpath, self.cache_skip_direct)
+            c1_files += count
+            c1_nbytes += nbytes
+            cache_files += skipped
+            cache_bytes += skipped_bytes
+        nx_files = nx_nbytes = 0
+        for _, dpath in nx_dirs:
+            count, nbytes = self._tree_usage(dpath)
+            nx_files += count
+            nx_nbytes += nbytes
+        self.unexported.append(UnexportedFolder(
+            path, len(files), sum(item[2] for item in files), c1_nbytes, nx_nbytes,
+            c1_files, nx_files, self.unexported_mode == "copy"))
+        if self.unexported_mode == "copy":
+            for _, fpath, size, mtime_ns in files:
+                self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns,
+                                      CAT_UNEXPORTED))
+            for _, dpath in c1_dirs:        # counts its cache itself
+                self._add_tree(dpath, base, CAT_CAPTURE_ONE, self.cache_skip_direct)
+            for _, dpath in nx_dirs:
+                self._add_tree(dpath, base, CAT_NX_STUDIO)
+        else:
+            self.stats.c1_cache_skipped += cache_files
+            self.stats.c1_cache_skipped_bytes += cache_bytes
 
     def _add_whole_row(self, root, base):
         stack = [root]
@@ -734,9 +990,9 @@ class _Planner:
             files, dirs = self._list_dir(path)
             for name, dpath in dirs:
                 folded = name.casefold()
-                if folded in self.skip_folder_names:
+                if self._skipped_by_name(name, dpath):
                     continue
-                if self.rules is not None and _folder_matches(name, self.rules.exclude):
+                if self._excluded(name, dpath):
                     continue
                 if folded in self.c1_names:
                     self._add_tree(dpath, base, CAT_WHOLE, self.cache_skip_direct)
@@ -747,6 +1003,10 @@ class _Planner:
                                       CAT_WHOLE))
 
     def build(self):
+        """Walk every source. A stack item is (path, base, inside, added):
+        inside = (session, its direct subfolder) once the walk is inside a
+        session (None outside); added = the Originals filter once it is inside
+        an AddFolders folder (None outside)."""
         stack = []
         whole = self.rules is not None and self.rules.whole
         for source in self.args.source:
@@ -763,65 +1023,50 @@ class _Planner:
             elif whole:
                 self._add_whole_row(src, base)
             else:
-                stack.append((src, base, False))
+                stack.append((src, base, None, None))
         stack.reverse()
         while stack:
-            path, base, inside_shoot = stack.pop()
+            path, base, inside, added = stack.pop()
             files, dirs = self._list_dir(path)
-            dirs = [(name, dpath) for name, dpath in dirs
-                    if name.casefold() not in self.skip_folder_names]
+            if added is None:   # inside an AddFolders folder v0.12.0 walked them too
+                dirs = [(name, dpath) for name, dpath in dirs
+                        if not self._skipped_by_name(name, dpath)]
             exports = [(name, dpath) for name, dpath in dirs if self._is_export_name(name)]
             c1_dirs = [(name, dpath) for name, dpath in dirs if name.casefold() in self.c1_names]
             nx_dirs = [(name, dpath) for name, dpath in dirs if name.casefold() in self.nx_names]
             classified = {os.path.normcase(dpath) for _, dpath in exports + c1_dirs + nx_dirs}
+            others = [(name, dpath) for name, dpath in dirs
+                      if os.path.normcase(dpath) not in classified
+                      and not self._excluded(name, dpath)]
             if exports:
-                has_originals = self._session(path, base, files, exports, c1_dirs, nx_dirs)
-                child_inside = inside_shoot or has_originals
-                if has_originals and self.rules is not None:
-                    for name, dpath in dirs:
-                        if os.path.normcase(dpath) in classified:
-                            continue
-                        if _folder_matches(name, self.rules.exclude):
-                            continue
-                        if _folder_matches(name, self.rules.add_whole):
-                            self._add_tree(dpath, base, CAT_ADDED, self.cache_skip_direct)
-                            classified.add(os.path.normcase(dpath))
-                        elif _folder_matches(name, self.rules.add_filtered):
-                            self._add_filtered(dpath, base, self.rules.originals)
-                            classified.add(os.path.normcase(dpath))
-                for _, dpath in dirs:
-                    if os.path.normcase(dpath) not in classified:
-                        stack.append((dpath, base, child_inside))
-            elif inside_shoot:
-                for _, _, size, _ in files:
-                    self.stats.inside_shoot_skipped += 1
-                    self.stats.inside_shoot_skipped_bytes += size
-                for _, dpath in dirs:
-                    if os.path.normcase(dpath) not in classified:
-                        stack.append((dpath, base, True))
+                has_originals = self._session(path, base, files, exports, c1_dirs, nx_dirs, added)
+                for name, dpath in others:
+                    child_inside = (path, dpath) if has_originals else inside
+                    if self.rules is not None and _folder_matches(name, self.rules.add_whole):
+                        self._add_tree(dpath, base, CAT_ADDED, self.cache_skip_direct)
+                    elif self.rules is not None and _folder_matches(name, self.rules.add_filtered):
+                        stack.append((dpath, base, child_inside, self.rules.originals))
+                    else:
+                        stack.append((dpath, base, child_inside, added))
+            elif added is not None:
+                self._added_folder(path, base, files, c1_dirs, nx_dirs, inside, added)
+                for _, dpath in others:
+                    stack.append((dpath, base, inside, added))
+            elif inside is not None:
+                self._inside_folder(inside, files, c1_dirs + nx_dirs)
+                for _, dpath in others:
+                    stack.append((dpath, base, inside, None))
             else:
-                if files:
-                    c1_nbytes = sum(self._walk_usage(dpath, self.cache_skip_direct)[1]
-                                    for _, dpath in c1_dirs)
-                    nx_nbytes = sum(self._walk_usage(dpath)[1] for _, dpath in nx_dirs)
-                    self.unexported.append(UnexportedFolder(
-                        path, len(files), sum(item[2] for item in files), c1_nbytes, nx_nbytes))
-                    if self.unexported_mode == "copy":
-                        for _, fpath, size, mtime_ns in files:
-                            self._add(PlannedFile(fpath, self._rel(fpath, base), size, mtime_ns,
-                                                  CAT_UNEXPORTED))
-                        for _, dpath in c1_dirs:
-                            self._add_tree(dpath, base, CAT_CAPTURE_ONE, self.cache_skip_direct)
-                        for _, dpath in nx_dirs:
-                            self._add_tree(dpath, base, CAT_NX_STUDIO)
-                for name, dpath in dirs:
-                    if (self.rules is not None and self.unexported_mode == "copy"
-                            and _folder_matches(name, self.rules.exclude)):
-                        continue
-                    if os.path.normcase(dpath) not in classified:
-                        stack.append((dpath, base, False))
+                self._unexported_folder(path, base, files, c1_dirs, nx_dirs)
+                for _, dpath in others:
+                    stack.append((dpath, base, None, None))
         if self.rules is not None and self.rules.only:
             self._apply_only()
+
+    def inside_rows(self):
+        """(session, subfolder name, files, bytes) of every session subfolder left out."""
+        return [(session, os.path.basename(subfolder), count, nbytes)
+                for session, subfolder, count, nbytes in self.inside.values()]
 
     def _apply_only(self):
         kept = []
@@ -845,6 +1090,9 @@ def plan(args):
         errors=planner.errors,
         warnings=planner.warnings,
         sources=list(planner.sources),
+        links=list(planner.links),
+        inside=planner.inside_rows(),
+        skipped_folders=list(planner.skipped_folders),
     )
 
 
@@ -1319,6 +1567,25 @@ def _remove_temp(tmp):
         pass
 
 
+def _dest_accepts_writes(dest):
+    """None when the destination still takes a write, else why not. Writes one
+    file of our own (TEMP_SUFFIX, inside CATALOG_FOLDER), waits until it is on
+    the disk and removes it: the only file this test ever touches."""
+    probe = os.path.join(os.path.abspath(dest), CATALOG_FOLDER,
+                         f"dest_check_{os.getpid()}{TEMP_SUFFIX}")
+    try:
+        os.makedirs(_io(os.path.dirname(probe)), exist_ok=True)
+        with open(_io(probe), "wb") as handle:
+            handle.write(b"photo-backup destination check")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.remove(_io(probe))
+    except OSError as exc:
+        _remove_temp(probe)
+        return exc.strerror or str(exc)
+    return None
+
+
 def _write_temp(planned, tmp, source, flush):
     """Write `source` to the temp file; `flush` waits until it is on the disk."""
     if _exists(tmp):
@@ -1437,11 +1704,13 @@ def _adopt_rows(catalog, statuses):
     catalog.commit()
 
 
-def _find_move_candidates(statuses, rows, dest):
+def _find_move_candidates(statuses, rows, dest, sources=None):
     """NEW statuses whose name+size match a catalogued backup file whose source
     is gone. Returns {id(status): (status, [row, ...])} — confirmed by hash
     later. (The plan wrote {id(status): [row, ...]}; the status object travels
-    with its rows because _apply_moves receives only this mapping.)"""
+    with its rows because _apply_moves receives only this mapping.) "Gone" is
+    the orphans' proof: under a source of this run (`sources`) and
+    SOURCE_MISSING; a source that cannot be read is never moved away from."""
     planned_keys = {status.planned.rel.casefold() for status in statuses}
     index = {}
     for row in rows:
@@ -1458,7 +1727,9 @@ def _find_move_candidates(statuses, rows, dest):
             continue
         accepted = []
         for row in matches:
-            if _exists(row.source_path):
+            if sources is not None and not _under_sources(row.source_path, sources):
+                continue
+            if _source_state(row.source_path) != SOURCE_MISSING:
                 continue
             old = os.path.join(dest, row.rel)
             try:
@@ -1554,9 +1825,16 @@ def _apply_moves(candidates, dest, catalog, log):
     return moved, moved_bytes, move_errors, interrupted
 
 
-def _find_orphans(rows, statuses, prefixes, used_keys):
+ORPHAN_REASONS = {SOURCE_PRESENT: "not_selected", SOURCE_MISSING: "source_missing",
+                  SOURCE_UNREADABLE: "source_unreadable"}
+
+
+def _find_orphans(rows, statuses, prefixes, used_keys, sources=None):
     """Catalogued files under the verified prefixes that are neither planned
-    now nor consumed by a move. Returns [(reason, row), ...]."""
+    now nor consumed by a move. Returns [(reason, row), ...]. A row whose
+    source is not under a source of this run (`sources`: another disk that
+    shares the folder names) is other_source; only a source proven gone
+    (_source_state) is source_missing -- the one --move-orphans moves."""
     planned_keys = {status.planned.rel.casefold() for status in statuses}
     orphans = []
     for row in rows:
@@ -1564,7 +1842,10 @@ def _find_orphans(rows, statuses, prefixes, used_keys):
             continue
         if row.key in planned_keys or row.key in used_keys:
             continue
-        reason = "source_missing" if not _exists(row.source_path) else "not_selected"
+        if sources is not None and not _under_sources(row.source_path, sources):
+            reason = "other_source"
+        else:
+            reason = ORPHAN_REASONS[_source_state(row.source_path)]
         orphans.append((reason, row))
     return orphans
 
@@ -1619,17 +1900,37 @@ def _folder_summary_lines(folder_rows):
     return lines[:SUMMARY_FOLDER_LINES], more
 
 
+def _inside_name_lines(inside):
+    """The session subfolders left out, grouped by name, the biggest first:
+    a folder that is not an outtake stands out next to _OUTTAKES."""
+    groups = {}
+    for _session, name, count, nbytes in inside:
+        entry = groups.setdefault(name.casefold(), [name, 0, 0])
+        entry[1] += count
+        entry[2] += nbytes
+    biggest = sorted(groups.values(), key=lambda item: (-item[2], item[0].casefold()))
+    biggest = biggest[:SUMMARY_INSIDE_NAMES]
+    width = min(40, max([12] + [len(name) for name, _count, _nbytes in biggest]))
+    return [f"      {name:<{width}} {_num(count):>8} files {_gb(nbytes):>12}"
+            for name, count, nbytes in biggest]
+
+
 def _orphan_csv_rows(orphans):
     return [(reason, row.rel, row.size, row.source_path, row.copied_at)
             for reason, row in orphans]
 
 
-def _copy_all(args, statuses, dest, stamp, catalog, log):
+def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None):
+    """Copy what the plan says. `stop_info` (a dict) receives why the copy
+    stopped early and what was left, when the destination stopped taking
+    writes: after DEST_CHECK_AFTER_ERRORS failed copies in a row the
+    destination is tested, and a test that fails stops the reading too (B16)."""
     to_copy = [status for status in statuses if _will_copy(status, args)]
     total_bytes = sum(status.planned.size for status in to_copy)
     done = 0
     done_bytes = 0
     error_count = 0
+    in_a_row = 0
     uncommitted = 0
     started = time.monotonic()
     last_report = started
@@ -1642,16 +1943,18 @@ def _copy_all(args, statuses, dest, stamp, catalog, log):
     flush_pool = ThreadPoolExecutor(max_workers=max(FLUSH_THREADS, 1))
 
     def record(status, sha256, size, mtime_ns):
-        nonlocal done, done_bytes, uncommitted
+        nonlocal done, done_bytes, uncommitted, in_a_row
         catalog.upsert(status.planned, sha256, size, mtime_ns)
         done += 1
         done_bytes += status.planned.size
         uncommitted += 1
+        in_a_row = 0
         log.log(f"COPY {status.planned.rel}")
 
     def failed(status, exc):
-        nonlocal error_count
+        nonlocal error_count, in_a_row
         error_count += 1
+        in_a_row += 1
         log.log(f"ERROR {status.planned.rel}: {exc}")
 
     def finish_pending():
@@ -1675,8 +1978,9 @@ def _copy_all(args, statuses, dest, stamp, catalog, log):
         catalog.commit()
         uncommitted = 0
 
+    stopped = None
     try:
-        for status in to_copy:
+        for index, status in enumerate(to_copy):
             source = read_ahead.next_source(status.planned) if read_ahead else _SourceRead(status.planned)
             try:
                 before_final = None
@@ -1684,6 +1988,7 @@ def _copy_all(args, statuses, dest, stamp, catalog, log):
                     before_final = _handle_old_copy(dest, stamp, status, log)
                 if FLUSH_BATCH_FILES > 1 and status.planned.size < SMALL_FILE_KB * 1024:
                     pending.append(_stage_small_file(status, source, before_final))
+                    in_a_row = 0            # the destination took this write
                     if len(pending) >= FLUSH_BATCH_FILES:
                         finish_pending()
                 else:
@@ -1703,7 +2008,22 @@ def _copy_all(args, statuses, dest, stamp, catalog, log):
             if uncommitted >= max(FLUSH_BATCH_FILES, 1):
                 catalog.commit()
                 uncommitted = 0
+            if DEST_CHECK_AFTER_ERRORS > 0 and in_a_row >= DEST_CHECK_AFTER_ERRORS:
+                reason = _dest_accepts_writes(dest)
+                log.log(f"DEST CHECK after {in_a_row} failed copies in a row: "
+                        + ("the destination takes writes, going on" if reason is None
+                           else f"FAILED ({reason})"))
+                if reason is not None:
+                    stopped = (reason, in_a_row, to_copy[index + 1:])
+                    break
+                in_a_row = 0
         finish_pending()
+        if stopped is not None:
+            reason, failures, left = stopped
+            log.log(f"STOPPED: {_num(len(left))} files not attempted")
+            if stop_info is not None:
+                stop_info.update(reason=reason, failures=failures, left=len(left),
+                                 left_bytes=sum(item.planned.size for item in left))
     except KeyboardInterrupt:
         for item in pending:
             _remove_temp(item.tmp)
@@ -1763,6 +2083,13 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
     lines.append(f"  unselected originals: {_num(planned.stats.unselected_skipped)} / "
                  f"{_gb(planned.stats.unselected_skipped_bytes)}      "
                  f"Capture One cache: {_gb(planned.stats.c1_cache_skipped_bytes)}")
+    if planned.stats.add_filtered_skipped:
+        lines.append(f"  left out inside added folders (Originals filter): "
+                     f"{_num(planned.stats.add_filtered_skipped)} / "
+                     f"{_gb(planned.stats.add_filtered_skipped_bytes)}")
+    if planned.stats.mode_excluded:
+        lines.append(f"  excluded by the mode (Exclude): {_num(planned.stats.mode_excluded)} / "
+                     f"{_gb(planned.stats.mode_excluded_bytes)}")
     if planned.stats.derivatives_skipped:
         lines.append(f"  jxl-photo derivatives (their master is copied; --derivatives copies them): "
                      f"{_num(planned.stats.derivatives_skipped)} / "
@@ -1775,16 +2102,25 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
     if planned.stats.only_filtered:
         lines.append(f"  left out by a mode's Only filter: {_num(planned.stats.only_filtered)} / "
                      f"{_gb(planned.stats.only_filtered_bytes)}")
+    inside_csv = f"   -> {log_paths['inside']}" if planned.inside else ""
     lines.append(f"  inside sessions (_OUTTAKES, OLD_TIFFs, ...): "
                  f"{_num(planned.stats.inside_shoot_skipped)} / "
-                 f"{_gb(planned.stats.inside_shoot_skipped_bytes)}")
+                 f"{_gb(planned.stats.inside_shoot_skipped_bytes)}{inside_csv}")
+    lines.extend(_inside_name_lines(planned.inside))
+    not_copied = [folder for folder in planned.unexported_folders if not folder.copied]
     unexported_bytes = sum(folder.nbytes + folder.c1_nbytes + folder.nx_nbytes
-                           for folder in planned.unexported_folders)
-    lines.append(f"  folders without export: {_num(len(planned.unexported_folders))} folders / "
+                           for folder in not_copied)
+    lines.append(f"  folders without export: {_num(len(not_copied))} folders / "
                  f"{_gb(unexported_bytes)}   -> {log_paths['unexported']}")
     sessions = {session for session, _ in planned.unmatched}
     lines.append(f"  exports without a matching original: {_num(len(planned.unmatched))} files "
                  f"in {_num(len(sessions))} sessions -> {log_paths['unmatched']}")
+    if planned.links:
+        lines.append(f"  links/junctions not followed: {_num(len(planned.links))} "
+                     f"-> {log_paths['log']}")
+    if planned.skipped_folders:
+        lines.append(f"  folders skipped by name (system / --exclude-folders): "
+                     f"{_num(len(planned.skipped_folders))} -> {log_paths['log']}")
     if planned.errors:
         lines.append(f"Errors: {_num(len(planned.errors))} folders/files could not be read "
                      f"(NOT backed up) -> {log_paths['log']}")
@@ -1811,6 +2147,10 @@ def _run_backup(args, log, stamp, plan_fn=None):
         log.log(error)
     for warning in planned.warnings:
         log.log(warning)
+    for link in planned.links:
+        log.log(f"LINK not followed {link}")
+    for folder in planned.skipped_folders:
+        log.log(f"SKIPPED FOLDER {folder}")
     statuses = [_file_status(planned_file, dest) for planned_file in planned.files]
     to_copy = [status for status in statuses if _will_copy(status, args)]
     needed = sum(status.planned.size for status in to_copy)
@@ -1829,6 +2169,7 @@ def _run_backup(args, log, stamp, plan_fn=None):
         "unmatched": log.prefix + "_unmatched.csv",
         "orphans_csv": log.prefix + "_orphans.csv",
         "by_folder_csv": log.prefix + "_by_folder.csv",
+        "inside": log.prefix + "_inside.csv",
     }
     rows = []
     candidates = {}
@@ -1842,12 +2183,13 @@ def _run_backup(args, log, stamp, plan_fn=None):
         finally:
             read_only_catalog.close()
         if args.detect_moves:
-            candidates = _find_move_candidates(statuses, rows, dest)
+            candidates = _find_move_candidates(statuses, rows, dest, planned.sources)
     prefixes = _source_prefixes(planned)
     tentative_used = set()
     for _status, matches in candidates.values():
         tentative_used.update(row.key for row in matches)
-    tentative_orphans = _find_orphans(rows, statuses, prefixes, tentative_used) if rows else []
+    tentative_orphans = (_find_orphans(rows, statuses, prefixes, tentative_used, planned.sources)
+                         if rows else [])
     extra_lines = []
     folder_rows = _folder_rows(to_copy)
     if len(folder_rows) >= 2:
@@ -1865,15 +2207,29 @@ def _run_backup(args, log, stamp, plan_fn=None):
             f"confirmed by hash before moving)")
     gone = [row for reason, row in tentative_orphans if reason == "source_missing"]
     unselected = [row for reason, row in tentative_orphans if reason == "not_selected"]
+    unreadable = [row for reason, row in tentative_orphans if reason == "source_unreadable"]
+    elsewhere = [row for reason, row in tentative_orphans if reason == "other_source"]
+    not_proven = ""
+    if unreadable:
+        not_proven += (f", {_num(len(unreadable))} files / "
+                       f"{_gb(sum(row.size for row in unreadable))} source cannot be read")
+    if elsewhere:
+        not_proven += (f", {_num(len(elsewhere))} files / "
+                       f"{_gb(sum(row.size for row in elsewhere))} from another source")
     extra_lines.append(
         f"  orphans (in the backup, not in the source): "
         f"{_num(len(gone))} files / {_gb(sum(row.size for row in gone))} source gone, "
         f"{_num(len(unselected))} files / {_gb(sum(row.size for row in unselected))} "
-        f"no longer selected -> {log_paths['orphans_csv']}")
+        f"no longer selected{not_proven} -> {log_paths['orphans_csv']}")
+    orphans_blocked = (f"nothing moved: {_num(len(planned.errors))} errors in the plan of this "
+                       f"run (a source that cannot be read is not one that is gone)")
     if args.move_orphans and args.dry_run:
-        extra_lines.append(
-            f"  --move-orphans: {_num(len(gone))} files would be moved to "
-            f"{os.path.join(dest, CATALOG_FOLDER, ORPHANS_FOLDER, stamp)}")
+        if planned.errors:
+            extra_lines.append(f"  --move-orphans: {orphans_blocked}")
+        else:
+            extra_lines.append(
+                f"  --move-orphans: {_num(len(gone))} files would be moved to "
+                f"{os.path.join(dest, CATALOG_FOLDER, ORPHANS_FOLDER, stamp)}")
     for line in _summary_lines(args, planned, statuses, needed, free, margin, fits, log_paths,
                                dest_error, extra_lines):
         log.out(line)
@@ -1883,11 +2239,13 @@ def _run_backup(args, log, stamp, plan_fn=None):
               datetime.fromtimestamp(status.planned.mtime_ns / 1e9).strftime("%Y-%m-%d %H:%M:%S"),
               status.planned.src, status.planned.rel)
              for status in statuses])
-    log.csv("_unexported.csv", ["folder", "files", "bytes", "c1_bytes", "nx_bytes"],
-            [(folder.path, folder.files, folder.nbytes, folder.c1_nbytes, folder.nx_nbytes)
+    log.csv("_unexported.csv", ["folder", "files", "bytes", "c1_bytes", "nx_bytes", "copied"],
+            [(folder.path, folder.files, folder.nbytes, folder.c1_nbytes, folder.nx_nbytes,
+              "yes" if folder.copied else "no")
              for folder in planned.unexported_folders])
     log.csv("_unmatched.csv", ["session", "export_file"],
             [(session, path) for session, path in planned.unmatched])
+    log.csv("_inside.csv", ["session", "subfolder", "files", "bytes"], planned.inside)
     cumulative = 0
     by_folder_csv = []
     for folder, count, nbytes in folder_rows:
@@ -1911,9 +2269,17 @@ def _run_backup(args, log, stamp, plan_fn=None):
         return 2
     if not fits:
         message = f"Not enough space: need {_gb(needed)}, free {_gb(free)}, margin {_gb(margin)}"
+        # The count stays closed (B15): a possible move is only confirmed by
+        # hash later, so it is counted as a copy; the message says how much.
+        moves_note = ""
+        if possible:
+            moves_note = (f"; {_gb(sum(status.planned.size for status in possible))} of it "
+                          f"may be files moved inside the backup (possible moves, confirmed "
+                          f"by hash when copying), which would need no new space")
+        message += moves_note
         if args.dry_run:
             print(f"WARNING: would not fit ({_gb(needed)} needed, {_gb(free)} free, "
-                  f"{_gb(margin)} margin)")
+                  f"{_gb(margin)} margin{moves_note})")
             log.log("WARNING: would not fit")
             return read_errors
         print(message, file=sys.stderr)
@@ -1946,6 +2312,7 @@ def _run_backup(args, log, stamp, plan_fn=None):
     done = done_bytes = error_count = 0
     moved = moved_bytes = move_errors = 0
     interrupted = False
+    stop_info = {}
     try:
         _ensure_backup_id(dest, log)
         _adopt_rows(catalog, statuses)
@@ -1954,24 +2321,33 @@ def _run_backup(args, log, stamp, plan_fn=None):
                 candidates, dest, catalog, log)
         if interrupted:
             return 130
-        orphans = _find_orphans(catalog.all_rows(), statuses, prefixes, set())
+        orphans = _find_orphans(catalog.all_rows(), statuses, prefixes, set(), planned.sources)
         log.csv("_orphans.csv", ["reason", "rel", "size", "source_path", "copied_at"],
                 _orphan_csv_rows(orphans))
         done, done_bytes, error_count, interrupted = _copy_all(
-            args, statuses, dest, stamp, catalog, log)
+            args, statuses, dest, stamp, catalog, log, stop_info)
         log.log(f"moved {moved} files / {_gb(moved_bytes)}")
         log.out(f"copied {done} files / {_gb(done_bytes)}; {error_count} errors")
         if error_count or move_errors:
             log.out(f"ERRORS: {_num(error_count + move_errors)} files were NOT copied -> {log.path}")
+        if stop_info:
+            log.out(f"STOPPED: the destination no longer takes writes "
+                    f"({stop_info['reason']}; tested after {_num(stop_info['failures'])} "
+                    f"failed copies in a row): {_num(stop_info['left'])} files / "
+                    f"{_gb(stop_info['left_bytes'])} were left to copy and not read")
         if interrupted:
             return 130
-        if args.move_orphans:
+        if args.move_orphans and stop_info:
+            log.out("--move-orphans: nothing moved: the destination no longer takes writes")
+        elif args.move_orphans and planned.errors:
+            log.out(f"--move-orphans: {orphans_blocked}")
+        elif args.move_orphans:
             moved_orphans = _move_orphans(dest, stamp, orphans, catalog, log)
             log.log(f"moved {moved_orphans} orphans to "
                     f"{os.path.join(dest, CATALOG_FOLDER, ORPHANS_FOLDER, stamp)}")
     finally:
         catalog.close()
-    return 1 if error_count or move_errors or planned.errors else 0
+    return 1 if error_count or move_errors or planned.errors or stop_info else 0
 
 
 @dataclass
@@ -1999,9 +2375,16 @@ def _verify_row(job, dest, deep):
             return VerifyResult("DEST_CORRUPT", row.rel, row.source_path,
                                 "destination sha256 differs from the catalog")
         dest_verified = True
-    if not _exists(row.source_path):
+    state = _source_state(row.source_path)
+    if state == SOURCE_MISSING:
         detail = "source file missing; backup copy hash verified" if hash_dst else "source file missing"
         return VerifyResult("SOURCE_MISSING", row.rel, row.source_path, detail,
+                            dest_verified=dest_verified)
+    if state == SOURCE_UNREADABLE:
+        detail = "source cannot be read (not proof that it is gone)"
+        if hash_dst:
+            detail += "; backup copy hash verified"
+        return VerifyResult("SOURCE_UNREADABLE", row.rel, row.source_path, detail,
                             dest_verified=dest_verified)
     source_stat = os.stat(_io(row.source_path), follow_symlinks=False)
     tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
@@ -2066,6 +2449,10 @@ def _run_verify(args, log, plan_fn=None):
             log.log(error)
         for warning in planned.warnings:
             log.log(warning)
+        for link in planned.links:
+            log.log(f"LINK not followed {link}")
+        for folder in planned.skipped_folders:
+            log.log(f"SKIPPED FOLDER {folder}")
         rows = {row.key: row for row in catalog.all_rows()}
         db_keys = set(rows)
         prefixes = _source_prefixes(planned)
@@ -2091,50 +2478,67 @@ def _run_verify(args, log, plan_fn=None):
             rows[key] = row
             planned_jobs.append(_VerifyJob(row, key in db_keys))
             checked.add(key)
+        outside = []
         for key, row in rows.items():
             if key in checked:
                 continue
             if not _key_under_prefixes(key, prefixes):
+                outside.append(row)
                 continue
             catalog_jobs.append(_VerifyJob(row, key in db_keys))
             checked.add(key)
-        deferred = []
-        if deep and args.max_gb > 0:
+        budget = args.max_gb * 1e9 if deep and args.max_gb > 0 else None
+        if budget is not None:
             catalog_jobs.sort(key=lambda job: (job.row.verified_at is not None,
                                                job.row.verified_at or "",
                                                job.row.copied_at or ""))
-            budget = args.max_gb * 1e9
-            rolling_bytes = 0
-            kept = []
-            for index, job in enumerate(catalog_jobs):
-                if index == 0 or rolling_bytes + job.row.size <= budget:
-                    kept.append(job)
-                    rolling_bytes += job.row.size
-                else:
-                    deferred.extend(catalog_jobs[index:])
-                    break
-            catalog_jobs = kept
-        jobs = planned_jobs + catalog_jobs
-        total_bytes = sum(job.row.size for job in jobs if deep)
+        catalog_bytes = sum(job.row.size for job in catalog_jobs)
+        total_bytes = 0
+        if deep:
+            total_bytes = sum(job.row.size for job in planned_jobs) + (
+                catalog_bytes if budget is None else min(catalog_bytes, budget))
+        job_count = len(planned_jobs) + len(catalog_jobs)
         done_bytes = 0
-        started = time.monotonic()
-        last_report = started
+        last_report = time.monotonic()
         now = datetime.now().isoformat(timespec="seconds")
-        for job in jobs:
+
+        def verify_one(job):
+            """Verify one row; True when it got a verified_at (it leaves the
+            front of the rolling queue)."""
+            nonlocal done_bytes, last_report
             result = _verify_row(job, dest, deep)
             results.append(result)
             if deep:
                 done_bytes += job.row.size
                 if time.monotonic() - last_report >= PROGRESS_EVERY_S:
-                    print(f"[{len(results)}/{len(jobs)}] {_gb(done_bytes)}/{_gb(total_bytes)}")
+                    print(f"[{len(results)}/{job_count}] {_gb(done_bytes)}/{_gb(total_bytes)}")
                     last_report = time.monotonic()
-            if job.in_catalog:
+            verified = (result.status in ("HASH_FILLED", "OK") or result.dest_verified)
+            # Only a full verify reads the files: a quick one never records
+            # verified_at, or it would reset the --max-gb queue (B23).
+            if deep and job.in_catalog:
                 if result.status == "HASH_FILLED":
                     catalog.set_hash_verified(job.row.key, result.new_hash, now)
-                elif result.status == "OK":
+                elif verified:
                     catalog.set_verified(job.row.key, now)
-                elif result.dest_verified:
-                    catalog.set_verified(job.row.key, now)
+            return verified
+
+        for job in planned_jobs:
+            verify_one(job)
+        checked_jobs = []
+        deferred = []
+        used = 0
+        for index, job in enumerate(catalog_jobs):
+            if budget is not None and used and used + job.row.size > budget:
+                deferred = catalog_jobs[index:]
+                break
+            checked_jobs.append(job)
+            # A row that stays without verified_at (DEST_CORRUPT, DEST_MISSING,
+            # ...) is checked again every run and keeps the exit code 1; its
+            # size goes back to the --max-gb budget, so it can never hold the
+            # rest of the backup back from being verified.
+            if verify_one(job):
+                used += job.row.size
         catalog.commit()
         counts = {}
         for result in results:
@@ -2142,12 +2546,16 @@ def _run_verify(args, log, plan_fn=None):
         summary = f"Verify {args.verify}: {_num(len(results))} files  " + "  ".join(
             f"{status} {_num(counts[status])}" for status in sorted(counts))
         log.out(summary)
-        if deep and args.max_gb > 0:
-            log.out(f"Rolling verify: checked {_num(len(catalog_jobs))} files / "
-                    f"{_gb(sum(job.row.size for job in catalog_jobs))}, "
+        if budget is not None:
+            log.out(f"Rolling verify: checked {_num(len(checked_jobs))} files / "
+                    f"{_gb(sum(job.row.size for job in checked_jobs))}, "
                     f"deferred {_num(len(deferred))} files / "
                     f"{_gb(sum(job.row.size for job in deferred))} "
-                    f"(oldest verification first; the next run continues)")
+                    f"(oldest verification first; the next run continues; "
+                    f"a row with a problem does not count against --max-gb)")
+        if outside:
+            log.out(f"{_num(len(outside))} files / {_gb(sum(row.size for row in outside))} "
+                    f"of the catalog are outside these sources: not checked")
         if planned.errors:
             log.out(f"Errors: {_num(len(planned.errors))} folders/files could not be read -> {log.path}")
         log.csv("_verify.csv", ["status", "rel", "source_path", "detail"],
@@ -2194,9 +2602,16 @@ def _build_parser():
                         help="folders without an export (default: %(default)s)")
     parser.add_argument("--c1-cache", action="store_true", default=COPY_CAPTUREONE_CACHE,
                         help="also copy the Capture One Cache folders")
+    parser.add_argument("--no-c1-cache", dest="c1_cache", action="store_false",
+                        default=COPY_CAPTUREONE_CACHE,
+                        help="do not copy the Capture One Cache folders "
+                             "(default: COPY_CAPTUREONE_CACHE)")
     parser.add_argument("--derivatives", action="store_true", default=COPY_JXLPHOTO_DERIVATIVES,
                         help="also copy the JXLs jxl-photo derived from a master that is copied "
                              "(sRGB/mobile copies; skipped by default, the master remakes them)")
+    parser.add_argument("--no-derivatives", dest="derivatives", action="store_false",
+                        default=COPY_JXLPHOTO_DERIVATIVES,
+                        help="skip those JXLs (default: COPY_JXLPHOTO_DERIVATIVES)")
     parser.add_argument("--exclude-folders", default=EXCLUDE_FOLDERS, metavar="NAMES",
                         help="';'-separated folder names skipped anywhere")
     parser.add_argument("--verify-copy", choices=("none", "size", "hash"), default=VERIFY_COPY,

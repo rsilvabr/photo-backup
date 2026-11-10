@@ -25,7 +25,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.12.0"
+__version__ = "0.12.1"
 
 # ---- Settings -------------------------------------------------------------------
 SPACE_MARGIN_GB = 5.0     # free space kept on each restore target drive (default --space-margin-gb)
@@ -94,6 +94,14 @@ def _build_parser():
 
 
 def main(argv=None):
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:   # while planning; the restore itself handles its own (B20)
+        print("Interrupted.", file=sys.stderr)
+        return 130
+
+
+def _main(argv):
     try:                        # a cp1252 console cannot print the owner's ～ paths
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, OSError):
@@ -135,10 +143,14 @@ def main(argv=None):
     else:
         to = None
     patterns = args.only
+    matched = set()
     items = []
     for row in rows:
-        if patterns is not None and not _under_any(row.rel, patterns):
-            continue
+        if patterns is not None:
+            hits = [pattern for pattern in patterns if _under_any(row.rel, [pattern])]
+            if not hits:
+                continue
+            matched.update(hits)
         src = os.path.join(backup, row.rel)
         target = _target_for(row, args)
         if args.to_original and sb._is_under(row.source_path, backup):
@@ -185,6 +197,10 @@ def main(argv=None):
         f"Catalog:   {sb._num(len(rows))} files; selected {sb._num(len(items))}",
         f"Plan:      {plan_text if plan_text else '(nothing to restore)'}",
     ] + space_lines
+    # B21: an --only that matches nothing is named, and the run ends with exit 1
+    unmatched = [pattern for pattern in (patterns or []) if pattern not in matched]
+    for pattern in unmatched:
+        lines.append(f"--only {pattern}: matches nothing in the catalog (not restored)")
     stamp = time.strftime("%y%m%d_%H%M%S")
     try:
         log = sb._Logger(os.path.join(sb.LOG_DIR, f"{stamp}_restore"))
@@ -206,7 +222,7 @@ def main(argv=None):
                     [(status, row.rel, target, "") for status, row, _src, target in items])
             bad = [item for item in items
                    if item[0] in ("MISSING_IN_BACKUP", "REFUSED")]
-            return 1 if bad else 0
+            return 1 if bad or unmatched else 0
         if not args.yes:
             try:
                 answer = input(f"Restore {sb._num(len(restores))} files? [y/N] ")
@@ -287,7 +303,9 @@ def main(argv=None):
             result_counts[status] = result_counts.get(status, 0) + 1
         log.out("Result: " + "  ".join(
             f"{status} {sb._num(count)}" for status, count in sorted(result_counts.items())))
-        return 1 if bad else 0
+        for pattern in unmatched:
+            log.out(f"--only {pattern}: matches nothing in the catalog (not restored)")
+        return 1 if bad or unmatched else 0
     finally:
         log.close()
 

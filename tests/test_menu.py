@@ -49,6 +49,7 @@ def first_run_answers(source, dest, copy="y"):
             "",                  # formats: keep the default
             "",                  # skip inside export: none
             "", "", "",          # unselected, unexported, c1 cache: defaults
+            "", "",              # jxl-photo derivatives, Capture One step: defaults
             "",                  # replace changed: no
             copy,                # step 2/2: copy now?
             "n",                 # save as preset?
@@ -81,7 +82,7 @@ def test_dry_run_abort_never_offers_the_copy(tmp_path, monkeypatch):
     source.mkdir()
     calls = capture_backend(monkeypatch, codes=[2])
     answers = first_run_answers(source, tmp_path / "out")
-    script(monkeypatch, answers[:9] + ["0"])
+    script(monkeypatch, answers[:11] + ["0"])
     assert menu.main([]) == 0
     assert len(calls) == 1
 
@@ -91,7 +92,7 @@ def test_read_errors_need_an_explicit_yes(tmp_path, monkeypatch):
     source.mkdir()
     calls = capture_backend(monkeypatch, codes=[1])
     answers = first_run_answers(source, tmp_path / "out")
-    script(monkeypatch, answers[:9] + ["", "0"])     # Enter on "copy the rest anyway?" = no
+    script(monkeypatch, answers[:11] + ["", "0"])    # Enter on "copy the rest anyway?" = no
     assert menu.main([]) == 0
     assert len(calls) == 1
 

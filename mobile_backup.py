@@ -22,6 +22,12 @@ from the source is deleted from the mirror. Only files this job wrote (listed
 in its state file under STATE_FOLDER) are ever renamed or deleted; anything
 else found in an album folder is left alone, and an album whose new name would
 land on such a file is skipped and reported. The sources are READ-ONLY.
+
+A delete needs proof (v0.1.2): a run only deletes or renumbers the photos whose
+path is under one of the sources it was given (the state also records each
+photo's root); a folder of a source that cannot be read stops every delete and
+rename of that run (exit 1). A photo whose shot time exiftool did not answer for is read
+again on the next run (exit 1), never recorded as "no date".
 """
 
 import argparse
@@ -34,7 +40,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # ---- Sources and destination ---------------------------------------------------
 SOURCES = ""                        # ';'-separated default for --source (e.g. r"G:\2024;G:\2025;G:\2026")
@@ -54,6 +60,7 @@ NUMBER_SEPARATOR = "_"
 # ---- State, copy, exiftool -----------------------------------------------------------
 STATE_FOLDER = ".mobile_backup"     # under the destination; exclude it in FreeFileSync
 STATE_FILE = "state.json"
+STATE_SAVE_EVERY = 20               # copies between two saves of the state (also saved after the renames)
 TEMP_SUFFIX = ".mbtmp"              # in-progress copy, next to its final name
 RENAME_SUFFIX = ".mbren"            # a file between its old and new number
 SPACE_MARGIN_GB = 5.0
@@ -150,13 +157,21 @@ def album_rel(album_dir):
     return rest.lstrip("\\/")
 
 
-def find_photos(sources):
-    """{source file: album rel path} for every file of every mobile folder."""
+def find_photos(sources, errors=None, roots=None):
+    """{source file: album rel path} for every file of every mobile folder.
+    `errors` (a list) receives "folder: reason" for every folder that could not
+    be read -- a folder os.walk cannot list is otherwise silently empty, and
+    its photos would look gone. `roots` (a dict) receives each file's source root."""
     mobile_names = _names(MOBILE_FOLDER_NAMES)
     skip = _names(SYSTEM_SKIP_FOLDERS)
     found = {}
     for root in sources:
-        for current, dirs, files in os.walk(_io(root)):
+        def unreadable(exc, root=root):
+            if errors is not None:
+                folder = _plain(getattr(exc, "filename", None) or _io(root))
+                errors.append(f"{folder}: {getattr(exc, 'strerror', None) or exc}")
+
+        for current, dirs, files in os.walk(_io(root), onerror=unreadable):
             dirs[:] = sorted(d for d in dirs if d.lower() not in skip)
             if os.path.basename(current).lower() not in mobile_names:
                 continue
@@ -166,6 +181,8 @@ def find_photos(sources):
             for name in sorted(files):
                 if os.path.splitext(name)[1].lower() in EXTENSIONS:
                     found[os.path.join(plain, name)] = rel
+                    if roots is not None:
+                        roots[os.path.join(plain, name)] = root
     return found
 
 
@@ -180,7 +197,10 @@ def _shot_key(record):
 
 
 def read_shot_times(paths, log=None):
-    """{path: 'YYYY:MM:DD HH:MM:SS.ffffff' or None}, exiftool in batches."""
+    """{path: 'YYYY:MM:DD HH:MM:SS.ffffff' or None}, exiftool in batches. None =
+    exiftool read the file and it has no date. A path exiftool gave no record
+    for (it failed, timed out or is not installed) is left OUT of the result:
+    it was not read, and must not be remembered as "no date"."""
     result = {}
     paths = list(paths)
     for start in range(0, len(paths), EXIFTOOL_BATCH):
@@ -206,7 +226,8 @@ def read_shot_times(paths, log=None):
         by_path = {os.path.normcase(os.path.abspath(r.get("SourceFile", ""))): r for r in records}
         for path in batch:
             record = by_path.get(os.path.normcase(os.path.abspath(path)))
-            result[path] = _shot_key(record) if record else None
+            if record is not None:
+                result[path] = _shot_key(record)
         if log and len(paths) > EXIFTOOL_BATCH:
             log.out(f"  shot times: {min(start + EXIFTOOL_BATCH, len(paths))}/{len(paths)} read")
     return result
@@ -218,13 +239,38 @@ def _state_path(dest):
     return os.path.join(dest, STATE_FOLDER, STATE_FILE)
 
 
-def load_state(dest):
+def load_state(dest, meta=None):
+    """The state's files. `meta` (a dict) receives the state's "tool"."""
     path = _state_path(dest)
     if not os.path.exists(_io(path)):
         return {}
     with open(_io(path), encoding="utf-8") as handle:
         data = json.load(handle)    # an unreadable state aborts: never guess what we wrote
+    if meta is not None:
+        meta["tool"] = data.get("tool")
     return data.get("files", {})
+
+
+def _tool_version(tool):
+    """(0, 1, 2) from "mobile_backup 0.1.2"; None when it cannot be read."""
+    match = re.fullmatch(r"mobile_backup (\d+)\.(\d+)\.(\d+)", str(tool or "").strip())
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def forget_old_null_shots(state, tool):
+    """A state written before 0.1.2 may hold shot = null from an exiftool that
+    failed (0.1.1 recorded that as "no date"). Every null shot of such a state
+    is read once more (S2); the state saved after it carries this version, so a
+    photo read and really without a date is not read again."""
+    version = _tool_version(tool)
+    if version is not None and version >= (0, 1, 2):
+        return 0
+    count = 0
+    for rec in state.values():
+        if "shot" in rec and rec["shot"] is None:
+            del rec["shot"]
+            count += 1
+    return count
 
 
 def save_state(dest, files):
@@ -262,8 +308,20 @@ def numbered_names(entries):
             for index, (source, _shot) in enumerate(ordered)}
 
 
-def plan(photos, stats, shots, state, dest):
-    """Decide copies, renames and deletes. Returns a dict of lists."""
+def _under_run(source, run_roots):
+    """Whether a photo of the state belongs to this run: its path is under one of
+    the run's sources, which were read in full (a read error stops every delete).
+    Decided by the path, not by the root recorded in the state: after a test run
+    with a narrower --source, a photo deleted from the source must still leave
+    the mirror on the next normal run."""
+    return any(_is_inside(source, root) for root in run_roots)
+
+
+def plan(photos, stats, shots, state, dest, run_roots=None):
+    """Decide copies, renames and deletes. Returns a dict of lists. With
+    `run_roots`, a photo of the state that is not under one of them is never
+    deleted (it is listed in "elsewhere"), and an album whose numbers would
+    land on one is skipped."""
     albums = {}
     for source, rel in photos.items():
         albums.setdefault(rel, []).append((source, shots.get(source)))
@@ -273,7 +331,8 @@ def plan(photos, stats, shots, state, dest):
             desired[source] = os.path.join(rel, name)
 
     tracked = {rec["dest"].lower(): source for source, rec in state.items()}
-    actions = {"copy": [], "rename": [], "delete": [], "keep": [], "conflict": [], "kept_changed": []}
+    actions = {"copy": [], "rename": [], "delete": [], "keep": [], "conflict": [], "kept_changed": [],
+               "elsewhere": []}
 
     blocked = set()
     for source, rel_dest in desired.items():
@@ -283,6 +342,9 @@ def plan(photos, stats, shots, state, dest):
         owner = tracked.get(rel_dest.lower())
         # a file we did not write, or one of ours that was changed since: never overwrite it
         if owner is None or os.path.getsize(_io(target)) != state[owner]["size"]:
+            blocked.add(photos[source])
+        # nor a photo of a source this run was not given
+        elif run_roots is not None and owner not in photos and not _under_run(owner, run_roots):
             blocked.add(photos[source])
     for rel in sorted(blocked):
         actions["conflict"].append(rel)
@@ -308,6 +370,9 @@ def plan(photos, stats, shots, state, dest):
 
     for source, rec in sorted(state.items()):
         if source in desired:       # still in a source (renamed, kept, or its album skipped)
+            continue
+        if run_roots is not None and not _under_run(source, run_roots):
+            actions["elsewhere"].append(source)     # not proof that it is gone
             continue
         current = os.path.join(dest, rec["dest"])
         if not os.path.exists(_io(current)):
@@ -353,7 +418,9 @@ def cleanup_leftovers(dest, log):
                 log.log(f"LEFTOVER removed {name}")
 
 
-def execute(actions, photos, stats, shots, state, dest, log):
+def execute(actions, photos, stats, shots, state, dest, log, unread=frozenset(), roots=None):
+    """`unread`: photos whose shot time was not read (their state gets no
+    "shot", so the next run reads them again); `roots`: each photo's source root."""
     errors = 0
     # 1. renames, step one: every renamed file leaves its old name first
     moving = []
@@ -381,6 +448,8 @@ def execute(actions, photos, stats, shots, state, dest, log):
         os.replace(_io(tmp), _io(target))
         state[source]["dest"] = new
         log.log(f"RENAME {new}")
+    if moving or actions["delete"]:
+        save_state(dest, state)     # a kill after this point does not leave the old names (B13)
     # 4. copies
     for done, (source, rel_dest) in enumerate(actions["copy"], 1):
         try:
@@ -390,12 +459,17 @@ def execute(actions, photos, stats, shots, state, dest, log):
             errors += 1
             continue
         size, mtime_ns = stats[source]
-        state[source] = {"dest": rel_dest, "size": size, "mtime_ns": mtime_ns,
-                         "shot": shots.get(source)}
+        rec = {"dest": rel_dest, "size": size, "mtime_ns": mtime_ns}
+        if source not in unread:
+            rec["shot"] = shots.get(source)
+        if roots is not None and roots.get(source):
+            rec["root"] = roots[source]
+        state[source] = rec
         log.log(f"COPY {rel_dest}")
+        if STATE_SAVE_EVERY > 0 and done % STATE_SAVE_EVERY == 0:
+            save_state(dest, state)
         if done % 200 == 0:
             print(f"  copied {done}/{len(actions['copy'])}")
-            save_state(dest, state)
     _remove_empty_dirs(dest, [old for _s, old in actions["delete"]] +
                        [old for _s, old, _n in actions["rename"]])
     return errors
@@ -434,28 +508,59 @@ def run(args, log):
         if _is_inside(dest, source) or _is_inside(source, dest):
             log.out(f"ERROR: the destination and a source contain each other: {dest} / {source}")
             return 2
+    meta = {}
     try:
-        state = load_state(dest)
+        state = load_state(dest, meta)
     except (OSError, ValueError) as exc:
         log.out(f"ERROR: cannot read the state file {_state_path(dest)}: {exc}")
         return 2
+    reread = forget_old_null_shots(state, meta.get("tool"))
+    if reread:
+        log.log(f"{reread} null shot time(s) of a state written by {meta.get('tool') or 'an older version'}: "
+                f"read again")
 
     started = time.time()
     log.out(f"Scanning {len(sources)} source(s)...")
-    photos = find_photos(sources)
+    read_errors = []
+    roots = {}
+    photos = find_photos(sources, read_errors, roots)
     stats = {}
-    for source in photos:
-        st = os.stat(_io(source))
+    for source in list(photos):
+        try:
+            st = os.stat(_io(source))
+        except OSError as exc:
+            read_errors.append(f"{source}: {exc.strerror or exc}")
+            del photos[source]
+            continue
         stats[source] = (st.st_size, st.st_mtime_ns)
-    need = [s for s in photos
-            if not (s in state and state[s]["size"] == stats[s][0]
-                    and state[s]["mtime_ns"] == stats[s][1])]
+
+    def unchanged(s):
+        return s in state and state[s]["size"] == stats[s][0] and state[s]["mtime_ns"] == stats[s][1]
+
+    # "shot" missing from the state = exiftool did not answer last time: read again
+    need = [s for s in photos if not (unchanged(s) and "shot" in state[s])]
     shots = {s: state[s].get("shot") for s in photos if s not in need}
+    unread = set()
     if need:
         log.out(f"Reading the shot time of {len(need)} new or changed file(s)...")
-        shots.update(read_shot_times(need, log))
+        read = read_shot_times(need, log)
+        unread = {s for s in need if s not in read}
+        shots.update(read)
+        for s in need:
+            if s in read and unchanged(s):
+                state[s]["shot"] = read[s]
+    for source in photos:
+        if source in state:
+            state[source]["root"] = roots[source]
 
-    actions = plan(photos, stats, shots, state, dest)
+    actions = plan(photos, stats, shots, state, dest, sources)
+    if read_errors:
+        # A folder that could not be read looks empty: its photos would be
+        # deleted, or renamed over. Only new photos go to free names this run.
+        actions["delete"] = []
+        actions["rename"] = []
+        actions["copy"] = [(s, r) for s, r in actions["copy"]
+                           if s not in state and not os.path.exists(_io(os.path.join(dest, r)))]
     albums = len(set(photos.values()))
     no_date = sum(1 for s in photos if not shots.get(s))
     copy_bytes = sum(stats[s][0] for s, _r in actions["copy"])
@@ -467,6 +572,18 @@ def run(args, log):
         log.out(f"SKIPPED album {rel}: a file this job did not write is in the way")
     for rel in actions["kept_changed"]:
         log.out(f"LEFT ALONE {rel}: changed since this job wrote it")
+    if actions["elsewhere"]:
+        log.out(f"{len(actions['elsewhere'])} photo(s) of sources not given in this run "
+                f"were left alone")
+    for error in read_errors:
+        log.out(f"ERROR cannot read {error}")
+    if read_errors:
+        log.out(f"{len(read_errors)} folder(s)/file(s) of the sources could not be read: "
+                f"nothing is deleted or renamed in this run, only new photos are copied.")
+    if unread:
+        log.out(f"WARNING the shot time of {len(unread)} file(s) was not read (exiftool did "
+                f"not answer): numbered by name for now, read again on the next run.")
+    problems = 1 if read_errors or unread else 0
     if args.dry_run:
         for source, rel_dest in actions["copy"]:
             log.log(f"would COPY {rel_dest}")
@@ -475,7 +592,7 @@ def run(args, log):
         for _s, old in actions["delete"]:
             log.log(f"would DELETE {old}")
         log.out("Dry run: nothing changed.")
-        return 0
+        return problems
 
     os.makedirs(_io(dest), exist_ok=True)
     free = shutil.disk_usage(_io(dest)).free
@@ -485,12 +602,12 @@ def run(args, log):
         return 2
     cleanup_leftovers(dest, log)
     try:
-        errors = execute(actions, photos, stats, shots, state, dest, log)
+        errors = execute(actions, photos, stats, shots, state, dest, log, unread, roots)
     finally:
         save_state(dest, state)
     log.out(f"Done in {time.time() - started:.0f}s: {errors} error(s), "
             f"{len(actions['conflict'])} album(s) skipped.")
-    return 1 if errors or actions["conflict"] else 0
+    return 1 if errors or actions["conflict"] or problems else 0
 
 
 def main(argv=None):

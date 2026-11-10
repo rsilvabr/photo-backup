@@ -24,7 +24,7 @@ import string
 import subprocess
 import sys
 
-__version__ = "0.12.0"
+__version__ = "0.12.1"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
@@ -40,6 +40,13 @@ FORMAT_ALTERNATIVES = {         # offered next to the backend's EXPORT_FORMATS d
     "jxl>jpg": "the JXL, else the JPEG (never the TIFF)",
     "jxl+jpg": "both the JXL and the JPEG",
     "all": "everything inside the export folders",
+}
+UNSELECTED_TEXT = {             # what each --unselected value means (the values come from the backend)
+    "skip": "leave them (the outtakes)",
+    "raw": "copy their RAW files and sidecars",
+    "raw_or_jpeg": "RAW + sidecars + every JPEG, TIFF, PNG, HEIC or PSD that has no RAW beside it",
+    "raw_jpeg": "RAW + sidecars + every JPEG + every TIFF, PNG, HEIC or PSD that has no RAW beside it",
+    "all": "copy every file beside the export folder",
 }
 
 KIND_BACKUP = "backup"
@@ -73,6 +80,14 @@ def _backend():
 
 def _setting(name):
     return getattr(_backend(), name)
+
+
+def _backend_choices(dest):
+    """The values the backend's parser accepts for one option (by its dest)."""
+    for action in _backend()._build_parser()._actions:
+        if action.dest == dest and action.choices:
+            return list(action.choices)
+    raise KeyError(dest)
 
 
 _CAPTUREONE_MODULE = None
@@ -216,6 +231,7 @@ def default_session():
         "c1_cache": bool(_setting("COPY_CAPTUREONE_CACHE")),
         "derivatives": bool(_setting("COPY_JXLPHOTO_DERIVATIVES")),
         "captureone": bool(COPY_CAPTUREONE_SETTINGS),
+        "captureone_verify": bool(COPY_CAPTUREONE_SETTINGS),
         "update_changed": False,
         "verify_mode": VERIFY_MODE,
         "max_gb": _setting("VERIFY_MAX_GB"),
@@ -224,7 +240,11 @@ def default_session():
 
 def session_from(saved):
     session = default_session()
-    session.update({key: value for key, value in (saved or {}).items() if key in session})
+    saved = saved or {}
+    session.update({key: value for key, value in saved.items() if key in session})
+    if "captureone_verify" not in saved:
+        # a config or preset written before the verify had its own key (S6)
+        session["captureone_verify"] = session["captureone"]
     return session
 
 
@@ -240,11 +260,11 @@ def build_argv(session, mode):
              "--export-formats", session["export_formats"],
              "--exclude-export-subfolders", session["exclude_export_subfolders"],
              "--unselected", session["unselected"],
-             "--unexported", session["unexported"]]
-    if session["c1_cache"]:
-        argv.append("--c1-cache")
-    if session["derivatives"]:
-        argv.append("--derivatives")
+             "--unexported", session["unexported"],
+             # always one of the two forms: a True default at the top of
+             # selective_backup.py must not turn a "no" shown here into a yes
+             "--c1-cache" if session["c1_cache"] else "--no-c1-cache",
+             "--derivatives" if session["derivatives"] else "--no-derivatives"]
     if mode == "verify":
         argv += ["--verify", session["verify_mode"]]
         if session["verify_mode"] == "full":
@@ -269,11 +289,20 @@ def describe(session):
         f"  Capture One cache: {'copy' if session['c1_cache'] else 'skip'}   "
         f"Replace changed originals/exports: {'yes' if session['update_changed'] else 'no'}",
         "  jxl-photo derivatives of a copied master: "
-        + ("copy" if session["derivatives"] else "skip (COPY_JXLPHOTO_DERIVATIVES)"),
+        + _choice_text(session["derivatives"],
+                       bool(_setting("COPY_JXLPHOTO_DERIVATIVES")), "COPY_JXLPHOTO_DERIVATIVES"),
         "  Capture One profiles, styles and settings: "
-        + ("copy" if session["captureone"] else "skip (COPY_CAPTUREONE_SETTINGS)"),
+        + _choice_text(session["captureone"], bool(COPY_CAPTUREONE_SETTINGS),
+                       "COPY_CAPTUREONE_SETTINGS"),
     ]
     return "\n".join(lines)
+
+
+def _choice_text(value, default, setting):
+    """'copy' / 'skip', naming the setting only when the value is its default:
+    a choice remembered in the config is never blamed on the setting."""
+    text = "copy" if value else "skip"
+    return f"{text} ({setting})" if value == default else f"{text} (your choice)"
 
 
 # ---- Drives ------------------------------------------------------------------------------------
@@ -362,6 +391,32 @@ def ask_formats(current):
             say(f"  {exc}", "yellow")
 
 
+def ask_unselected(current):
+    """--unselected, offering every value the backend accepts. The current value
+    is always among them and marked: Enter keeps it (a value missing from the
+    list used to make Enter choose the first one, 'skip')."""
+    choices = _backend_choices("unselected")
+    if current not in choices:
+        current = _setting("UNSELECTED")
+    say("  Originals of photos that were NOT exported:")
+    return choose("Not exported", [(value, UNSELECTED_TEXT.get(value, "see the README"))
+                                   for value in choices], current)
+
+
+def ask_max_gb(current):
+    while True:
+        answer = ask("Max GB to verify in this run (0 = everything)", current)
+        try:
+            value = float(answer)
+        except ValueError:
+            say("  Type a number >= 0.", "yellow")
+            continue
+        if value < 0:
+            say("  Type a number >= 0.", "yellow")
+            continue
+        return value
+
+
 def edit_session(session, verify=False):
     session = dict(session)
     title("Verify a backup" if verify else "What to back up")
@@ -373,33 +428,29 @@ def edit_session(session, verify=False):
         session["exclude_export_subfolders"] or "-")
     if session["exclude_export_subfolders"] == "-":
         session["exclude_export_subfolders"] = ""
-    say("  Originals of photos that were NOT exported:")
-    session["unselected"] = choose("Not exported", [
-        ("skip", "leave them (the outtakes)"),
-        ("raw", "copy their RAW files and sidecars"),
-        ("all", "copy every file beside the export folder")], session["unselected"])
+    session["unselected"] = ask_unselected(session["unselected"])
     say("  Folders that have no export folder at all:")
     session["unexported"] = choose("Without export", [
         ("skip", "only list them in the report"),
         ("copy", "copy everything in them")], session["unexported"])
     session["c1_cache"] = yes_no("Copy the Capture One Cache (previews, regenerable)?", session["c1_cache"])
+    session["derivatives"] = yes_no(
+        "Copy the jxl-photo derivatives (sRGB/mobile JXLs) of a master that is copied?",
+        session["derivatives"])
+    if verify:      # its own key: a "no" here never turns the backup's step off (S6)
+        session["captureone_verify"] = yes_no(
+            "Also verify Capture One's own files (profiles, styles, settings) when the backup "
+            "has them?", session["captureone_verify"])
+    else:
+        session["captureone"] = yes_no(
+            "Also back up Capture One's own files (profiles, styles, settings)?",
+            session["captureone"])
     if verify:
         session["verify_mode"] = choose("Verify", [
             ("quick", "sizes and dates only (seconds)"),
             ("full", "re-read and hash both sides (hours on a big backup)")], session["verify_mode"])
         if session["verify_mode"] == "full":
-            while True:
-                answer = ask("Max GB to verify in this run (0 = everything)", session["max_gb"])
-                try:
-                    value = float(answer)
-                except ValueError:
-                    say("  Type a number >= 0.", "yellow")
-                    continue
-                if value < 0:
-                    say("  Type a number >= 0.", "yellow")
-                    continue
-                session["max_gb"] = value
-                break
+            session["max_gb"] = ask_max_gb(session["max_gb"])
     else:
         session["update_changed"] = yes_no(
             "Replace originals/exports that changed since the last backup "
@@ -433,7 +484,7 @@ def captureone_step(session, mode):
 
 def captureone_verify_step(session):
     """Verify Capture One's files too, when this backup holds them."""
-    if not session["captureone"]:
+    if not session.get("captureone_verify", session["captureone"]):
         return 0
     if not os.path.isdir(os.path.join(session["dest"], _captureone_setting("BACKUP_SUBFOLDER"))):
         return 0
@@ -681,8 +732,23 @@ def manifest_flow(config):
         mode = choose("Verify", [
             ("quick", "sizes and dates only (seconds)"),
             ("full", "re-read and hash both sides (hours on a big backup)")], VERIFY_MODE)
+        argv = ["--manifest", manifest, "--dest", dest, "--verify", mode]
+        if mode == "full":
+            argv += ["--max-gb", str(ask_max_gb(_setting("VERIFY_MAX_GB")))]
+        step = {"dest": dest, "captureone": False, "captureone_verify": False}
+        if os.path.isdir(os.path.join(dest, _captureone_setting("BACKUP_SUBFOLDER"))):
+            remembered = config.get("last_manifest_captureone_verify",
+                                    config.get("last_manifest_captureone",
+                                               COPY_CAPTUREONE_SETTINGS))
+            step["captureone_verify"] = yes_no(
+                "Also verify Capture One's own files (profiles, styles, settings)?",
+                bool(remembered))
+            config["last_manifest_captureone_verify"] = step["captureone_verify"]
+            save_config(config)
         title(f"Verifying ({mode})")
-        rc = run_manifest(["--manifest", manifest, "--dest", dest, "--verify", mode])
+        rc = run_manifest(argv)
+        if rc in (0, 1):
+            rc = max(rc, 1 if captureone_verify_step(step) else 0)
         if rc == 0:
             say("Verify: everything matches.", "green")
         elif rc == 1:
@@ -692,6 +758,18 @@ def manifest_flow(config):
         return rc
     if choice != "2":
         return 0
+    # the same steps as [1]: Capture One's own files, and replacing what changed
+    step = {"dest": dest,
+            "captureone": yes_no("Also back up Capture One's own files (profiles, styles, "
+                                 "settings)?",
+                                 bool(config.get("last_manifest_captureone",
+                                                 COPY_CAPTUREONE_SETTINGS)))}
+    update_changed = yes_no("Replace originals/exports that changed since the last backup "
+                            "(old copy kept in versions)?",
+                            bool(config.get("last_manifest_update_changed", False)))
+    config["last_manifest_captureone"] = step["captureone"]
+    config["last_manifest_update_changed"] = update_changed
+    save_config(config)
     title("Step 1/2 - what would be copied (dry-run, nothing is written)")
     rc = run_manifest(["--manifest", manifest, "--dest", dest, "--dry-run"])
     if rc == 2:
@@ -699,6 +777,7 @@ def manifest_flow(config):
         return rc
     if rc == 130:
         return rc
+    captureone_step(step, "dry-run")
     if rc == 1:
         say("Some folders or files could not be read: they would NOT be backed up "
             "(see the log).", "yellow")
@@ -708,7 +787,12 @@ def manifest_flow(config):
         say("Nothing copied.")
         return 0
     title("Copying")
-    rc = run_manifest(["--manifest", manifest, "--dest", dest, "--yes"])
+    argv = ["--manifest", manifest, "--dest", dest, "--yes"]
+    if update_changed:
+        argv.append("--update-changed")
+    rc = run_manifest(argv)
+    if rc in (0, 1):
+        rc = max(rc, 1 if captureone_step(step, "copy") else 0)
     say(f"Manifest backup: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.",
         "green" if rc == 0 else "yellow")
     return rc
