@@ -28,6 +28,7 @@ A selective backup for photographers' archives. It backs up **the photos you exp
 - [Restoring](#restoring)
 - [Every option](#every-option) · [Settings](#settings) · [Logs](#logs) · [Exit codes](#exit-codes)
 - [Current version](#current-version) · [Changelog](#changelog)
+- [Related project: photo-backup as a Windows program](#related-project-photo-backup-as-a-windows-program)
 - [Run it after jxl-photo](#run-it-after-jxl-photo) · [Related project: jxl-photo](#related-project-jxl-photo)
 - [Disclaimer](#disclaimer) · [License](#license) · [Acknowledgments](#acknowledgments)
 
@@ -109,6 +110,9 @@ The menu never copies anything itself — it runs `selective_backup.py` (or `res
 ---
 
 ## Requirements & Installation
+
+> Rather not install Python? A Windows program packages everything: see
+> [photo-backup-exe](#related-project-photo-backup-as-a-windows-program).
 
 - **Python 3.12 or newer.** Nothing else: the standard library only — no packages, no external tools.
 - **Windows.** All file I/O uses extended-length `\\?\` paths, so paths longer than 260 characters (Japanese folder names, deep sessions) work.
@@ -890,6 +894,14 @@ Japanese file names.
 | v0.2.0 | 2026-10-07 | First release: exported photos with their originals and edits, SHA-256 catalog, verify, space check |
 
 What each version changed, in detail: [docs/version_history.md](docs/version_history.md).
+
+---
+
+## Related project: photo-backup as a Windows program
+
+[photo-backup-exe](https://github.com/rsilvabr/photo-backup-exe) packages this backup as `photo-backup.exe`: no Python to install. Unzip and double-click for the menu, or use the same command lines as here (`photo-backup.exe backup ...`, `manifest`, `restore`, `captureone`). The scripts inside are byte-for-byte those of a photo-backup release, and the settings at their top can be edited there as here. Presets and backups are shared: a backup made by one version is continued, verified and restored by the other.
+
+This Python version, the one I run on my own archive, remains by far the more tested. Use the program if you would rather not install Python; otherwise use the scripts here.
 
 ---
 
