@@ -2,6 +2,8 @@
 
 You shoot 400 frames, the RAWs land in one folder, and the 30 you keep are exported into an `_EXPORT` folder inside it. photo-backup reads that export folder and backs up **those 30 photos**: the exports, plus — picked out of the 400 — their RAW, camera JPEG, edited TIFF and sidecars, plus your Capture One and NX Studio edits. The rest stays behind, or comes along folder by folder if you choose. Read-only on the source, never deletes on the destination, and verifies the backup on any later day with SHA-256. Tested on a 9 TB archive of Capture One, Lightroom and NX Studio sessions from 1991 to 2026.
 
+Every backup from the menu also keeps **Capture One itself**. Your `.cos` edits only *name* the ICC profiles, film curves and styles they use; on a computer without those files the same edit looks different. The backup keeps them, with your presets, recipes, shortcuts and workspaces, and a double-click restore (no Python needed) puts them back on a new computer: Capture One opens your photos with the same look and the same setup. Login data and the licence stay out. [Details](#capture-ones-own-files-captureone_backuppy-v060).
+
 **Windows program, no Python needed:** [photo-backup-exe](https://github.com/rsilvabr/photo-backup-exe/releases/latest) — unzip and double-click.
 
 ---
