@@ -231,7 +231,8 @@ def test_expect_backup_id(tmp_path):
     assert not none.exists()
 
 
-def test_rolling_verify_oldest_first(tmp_path, capsys):
+def test_rolling_verify_oldest_first(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(selective_backup, "VERIFY_CSV_OK", True)    # the CSV names every file checked
     make_tree(tmp_path, {
         "G/2025/shoot/_EXPORT/x/a_v1.jpg": 1_000_000,
         "G/2025/shoot/_EXPORT/x/b_v1.jpg": 1_000_000,

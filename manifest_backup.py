@@ -35,7 +35,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 
 # ---- Settings -------------------------------------------------------------------
 MODES_FILE = "backup_modes.csv"     # next to this script; --modes reads another
@@ -275,13 +275,13 @@ def _row_args(args, folder, unselected, unexported=False):
     return row_args
 
 
-def _plan_row(row, rows, modes, args, list_cache, originals=None, mode=None):
+def _plan_row(row, rows, modes, args, list_cache, originals=None, mode=None, role_cache=None):
     mode = modes[row.mode] if mode is None else mode
     originals = row.originals if originals is None else originals
     planner = sb._Planner(_row_args(args, row.folder, _row_unselected(mode, originals),
                                     mode.unexported),
                           list_cache, _skip_paths_for(row.folder, rows),
-                          _row_rules(mode, originals))
+                          _row_rules(mode, originals), role_cache)
     planner.build()
     return planner
 
@@ -390,7 +390,12 @@ def _run(parsed, rows, modes, stamp, argv):
         list_cache = {}
 
         def plan_fn(plan_args):
-            return _plan_rows(rows, modes, plan_args, list_cache)
+            try:
+                return _plan_rows(rows, modes, plan_args, list_cache)
+            finally:
+                # the listing of the whole source (0.5 GB for 1.2 M files) is
+                # only needed while the lines are planned, not during the copy
+                list_cache.clear()
 
         try:
             if parsed.verify:
@@ -404,23 +409,24 @@ def _run(parsed, rows, modes, stamp, argv):
         log.close()
 
 
-def _analysis_counts(row, rows, modes, args, list_cache, mode, errors):
+def _analysis_counts(row, rows, modes, args, list_cache, mode, errors, role_cache=None):
     """{originals: (files, bytes)} for one mode of one manifest line, through
     the same _Planner the copy uses. A mode that has no unselected originals
     and no AddFolders does not depend on Originals: it is planned once. What
     could not be read goes to `errors` (a folder is scanned once: the cache
-    reports it to the first planner only)."""
+    reports it to the first planner only). `role_cache`: a JXL read to tell a
+    master from a derivative is read once, not once per mode and Originals."""
     if mode.unselected or mode.add_folders:
         counts = {}
         for originals in ANALYSIS_ORIGINALS:
             planner = _plan_row(row, rows, modes, args, list_cache,
-                                originals=originals, mode=mode)
+                                originals=originals, mode=mode, role_cache=role_cache)
             errors.extend(planner.errors)
             counts[originals] = (len(planner.files),
                                  sum(item.size for item in planner.files))
         return counts
     planner = _plan_row(row, rows, modes, args, list_cache,
-                        originals=ANALYSIS_ORIGINALS[0], mode=mode)
+                        originals=ANALYSIS_ORIGINALS[0], mode=mode, role_cache=role_cache)
     errors.extend(planner.errors)
     count = (len(planner.files), sum(item.size for item in planner.files))
     return {originals: count for originals in ANALYSIS_ORIGINALS}
@@ -452,6 +458,7 @@ def _analyze_rows(parsed, rows, modes, stamp, log):
     """The --analyze loop (log already open)."""
     backend_args = _backend_args(parsed, rows, os.getcwd())
     list_cache = {}
+    role_cache = {}
     errors = []
     results = []
     total_files = 0
@@ -462,7 +469,8 @@ def _analyze_rows(parsed, rows, modes, stamp, log):
                 f"({sb._hms(time.monotonic() - started)})")
         line_rows = []
         for mode in modes.values():
-            counts = _analysis_counts(row, rows, modes, backend_args, list_cache, mode, errors)
+            counts = _analysis_counts(row, rows, modes, backend_args, list_cache, mode, errors,
+                                      role_cache)
             for originals in ANALYSIS_ORIGINALS:
                 files, nbytes = counts[originals]
                 chosen = mode.name == row.mode and originals == row.originals

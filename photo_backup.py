@@ -20,11 +20,12 @@ import importlib.util
 import json
 import os
 import shutil
+import sqlite3
 import string
 import subprocess
 import sys
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
@@ -35,6 +36,7 @@ CAPTUREONE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captureon
 MANIFEST_BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifest_backup.py")
 COPY_CAPTUREONE_SETTINGS = True # every backup also keeps Capture One's profiles, styles and settings
 VERIFY_MODE = "quick"           # default verify mode offered by the menu: quick | full
+MAX_ONLY_CHARS = 20000          # [5] Restore: the --only values of one command (Windows takes about 32 000 characters)
 FORMAT_ALTERNATIVES = {         # offered next to the backend's EXPORT_FORMATS default
     "jxl>tif>jpg": "best per photo: the JXL master, else the TIFF, else the JPEG",
     "jxl>jpg": "the JXL, else the JPEG (never the TIFF)",
@@ -269,10 +271,10 @@ def build_argv(session, mode):
         argv += ["--verify", session["verify_mode"]]
         if session["verify_mode"] == "full":
             argv += ["--max-gb", str(session["max_gb"])]
-    elif mode == "dry-run":
-        argv.append("--dry-run")
     else:
-        argv.append("--yes")
+        argv.append("--dry-run" if mode == "dry-run" else "--yes")
+        # in the dry-run too: the plan the user confirms must count the changed
+        # files that the copy will replace (and the space they take)
         if session["update_changed"]:
             argv.append("--update-changed")
     return argv
@@ -629,9 +631,16 @@ def presets_menu(config):
 
 # ---- Restore -----------------------------------------------------------------------------------
 def _catalog_folder_rows(backup):
+    """The backup by folder: [(label, files, bytes, only), ...], `only` being
+    the --only values that restore exactly that line. The files that sit
+    above the listed folders (loose in the year, or in the backup's root) get
+    a line of their own, restored file by file: --only <their folder> would
+    restore everything below it."""
     catalog = _backend()._Catalog(backup, create=False, readonly=True)
     try:
         rows = catalog.all_rows()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"cannot read catalog {catalog.path}: {exc}")
     finally:
         catalog.close()
     firsts = {row.rel.split("\\")[0] for row in rows}
@@ -639,10 +648,21 @@ def _catalog_folder_rows(backup):
     groups = {}
     for row in rows:
         parts = row.rel.replace("/", "\\").split("\\")[:-1]
-        folder = "\\".join(parts[:depth]) if parts else ""
-        count, nbytes = groups.get(folder, (0, 0))
-        groups[folder] = (count + 1, nbytes + row.size)
-    return sorted(groups.items())
+        loose = len(parts) < depth
+        folder = "\\".join(parts[:depth])
+        entry = groups.setdefault((folder, loose), [0, 0, []])
+        entry[0] += 1
+        entry[1] += row.size
+        if loose:
+            entry[2].append(row.rel)
+    listed = []
+    for (folder, loose), (count, nbytes, files) in sorted(groups.items()):
+        if loose:
+            where = folder or "the backup's root"
+            listed.append((f"(files directly in {where})", count, nbytes, files))
+        else:
+            listed.append((folder, count, nbytes, [folder]))
+    return listed
 
 
 def restore_flow(config):
@@ -659,9 +679,9 @@ def restore_flow(config):
             say(f"  {exc}", "yellow")
             continue
         break
-    total = sum(count for _folder, (count, _bytes) in folders)
+    total = sum(count for _folder, count, _bytes, _only in folders)
     say(f"  In the backup, by folder ({_backend()._num(total)} files):")
-    for index, (folder, (count, nbytes)) in enumerate(folders, 1):
+    for index, (folder, count, nbytes, _only) in enumerate(folders, 1):
         say(f"    [{index}] {folder:<40} {_backend()._gb(nbytes):>10}  ({count} files)")
     answer = ask("What to restore (a folder from the list or a path inside it; "
                  "separate several with ';'; Enter = everything)", "")
@@ -671,9 +691,13 @@ def restore_flow(config):
         if not part:
             continue
         if part.isdigit() and 1 <= int(part) <= len(folders):
-            only.append(folders[int(part) - 1][0])
+            only.extend(folders[int(part) - 1][3])
         else:
             only.append(part)
+    if len(subprocess.list2cmdline(only)) > MAX_ONLY_CHARS:
+        say("  Too many loose files for one command: restore the folder above them "
+            "(type its path), or everything.", "yellow")
+        return 2
     destination = choose("Where to restore", [
         ("original", "original place (where each file came from)"),
         ("folder", "another folder")], "original")
@@ -771,7 +795,9 @@ def manifest_flow(config):
     config["last_manifest_update_changed"] = update_changed
     save_config(config)
     title("Step 1/2 - what would be copied (dry-run, nothing is written)")
-    rc = run_manifest(["--manifest", manifest, "--dest", dest, "--dry-run"])
+    # the same choices as the copy below: what is confirmed is what runs
+    update_argv = ["--update-changed"] if update_changed else []
+    rc = run_manifest(["--manifest", manifest, "--dest", dest, "--dry-run"] + update_argv)
     if rc == 2:
         say(f"Dry-run: {_EXIT_TEXT[2]}.", "red")
         return rc
@@ -787,10 +813,7 @@ def manifest_flow(config):
         say("Nothing copied.")
         return 0
     title("Copying")
-    argv = ["--manifest", manifest, "--dest", dest, "--yes"]
-    if update_changed:
-        argv.append("--update-changed")
-    rc = run_manifest(argv)
+    rc = run_manifest(["--manifest", manifest, "--dest", dest, "--yes"] + update_argv)
     if rc in (0, 1):
         rc = max(rc, 1 if captureone_step(step, "copy") else 0)
     say(f"Manifest backup: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.",

@@ -9,7 +9,8 @@ releases are also published as
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **[v0.13.0](#v0130)** | 2026-11-11 | A session leaves out only the subfolders its mode names (`LeaveOut`, `_OUTTAKES*` in the shipped modes); any other one is judged alone, so a `+` mode copies it |
+| **[v0.13.1](#v0131)** | 2026-11-11 | Second bug sweep: a `--verify full` that survives unreadable files and Ctrl+C and reads both disks at once; small files copied and verified faster; a damaged catalog and odd file dates no longer end a run with a traceback; shorter CSVs |
+| [v0.13.0](#v0130) | 2026-11-11 | A session leaves out only the subfolders its mode names (`LeaveOut`, `_OUTTAKES*` in the shipped modes); any other one is judged alone, so a `+` mode copies it |
 | [v0.12.1](#v0121) | 2026-11-11 | Bug sweep: nothing left out without a count, a bigger mode never copies less, a source that cannot be read is not a source that is gone, the rolling verify keeps turning; `Originals=raw` keeps a photo whose only original is a TIFF, PNG, HEIC or PSD; `[7] Manifest` does what `[1]` does |
 | [v0.12.0](#v0120) | 2026-11-10 | A file never counts as saved when the right content cannot be restored: eight fixes from an audit; `manifest_backup.py --verify` |
 | [v0.11.0](#v0110) | 2026-11-10 | A manifest line can leave a folder out (`skip`) or keep only one type of file in it (`raw-only`, `jpeg-only`, `jxl-only`) |
@@ -26,6 +27,122 @@ releases are also published as
 | v0.1.0 | 2026-10-06 | First implementation, not released |
 
 `mobile_backup.py` has its own version: [see the end of this page](#mobile_backuppy).
+
+---
+
+## v0.13.1
+
+**Released 2026-11-11.** Fixes and speed from a second bug sweep of v0.13.0 (29
+findings, 10 optimizations). None of the findings was a silent loss of an
+original in the main backup. Nothing to do when upgrading; three things look
+different afterwards, listed first.
+
+**What changes on the screen and in `Logs\`**
+
+- `_plan.csv` of a run that copies lists the files that are `NEW` or
+  `CHANGED`, not the `UP_TO_DATE` ones (a `--dry-run` still lists every
+  planned file). `_verify.csv`, and the verify's `_plan.csv`, list the files
+  that are not `OK`. On a 425 000-file backup the full lists were 83 MB per
+  run. `PLAN_CSV_UP_TO_DATE = True` and `VERIFY_CSV_OK = True` at the top of
+  `selective_backup.py` bring them back. What each choice gives and costs:
+  short lists are small and show only what changed or is wrong, but the CSV of
+  a copy is no longer the list of everything in the backup, and after a
+  rolling verify it no longer says which files were checked that night; full
+  lists keep both, at 83 MB or more per run
+  ([README](../README.md#short-or-full-lists-in-the-csvs-v0131)).
+- A dry-run over a catalog that cannot be read (damaged, or not a
+  photo-backup catalog) now exits 2, as the copy after it always did.
+- The menu's dry-run of `[1]` and `[7]` now shows the changed files that the
+  copy will replace when you answered yes to "replace what changed".
+
+**Verify**
+
+- **A file that could not be read ended `--verify full` with a traceback**,
+  with no summary and no `_verify.csv`. A read error is what a failing disk
+  shows first. Now the copy is `DEST_UNREADABLE`, the original
+  `SOURCE_UNREADABLE`, the verify goes on and exits 1.
+- **A verify only wrote to the catalog at its end.** A Ctrl+C, a kill or a
+  task's time limit after hours of reading left no `verified_at`, no filled
+  hash and no CSV, and a rolling verify that never reached its end started at
+  the same files every night. Now the catalog is written every
+  `VERIFY_COMMIT_S` (30 s), in one short transaction (a backup started
+  meanwhile is no longer locked out), and a Ctrl+C prints the summary and
+  writes the CSV for what was checked.
+- **Both disks are read at the same time.** With the backup and the source on
+  two drives, the copy and its original are hashed together: about the time of
+  the slower disk instead of the sum. Files on one drive letter are read one
+  after the other, and `VERIFY_PARALLEL = False` forces that. Measured on the
+  CPU side only; on real disks it is an estimate until a full verify is timed.
+- **A destination that goes away during a verify** (a USB disk that drops) is
+  `STOPPED: the destination is not available any more`, exit 1, not thousands
+  of `DEST_MISSING`.
+- **A file copied again kept the `verified_at` of its old bytes**, so the
+  rolling queue took it for verified. The date is now cleared with the copy.
+- **A catalog with a damaged page**: a dry-run and a `--verify quick` said
+  `OK`, the backup and the restore died with a traceback. Every run now checks
+  the catalog when it opens it and stops with a message, exit 2. The README
+  says how to go on ([A damaged catalog](../README.md#a-damaged-catalog)).
+
+**Backup**
+
+- **A file dated before 1970 or after the year 3000 stopped every backup and
+  dry-run** before the first copy (Windows cannot show that date in local
+  time). It is written in UTC in the CSV now. A date after the year 2262 did
+  not fit the catalog either: it is stored at the catalog's limit and compared
+  the same way. The file is copied with its real date.
+- **A backup of a backup with its root as `--base`** gave the second disk the
+  ID of the first (its `volume.json` was copied over the new one). A plan with
+  a path that starts with `_photo_backup` is now refused, exit 2.
+- **Speed, measured on 5 000 small files** (same hashes before and after):
+  copy 26 s → 10.5 s, verify full 20 s → 2.1 s, a run with nothing to copy
+  0.4 s → 0.1 s. Each read asked for an 8 MB block whatever the file's size;
+  it now asks for what the file holds. The state of the destination comes from
+  one listing per folder instead of one question per file (a name stored in
+  another case, or a folder that cannot be listed, still asks the system, so a
+  file that is there is never taken for a new one), and the plan no longer
+  calls `os.path.relpath` for every file.
+- `manifest_backup.py` frees the listing of the source after planning (about
+  0.5 GB on 1.2 M files), `--analyze` reads each JXL once instead of once per
+  mode, and the orphans' sources are asked once per run instead of twice
+  (twice, on purpose, with `--move-orphans`).
+
+**Menu and restore**
+
+- **The dry-run you confirmed was not what ran**: `[1]` and `[7]` ran it
+  without `--update-changed` and the copy with it. Both carry it now.
+- **`[5] Restore`: the line of the files loose in a year restored the whole
+  year.** It is now `(files directly in 2025)` and restores those files only.
+- A restored file gets the exact date of the catalog when the backup's disk
+  could only keep it rounded (FAT/exFAT), and the restore shows its progress.
+
+**`captureone_backup.py`**
+
+- A junction or link inside a Capture One folder was skipped without a word;
+  it is now counted and named. A folder that could not be read no longer makes
+  its files "gone from Capture One".
+- `RESTORE_CAPTUREONE.cmd` and `WHERE_EACH_FOLDER_GOES.txt` were rewritten
+  from what the last run found: after a reset of Capture One, the double-click
+  restore brought back less than the backup held. They are written from the
+  catalog now. The script never copies a leftover `*.pbtmp`, and the instance
+  it starts as administrator cannot ask for elevation again.
+- A read-only file made `--force` leave a target the `--revert-last` could not
+  undo. `--revert-last` undoes each file where the force put it (also with
+  another `--install-folder`), and never replaces a target that appears during
+  the undo.
+- An empty `--to ""` restored into the real Capture One folders; empty paths
+  are refused. Under `--to`, a different file is a `CONFLICT`, never
+  `KEPT_INSTALLED`. Three tracebacks became messages.
+
+**`mobile_backup.py` 0.1.3**: [see below](#013).
+
+**Not changed, on purpose.** Two names that Windows tells apart and the
+catalog does not (`Straße` / `Strasse` in one folder) are still an error of
+the plan (exit 1, the second file named as not backed up), not a silent loss;
+the owner's archive has none. The restore still reads every existing target in
+full to tell `ALREADY_THERE` from `CONFLICT`.
+
+**769 tests** (101 new; 88 of them fail on v0.13.0, the others guard what did
+not change).
 
 ---
 
@@ -652,9 +769,46 @@ A separate script with its own version: it mirrors the phone-size
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| 0.1.3 | 2026-11-11 | A photo exported again during a run no longer leaves its album skipped; the album never depends on `--source`; read-only photos, a source typed in another case and a destination that is not connected are handled |
 | 0.1.2 | 2026-11-11 | Deletes only with proof: never a photo of a source not given in this run, nothing when a source folder could not be read; an exiftool failure is read again next time instead of becoming "no date"; the state is saved more often |
 | 0.1.1 | 2026-10-13 | Photos numbered camera by camera, each camera in its own shooting order (cameras' clocks disagree) |
 | 0.1.0 | 2026-10-13 | First version: one album per event, photos numbered in shooting order, synchronised (only its own files are renamed or removed) |
+
+### 0.1.3
+
+**Released 2026-11-11** with photo-backup v0.13.1. Nothing to do when upgrading. The
+rule for deleting did not change: only a photo under a source of this run, and
+nothing in a run where a source could not be read.
+
+- **A photo exported again between the scan and the copy** (jxl-photo running
+  the same night) left its album `SKIPPED` on every run after: the mirror had
+  the new bytes and the state the old size. The state now records the size and
+  date the photo had while its bytes were read. An album already stuck by
+  0.1.2 still needs its file removed from the mirror by hand, once.
+- **The album depended on `--source`.** A run given a camera folder inside an
+  event moved that camera's photos to an album of their own. The event folder
+  is now looked for up to the drive, and a run on a part of an event numbers
+  it as the whole album is numbered (the other photos are counted, never
+  touched). For sources like `G:\<year>` nothing changes.
+- **The same source typed in another case** (`g:\2026`) read every shot time
+  again, deleted and copied the whole mirror. It is the same photo now.
+- **A state entry with nothing behind it** (album removed from the mirror by
+  hand and the camera folder renamed in the source) deleted, on the next run,
+  the file of whatever photo had taken that name. Such an entry is dropped; a
+  file that a photo still in the source holds is never deleted in the name of
+  another entry.
+- **A read-only photo** left a copy that could never be deleted or replaced,
+  and a read-only temp file stopped every run with a traceback. Copies no
+  longer carry the attribute; it is cleared only on the job's own temp files
+  and on a mirror file the state proves this job wrote.
+- **A destination that is not connected** is refused before the shot times are
+  read (exit 2); a mirror file open in another program during the renumbering
+  is an error line (exit 1), not a traceback.
+- `--dry-run` exits 1 when its plan skips an album, as the real run does.
+- A first run of many photos saves its state less often after its first 4 000
+  copies (`STATE_SAVE_SPREAD`): every save rewrites the whole file, and 20 000
+  photos spent three quarters of their time there. Up to 4 000 copies nothing
+  changes.
 
 ### 0.1.2
 

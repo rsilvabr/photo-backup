@@ -68,7 +68,9 @@ def test_b23_quick_verify_records_nothing(tmp_path):
     assert not any(row.verified_at for row in catalog_rows(dest))
 
 
-def test_b23_a_quick_verify_does_not_reset_the_rolling_queue(tmp_path, photobackup_log_dir):
+def test_b23_a_quick_verify_does_not_reset_the_rolling_queue(tmp_path, photobackup_log_dir,
+                                                             monkeypatch):
+    monkeypatch.setattr(sb, "VERIFY_CSV_OK", True)      # the CSV names every file checked
     source, dest = twelve_files(tmp_path)
     common = ("--unexported", "copy")
     assert sb.main(argv_for(source, dest, tmp_path, *common, "--yes")) == 0
@@ -887,7 +889,8 @@ def test_7_backup_runs_the_capture_one_step_and_update_changed(tmp_path, monkeyp
     answers(monkeypatch, manifest_answers(manifest, dest, "2", "", "y", "y"))
     assert menu.main([]) == 0
     dry, copy = calls["manifest"]
-    assert "--dry-run" in dry and "--update-changed" not in dry
+    # N4 of the second sweep: the dry-run that is confirmed carries the choice too
+    assert "--dry-run" in dry and "--update-changed" in dry
     assert "--yes" in copy and "--update-changed" in copy
     assert calls["captureone"] == [["--dest", str(dest), "--dry-run"],
                                    ["--dest", str(dest), "--yes"]]

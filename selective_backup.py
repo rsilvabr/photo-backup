@@ -28,11 +28,11 @@ import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -109,12 +109,20 @@ DETECT_MOVES = True                 # default: a NEW file that is a moved/rename
 ORPHANS_FOLDER = "orphans"          # under CATALOG_FOLDER: where --move-orphans puts backup files whose source is gone
 BACKUP_ID_FILE = "volume.json"      # under CATALOG_FOLDER: the identity of this backup (F2)
 VERIFY_MAX_GB = 0.0                 # default --max-gb for --verify full: 0 = verify everything
+VERIFY_PARALLEL = True              # --verify full: read the backup copy and the source at the same time when they
+                                    # are on two drives (the time of the slower disk, not the sum); False = one
+                                    # after the other (two partitions of ONE hard disk)
+VERIFY_COMMIT_S = 30.0              # --verify full: the catalog is written at least this often, so a verify that
+                                    # is interrupted keeps what it had checked
 SUMMARY_FOLDER_LINES = 25           # lines of the per-folder table in the summary (the CSV has all)
 SUMMARY_INSIDE_NAMES = 5            # subfolder names shown under "inside sessions" (the _inside.csv has all)
 
 # ---- Logs ---------------------------------------------------------------------------
 LOG_DIR = os.environ.get("PHOTOBACKUP_LOG_DIR") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "Logs")
+PLAN_CSV_UP_TO_DATE = False         # _plan.csv of a run that copies: also one line per UP_TO_DATE file (83 MB a
+                                    # run on a 425 000-file backup). A --dry-run always lists every planned file
+VERIFY_CSV_OK = False               # _verify.csv and the verify's _plan.csv: also one line per file that is OK
 
 # ---- Categories ---------------------------------------------------------------------
 CAT_EXPORT = "export"
@@ -162,38 +170,43 @@ SOURCE_MISSING = "missing"
 SOURCE_UNREADABLE = "unreadable"
 
 
-def _source_state(path):
-    """SOURCE_PRESENT, SOURCE_MISSING or SOURCE_UNREADABLE for a source file.
+def _source_stat(path):
+    """(state, stat) of a source file: SOURCE_PRESENT with its stat, or
+    SOURCE_MISSING / SOURCE_UNREADABLE with None.
     MISSING needs positive proof: the system answered "does not exist" AND the
     nearest folder above that does exist could be listed. Any other error --
     access denied, a drive or share that does not answer, nothing above it
     that exists (a drive not connected) -- is UNREADABLE: a source that cannot
     be reached is never a source that is gone."""
     try:
-        os.stat(_io(path), follow_symlinks=False)
-        return SOURCE_PRESENT
+        return SOURCE_PRESENT, os.stat(_io(path), follow_symlinks=False)
     except FileNotFoundError:
         pass
     except OSError:
-        return SOURCE_UNREADABLE
+        return SOURCE_UNREADABLE, None
     parent = os.path.abspath(path)
     while True:
         up = os.path.dirname(parent)
         if up == parent:
-            return SOURCE_UNREADABLE
+            return SOURCE_UNREADABLE, None
         parent = up
         try:
             os.stat(_io(parent))
         except FileNotFoundError:
             continue
         except OSError:
-            return SOURCE_UNREADABLE
+            return SOURCE_UNREADABLE, None
         try:
             with os.scandir(_io(parent)) as entries:
                 next(entries, None)
         except OSError:
-            return SOURCE_UNREADABLE
-        return SOURCE_MISSING
+            return SOURCE_UNREADABLE, None
+        return SOURCE_MISSING, None
+
+
+def _source_state(path):
+    """SOURCE_PRESENT, SOURCE_MISSING or SOURCE_UNREADABLE: see _source_stat."""
+    return _source_stat(path)[0]
 
 
 def _trailing_dot_folder(path):
@@ -399,15 +412,68 @@ def _hms(seconds):
     return f"{h}h{m:02d}m"
 
 
-def _sha256_file(path):
+def _read_chunks(handle):
+    """The data of an open file, in chunks of COPY_CHUNK_MB at most. A read
+    never asks for more than the file is known to still hold, plus one byte
+    (the read that finds the end): Python allocates what is asked for, and
+    COPY_CHUNK_MB for every 300-byte sidecar cost 2.5 ms a read. A file that
+    grew while it was read is still read to its real end."""
+    limit = max(1, int(COPY_CHUNK_MB * 1024 * 1024))
+    try:
+        left = os.fstat(handle.fileno()).st_size
+    except OSError:
+        left = None
+    while True:
+        chunk = handle.read(limit if left is None else min(limit, left + 1))
+        if not chunk:
+            return
+        yield chunk
+        if left is not None:
+            left -= len(chunk)
+            if left < 0:        # it grew: its size says nothing any more
+                left = None
+
+
+class _Cancelled(Exception):
+    """A read on another thread was told to stop (the run is ending)."""
+
+
+def _sha256_file(path, cancel=None):
+    """sha256 of a file. `cancel` (a threading.Event) stops a read that runs
+    on a thread of its own, between two chunks."""
     hasher = hashlib.sha256()
     with open(_io(path), "rb") as handle:
-        while True:
-            chunk = handle.read(COPY_CHUNK_MB * 1024 * 1024)
-            if not chunk:
-                break
+        for chunk in _read_chunks(handle):
+            if cancel is not None and cancel.is_set():
+                raise _Cancelled()
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+_NS_MIN = -2 ** 63
+_NS_MAX = 2 ** 63 - 1
+
+
+def _db_ns(mtime_ns):
+    """A file date as the catalog can hold it: SQLite integers are 64 bits,
+    and a date after the year 2262 (a camera or a zip with a broken clock) does
+    not fit. Stored at the limit, and compared the same way (_verify_row)."""
+    return max(_NS_MIN, min(_NS_MAX, int(mtime_ns)))
+
+
+def _csv_date(mtime_ns):
+    """A file date for a CSV. Windows cannot convert a date before 1970 or
+    after the year 3000 to local time: it is written in UTC then, and a date
+    no calendar holds as its number -- one odd file must not stop the run."""
+    try:
+        return datetime.fromtimestamp(mtime_ns / 1e9).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError):
+        pass
+    try:
+        moment = datetime(1970, 1, 1) + timedelta(microseconds=mtime_ns // 1000)
+        return moment.strftime("%Y-%m-%d %H:%M:%S") + " UTC"
+    except (OverflowError, ValueError):
+        return f"mtime_ns {mtime_ns}"
 
 
 @dataclass
@@ -491,6 +557,16 @@ class VerifyResult:
     dest_verified: bool = False
 
 
+# A relative path with a name that Windows rewrites when it opens it: one that
+# ends in a dot or a space, or a device name (NUL, COM1, AUX.txt, ...). Wider
+# than Windows' own rule on purpose: a match only sends _Planner._rel to relpath.
+_REL_REWRITTEN = re.compile(
+    r"[. ](?:\\|/|$)"
+    r"|(?:^|\\|/)(?:con|prn|aux|nul|conin\$|conout\$|(?:com|lpt)[0-9¹²³])"
+    r"(?:[.: ][^\\/]*)?(?:\\|/|$)",
+    re.IGNORECASE)
+
+
 @dataclass(frozen=True)
 class FolderRules:
     add_filtered: tuple = ()    # patterns: direct subfolders of a session, filtered by `originals`
@@ -507,7 +583,8 @@ class FolderRules:
 
 
 class _Planner:
-    def __init__(self, args, list_cache=None, skip_paths=frozenset(), rules=None):
+    def __init__(self, args, list_cache=None, skip_paths=frozenset(), rules=None,
+                 role_cache=None):
         self.args = args
         self.list_cache = list_cache
         self.skip_paths = frozenset(os.path.normcase(path) for path in skip_paths)
@@ -526,6 +603,8 @@ class _Planner:
         self.skipped_folders = []   # SYSTEM_SKIP_FOLDERS / --exclude-folders, each once (S4)
         self._skipped_seen = set()
         self.inside = {}            # session subfolder -> [session, subfolder, files, bytes]
+        self._rel_prefixes = {}     # base -> base + separator (_rel)
+        self.role_cache = role_cache    # (path, size, mtime_ns) -> _jxl_role, shared by --analyze
         self.export_contains = args.export_name_contains.casefold()
         self.export_excludes = _fold_set(args.exclude_export_names)
         self.skip_folder_names = _fold_set(SYSTEM_SKIP_FOLDERS) | _fold_set(args.exclude_folders)
@@ -554,7 +633,7 @@ class _Planner:
         for key, recs in jxl_by_key.items():
             if len(recs) < 2:
                 continue
-            roles = {id(rec): _jxl_role(rec[2]) for rec in recs}
+            roles = {id(rec): self._role(rec) for rec in recs}
             if "master" not in roles.values():
                 continue
             for rec in recs:
@@ -563,6 +642,17 @@ class _Planner:
                     self.stats.derivatives_skipped += 1
                     self.stats.derivatives_skipped_bytes += rec[3]
         return [rec for rec in chosen if id(rec) not in dropped]
+
+    def _role(self, rec):
+        """_jxl_role of a chosen record. --analyze plans every line once per
+        mode and Originals: with `role_cache` a JXL is opened once, as long as
+        its listing (size and date) is the same."""
+        if self.role_cache is None:
+            return _jxl_role(rec[2])
+        key = (os.path.normcase(rec[2]), rec[3], rec[4])
+        if key not in self.role_cache:
+            self.role_cache[key] = _jxl_role(rec[2])
+        return self.role_cache[key]
 
     def _is_export_name(self, name):
         folded = name.casefold()
@@ -638,6 +728,20 @@ class _Planner:
         return True
 
     def _rel(self, path, base):
+        """`path` relative to `base`. Every listed path starts with its source,
+        which is under the base: cutting that prefix gives what os.path.relpath
+        gives, at a fraction of its cost (28% of the planning time). relpath
+        also reads a name as Windows will open it -- 'Trip.' is 'Trip', which
+        is how two folders with one destination are found (S8) -- so any name
+        Windows rewrites, and a --base typed in another case, still go
+        through it."""
+        prefix = self._rel_prefixes.get(base)
+        if prefix is None:
+            prefix = self._rel_prefixes[base] = base.rstrip("\\/") + os.sep
+        if path.startswith(prefix):
+            rest = path[len(prefix):]
+            if rest and not _REL_REWRITTEN.search(rest):
+                return rest
         return os.path.relpath(path, base)
 
     def _add(self, planned):
@@ -1157,16 +1261,85 @@ def _validate_usage(args):
     return errors
 
 
+def _status_of(planned, dst, size, mtime_ns):
+    """UP_TO_DATE or CHANGED for a destination file of this size and date."""
+    tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
+    if size == planned.size and abs(mtime_ns - planned.mtime_ns) <= tolerance:
+        return FileStatus(planned, dst, ST_UP_TO_DATE)
+    return FileStatus(planned, dst, ST_CHANGED)
+
+
 def _file_status(planned, dest):
     dst = os.path.join(dest, planned.rel)
     try:
         stat = os.stat(_io(dst), follow_symlinks=False)
     except OSError:
         return FileStatus(planned, dst, ST_NEW)
-    tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
-    if stat.st_size == planned.size and abs(stat.st_mtime_ns - planned.mtime_ns) <= tolerance:
-        return FileStatus(planned, dst, ST_UP_TO_DATE)
-    return FileStatus(planned, dst, ST_CHANGED)
+    return _status_of(planned, dst, stat.st_size, stat.st_mtime_ns)
+
+
+def _list_dest_folder(folder):
+    """{name: (size, mtime_ns)} of the files of one destination folder, as its
+    listing gives them; None when the folder does not exist (then nothing in
+    it does). A folder that cannot be listed, or only in part, gives what was
+    read: the caller asks the system for every name that is not there."""
+    listed = {}
+    try:
+        with os.scandir(_io(folder)) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        stat = entry.stat(follow_symlinks=False)
+                        listed[entry.name] = (stat.st_size, stat.st_mtime_ns)
+                except OSError:
+                    continue
+    except FileNotFoundError:
+        return None
+    except OSError:
+        pass
+    return listed
+
+
+def _file_statuses(files, dest):
+    """_file_status of every planned file, in the same order, with one listing
+    per destination folder instead of one question per file (6 times faster on
+    96 000 files, and no file record is read from a cold disk). The listing
+    only answers for a name it holds exactly as planned: any other case -- a
+    name stored in another case, a folder that could not be listed -- still
+    asks the system, so a file that is there is never taken for a NEW one."""
+    statuses = [None] * len(files)
+    by_folder = {}
+    for index, planned in enumerate(files):
+        dst = os.path.join(dest, planned.rel)
+        by_folder.setdefault(os.path.dirname(dst), []).append((index, planned, dst))
+    for folder, items in by_folder.items():
+        listed = _list_dest_folder(folder)
+        for index, planned, dst in items:
+            if listed is None:
+                statuses[index] = FileStatus(planned, dst, ST_NEW)
+                continue
+            hit = listed.get(os.path.basename(dst))
+            if hit is None:
+                statuses[index] = _file_status(planned, dest)
+            else:
+                statuses[index] = _status_of(planned, dst, *hit)
+    return statuses
+
+
+def _reserved_rel_error(planned):
+    """Why this plan cannot run, or None. A planned file whose path starts
+    with CATALOG_FOLDER would land in the backup's own folder: the volume.json
+    of a source that is itself a backup replaces the identity of this one
+    (two disks with one backup ID), and its versions mix with ours."""
+    reserved = CATALOG_FOLDER.casefold()
+    for item in planned.files:
+        first = item.rel.replace("/", "\\").split("\\", 1)[0]
+        if first.casefold() == reserved:
+            return (f"{item.src} would be copied into {CATALOG_FOLDER}, the backup's own "
+                    f"folder on the destination (the source is itself a backup and --base "
+                    f"is its root?). Choose a --base above it, so that its files land in "
+                    f"a folder of their own.")
+    return None
 
 
 def _existing_ancestor(path):
@@ -1289,6 +1462,15 @@ class _Catalog:
                 elif row[0] != SCHEMA_VERSION:
                     raise RuntimeError(
                         f"catalog schema_version {row[0]} != {SCHEMA_VERSION}: {self.path}")
+            # A damaged page can sit where a plain read of the table never
+            # goes (an index): a verify said OK with it, and the next backup
+            # died in the middle. Checked once, here, for every user.
+            check = self.conn.execute("PRAGMA quick_check(1)").fetchone()
+            if check is None or check[0] != "ok":
+                found = " ".join(str(check[0]).split()) if check else "no answer"
+                raise RuntimeError(
+                    f"catalog is damaged ({found}): {self.path}. The copied files are not "
+                    f"touched; see 'A damaged catalog' in the README.")
         except sqlite3.Error as exc:
             self.close()
             raise RuntimeError(f"cannot open catalog {self.path}: {exc}")
@@ -1319,12 +1501,15 @@ class _Catalog:
             "mtime_ns=excluded.mtime_ns, source_path=excluded.source_path, "
             "sha256=NULL, verified_at=NULL "
             "WHERE files.size != excluded.size OR files.mtime_ns != excluded.mtime_ns",
-            (planned.rel.casefold(), planned.rel, planned.size, planned.mtime_ns, planned.src))
+            (planned.rel.casefold(), planned.rel, planned.size, _db_ns(planned.mtime_ns),
+             planned.src))
 
     def upsert(self, planned, sha256, size=None, mtime_ns=None):
         """Record a copy. `size`/`mtime_ns` are the source's stat taken AT
         COPY TIME; the planned values are only a fallback (a file edited
-        between planning and copying is copied as it is now)."""
+        between planning and copying is copied as it is now). The row of a
+        file copied again loses its verified_at: that date was of the old
+        bytes, and these have never been read back by a verify."""
         size = planned.size if size is None else size
         mtime_ns = planned.mtime_ns if mtime_ns is None else mtime_ns
         now = datetime.now().isoformat(timespec="seconds")
@@ -1334,8 +1519,9 @@ class _Catalog:
             "VALUES(?, ?, ?, ?, ?, ?, ?, NULL) "
             "ON CONFLICT(key) DO UPDATE SET rel=excluded.rel, size=excluded.size, "
             "mtime_ns=excluded.mtime_ns, sha256=excluded.sha256, "
-            "source_path=excluded.source_path, copied_at=excluded.copied_at",
-            (planned.rel.casefold(), planned.rel, size, mtime_ns,
+            "source_path=excluded.source_path, copied_at=excluded.copied_at, "
+            "verified_at=NULL",
+            (planned.rel.casefold(), planned.rel, size, _db_ns(mtime_ns),
              sha256, planned.src, now))
 
     def set_verified(self, key, when):
@@ -1450,10 +1636,7 @@ class _SourceRead:
         stat0 = os.stat(_io(self.planned.src), follow_symlinks=False)
         hasher = hashlib.sha256()
         with open(_io(self.planned.src), "rb") as handle:
-            while True:
-                chunk = handle.read(COPY_CHUNK_MB * 1024 * 1024)
-                if not chunk:
-                    break
+            for chunk in _read_chunks(handle):
                 hasher.update(chunk)
                 yield chunk
         stat1 = os.stat(_io(self.planned.src), follow_symlinks=False)
@@ -1632,16 +1815,19 @@ def _flush_error(tmp):
 
 
 def _finish_temp(planned, tmp, dst, verify, digest, stat0, expected_sha256=None, no_clobber=False,
-                 before_final=None):
+                 before_final=None, mtime_ns=None):
     """Verify a temp file already on the disk, then give it its final name.
-    before_final(digest) runs last, right before that name is given."""
+    before_final(digest) runs last, right before that name is given.
+    `mtime_ns`: the date these bytes are known to have (the restore: the
+    catalog's, when the backup's disk could only keep it rounded)."""
     if expected_sha256 is not None and digest != expected_sha256:
         raise RuntimeError("content differs from the catalog sha256 (backup copy corrupt?)")
     shutil.copystat(_io(planned.src), _io(tmp))
     # The dates of the bytes really copied (stat0), not of the source as it is
     # now: a file edited after it was read keeps its old date here, so the next
     # run sees it as CHANGED instead of trusting old bytes under a new date.
-    os.utime(_io(tmp), ns=(stat0.st_atime_ns, stat0.st_mtime_ns))
+    os.utime(_io(tmp), ns=(stat0.st_atime_ns,
+                           stat0.st_mtime_ns if mtime_ns is None else mtime_ns))
     if verify == "size":
         if os.stat(_io(tmp)).st_size != stat0.st_size:
             raise RuntimeError("size mismatch after copy")
@@ -1664,18 +1850,19 @@ def _finish_temp(planned, tmp, dst, verify, digest, stat0, expected_sha256=None,
 
 
 def _copy_file(planned, dst, verify, expected_sha256=None, no_clobber=False, source=None,
-               before_final=None):
+               before_final=None, mtime_ns=None):
     """Copy to a temp file next to `dst`, verify, then move it into place.
     no_clobber: a `dst` that exists at that last step is never replaced
     (FileExistsError, nothing written) -- the restore's rule. `source`: where
-    the data comes from (default: read the file here)."""
+    the data comes from (default: read the file here). `mtime_ns`: see
+    _finish_temp."""
     tmp = dst + TEMP_SUFFIX
     os.makedirs(_io(os.path.dirname(dst)), exist_ok=True)
     source = _SourceRead(planned) if source is None else source
     try:
         _write_temp(planned, tmp, source, True)
         return _finish_temp(planned, tmp, dst, verify, source.digest, source.stat0,
-                            expected_sha256, no_clobber, before_final)
+                            expected_sha256, no_clobber, before_final, mtime_ns)
     except BaseException:
         _remove_temp(tmp)
         raise
@@ -1846,12 +2033,14 @@ ORPHAN_REASONS = {SOURCE_PRESENT: "not_selected", SOURCE_MISSING: "source_missin
                   SOURCE_UNREADABLE: "source_unreadable"}
 
 
-def _find_orphans(rows, statuses, prefixes, used_keys, sources=None):
+def _find_orphans(rows, statuses, prefixes, used_keys, sources=None, states=None):
     """Catalogued files under the verified prefixes that are neither planned
     now nor consumed by a move. Returns [(reason, row), ...]. A row whose
     source is not under a source of this run (`sources`: another disk that
     shares the folder names) is other_source; only a source proven gone
-    (_source_state) is source_missing -- the one --move-orphans moves."""
+    (_source_state) is source_missing -- the one --move-orphans moves.
+    `states` (a dict) keeps the answer of _source_state per row, for a second
+    list of the same run that moves nothing."""
     planned_keys = {status.planned.rel.casefold() for status in statuses}
     orphans = []
     for row in rows:
@@ -1862,7 +2051,12 @@ def _find_orphans(rows, statuses, prefixes, used_keys, sources=None):
         if sources is not None and not _under_sources(row.source_path, sources):
             reason = "other_source"
         else:
-            reason = ORPHAN_REASONS[_source_state(row.source_path)]
+            state = states.get(row.source_path) if states is not None else None
+            if state is None:
+                state = _source_state(row.source_path)
+                if states is not None:
+                    states[row.source_path] = state
+            reason = ORPHAN_REASONS[state]
         orphans.append((reason, row))
     return orphans
 
@@ -2213,7 +2407,12 @@ def _run_backup(args, log, stamp, plan_fn=None):
         log.log(f"LINK not followed {link}")
     for folder in planned.skipped_folders:
         log.log(f"SKIPPED FOLDER {folder}")
-    statuses = [_file_status(planned_file, dest) for planned_file in planned.files]
+    reserved = _reserved_rel_error(planned)
+    if reserved:
+        print(reserved, file=sys.stderr)
+        log.log(f"ERROR {reserved}")
+        return 2
+    statuses = _file_statuses(planned.files, dest)
     to_copy = [status for status in statuses if _will_copy(status, args)]
     needed = sum(status.planned.size for status in to_copy)
     dest_error = None
@@ -2237,11 +2436,22 @@ def _run_backup(args, log, stamp, plan_fn=None):
     candidates = {}
     try:
         read_only_catalog = _Catalog(dest, create=False, readonly=True)
-    except (RuntimeError, FileNotFoundError):
+    except FileNotFoundError:           # no backup here yet
         read_only_catalog = None
+    except RuntimeError as exc:
+        # A catalog that is there and cannot be read -- damaged, or not ours --
+        # stops the dry-run too: the copy would stop on it after the question.
+        print(str(exc), file=sys.stderr)
+        log.log(f"ERROR {exc}")
+        return 2
     if read_only_catalog is not None:
         try:
             rows = read_only_catalog.all_rows()
+        except sqlite3.Error as exc:
+            message = f"cannot read catalog {read_only_catalog.path}: {exc}"
+            print(message, file=sys.stderr)
+            log.log(f"ERROR {message}")
+            return 2
         finally:
             read_only_catalog.close()
         if args.detect_moves:
@@ -2250,7 +2460,13 @@ def _run_backup(args, log, stamp, plan_fn=None):
     tentative_used = set()
     for _status, matches in candidates.values():
         tentative_used.update(row.key for row in matches)
-    tentative_orphans = (_find_orphans(rows, statuses, prefixes, tentative_used, planned.sources)
+    # The orphans are looked for twice (for the summary, and again after the
+    # moves). Without --move-orphans the second list only rewrites the CSV: it
+    # reuses the answers of the first, one question per orphan instead of two.
+    # With --move-orphans every source is asked again, right before the copy.
+    orphan_states = {}
+    tentative_orphans = (_find_orphans(rows, statuses, prefixes, tentative_used, planned.sources,
+                                       orphan_states)
                          if rows else [])
     extra_lines = []
     folder_rows = _folder_rows(to_copy)
@@ -2296,11 +2512,17 @@ def _run_backup(args, log, stamp, plan_fn=None):
                                dest_error, extra_lines):
         log.out(line)
     read_errors = 1 if planned.errors else 0
+    # A dry-run lists every planned file. A run that copies lists what it will
+    # change: the UP_TO_DATE lines of a nightly run were 83 MB of "nothing".
+    listed = [status for status in statuses
+              if args.dry_run or PLAN_CSV_UP_TO_DATE or status.status != ST_UP_TO_DATE]
     log.csv("_plan.csv", ["action", "category", "size", "mtime", "src", "rel"],
             [(status.status, status.planned.category, status.planned.size,
-              datetime.fromtimestamp(status.planned.mtime_ns / 1e9).strftime("%Y-%m-%d %H:%M:%S"),
-              status.planned.src, status.planned.rel)
-             for status in statuses])
+              _csv_date(status.planned.mtime_ns), status.planned.src, status.planned.rel)
+             for status in listed])
+    if len(listed) != len(statuses):
+        log.log(f"_plan.csv: {_num(len(statuses) - len(listed))} UP_TO_DATE files not listed "
+                f"(PLAN_CSV_UP_TO_DATE; a --dry-run lists every file)")
     log.csv("_unexported.csv", ["folder", "files", "bytes", "c1_bytes", "nx_bytes", "copied"],
             [(folder.path, folder.files, folder.nbytes, folder.c1_nbytes, folder.nx_nbytes,
               "yes" if folder.copied else "no")
@@ -2388,7 +2610,8 @@ def _run_backup(args, log, stamp, plan_fn=None):
                 candidates, dest, catalog, log)
         if interrupted:
             return 130
-        orphans = _find_orphans(catalog.all_rows(), statuses, prefixes, set(), planned.sources)
+        orphans = _find_orphans(catalog.all_rows(), statuses, prefixes, set(), planned.sources,
+                                None if args.move_orphans else orphan_states)
         log.csv("_orphans.csv", ["reason", "rel", "size", "source_path", "copied_at"],
                 _orphan_csv_rows(orphans))
         done, done_bytes, error_count, interrupted = _copy_all(
@@ -2418,6 +2641,11 @@ def _run_backup(args, log, stamp, plan_fn=None):
             moved_orphans = _move_orphans(dest, stamp, orphans, catalog, log)
             log.log(f"moved {moved_orphans} orphans to "
                     f"{os.path.join(dest, CATALOG_FOLDER, ORPHANS_FOLDER, stamp)}")
+    except sqlite3.Error as exc:
+        # outside the copy itself (_copy_all has its own): recording the files
+        # already there, the moves, the orphans
+        log.out(f"ERROR the catalog could not be read or written ({exc}): {catalog.path}")
+        return 1 if done or moved else 2
     finally:
         catalog.close()
     return 1 if error_count or move_errors or planned.errors or stop_info else 0
@@ -2427,64 +2655,151 @@ def _run_backup(args, log, stamp, plan_fn=None):
 class _VerifyJob:
     row: _Row
     in_catalog: bool
+    dest_size: int = None       # from the listing of its folder (quick verify); None = ask
 
 
-def _verify_row(job, dest, deep):
+def _same_drive(first, second):
+    """Whether two paths are on one drive letter (or one share)."""
+    return (os.path.splitdrive(os.path.abspath(first))[0].casefold()
+            == os.path.splitdrive(os.path.abspath(second))[0].casefold())
+
+
+def _hash_or_error(path, cancel=None):
+    """(sha256, None) of a file, or (None, the error) when it cannot be read:
+    a file that gives a read error is a result of the verify, not its end."""
+    try:
+        if cancel is None:
+            return _sha256_file(path), None
+        return _sha256_file(path, cancel), None
+    except (OSError, _Cancelled) as exc:
+        return None, exc
+
+
+class _CopyReader:
+    """Reads backup copies on a thread of its own, so that --verify full reads
+    the copy and its source at the same time: two disks, the time of the
+    slower one instead of the sum (hashlib releases the GIL). One file at a
+    time; the results are used on the main thread, where the catalog lives."""
+
+    def __init__(self):
+        self.cancel = threading.Event()
+        self._pool = ThreadPoolExecutor(max_workers=1)
+
+    def parallel(self, copy, source):
+        """Two files of one disk are read one after the other: together, its
+        head would only travel between them."""
+        return VERIFY_PARALLEL and not _same_drive(copy, source)
+
+    def start(self, path):
+        """Start reading `path`; the returned function waits for its
+        (sha256, error). A timed wait: Ctrl+C reaches a wait on Windows only
+        when it ends."""
+        future = self._pool.submit(_hash_or_error, path, self.cancel)
+
+        def result():
+            while True:
+                try:
+                    return future.result(timeout=0.2)
+                except _FutureTimeout:
+                    continue
+        return result
+
+    def close(self):
+        self.cancel.set()
+        self._pool.shutdown(wait=True)
+
+
+def _dest_available(dest):
+    """Whether the backup still answers: its catalog file can be seen. A copy
+    that is "missing" on a drive that went away is not a missing copy."""
+    try:
+        os.stat(_io(os.path.join(os.path.abspath(dest), CATALOG_FOLDER, "catalog.sqlite")))
+    except OSError:
+        return False
+    return True
+
+
+def _error_text(exc):
+    return getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
+
+
+def _verify_row(job, dest, deep, reader=None):
+    """Check one catalogued file. A file that cannot be read -- the copy or
+    the source -- is a status (DEST_UNREADABLE, SOURCE_UNREADABLE), never an
+    exception: a read error is what a failing disk shows first. `reader` (a
+    _CopyReader) reads the copy while this thread reads the source."""
     row = job.row
     dst = os.path.join(dest, row.rel)
-    if not _exists(dst):
-        return VerifyResult("DEST_MISSING", row.rel, row.source_path, "destination file missing")
-    stat = os.stat(_io(dst), follow_symlinks=False)
-    if stat.st_size != row.size:
+    dest_size = job.dest_size
+    if dest_size is None:
+        try:
+            dest_size = os.stat(_io(dst), follow_symlinks=False).st_size
+        except FileNotFoundError:
+            return VerifyResult("DEST_MISSING", row.rel, row.source_path,
+                                "destination file missing")
+        except OSError as exc:
+            return VerifyResult("DEST_UNREADABLE", row.rel, row.source_path,
+                                f"backup copy cannot be read: {_error_text(exc)}")
+    if dest_size != row.size:
         return VerifyResult("DEST_SIZE", row.rel, row.source_path,
-                            f"destination size {stat.st_size} != {row.size}")
-    # The backup copy is checked BEFORE the source: when the original is gone
-    # or changed, the copy may be the only one left, and its health matters most.
-    hash_dst = None
+                            f"destination size {dest_size} != {row.size}")
+    state, source_stat = _source_stat(row.source_path)
+    tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
+    source_same = (state == SOURCE_PRESENT and source_stat.st_size == row.size
+                   and abs(_db_ns(source_stat.st_mtime_ns) - row.mtime_ns) <= tolerance)
+    # The backup copy is judged BEFORE the source: when the original is gone
+    # or changed, the copy may be the only one left, and its health matters
+    # most. A copy with a catalog hash is always read; one without is read
+    # only to be compared with a source that still has the row's size and date.
+    hash_dst = hash_src = dest_error = source_error = None
+    if deep and (row.sha256 or source_same):
+        if source_same and reader is not None and reader.parallel(dst, row.source_path):
+            waiting = reader.start(dst)
+            hash_src, source_error = _hash_or_error(row.source_path)
+            hash_dst, dest_error = waiting()
+        else:
+            hash_dst, dest_error = _hash_or_error(dst)
+            copy_bad = dest_error is not None or bool(row.sha256 and hash_dst != row.sha256)
+            if source_same and not copy_bad:
+                hash_src, source_error = _hash_or_error(row.source_path)
+    if dest_error is not None:
+        return VerifyResult("DEST_UNREADABLE", row.rel, row.source_path,
+                            f"backup copy cannot be read: {_error_text(dest_error)}")
     dest_verified = False
     if deep and row.sha256:
-        hash_dst = _sha256_file(dst)
         if hash_dst != row.sha256:
             return VerifyResult("DEST_CORRUPT", row.rel, row.source_path,
                                 "destination sha256 differs from the catalog")
         dest_verified = True
-    state = _source_state(row.source_path)
+    copy_note = "; backup copy hash verified" if dest_verified else ""
     if state == SOURCE_MISSING:
-        detail = "source file missing; backup copy hash verified" if hash_dst else "source file missing"
-        return VerifyResult("SOURCE_MISSING", row.rel, row.source_path, detail,
-                            dest_verified=dest_verified)
+        return VerifyResult("SOURCE_MISSING", row.rel, row.source_path,
+                            "source file missing" + copy_note, dest_verified=dest_verified)
     if state == SOURCE_UNREADABLE:
-        detail = "source cannot be read (not proof that it is gone)"
-        if hash_dst:
-            detail += "; backup copy hash verified"
-        return VerifyResult("SOURCE_UNREADABLE", row.rel, row.source_path, detail,
+        return VerifyResult("SOURCE_UNREADABLE", row.rel, row.source_path,
+                            "source cannot be read (not proof that it is gone)" + copy_note,
                             dest_verified=dest_verified)
-    source_stat = os.stat(_io(row.source_path), follow_symlinks=False)
-    tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
-    if (source_stat.st_size != row.size
-            or abs(source_stat.st_mtime_ns - row.mtime_ns) > tolerance):
-        detail = "source size/mtime differ from the catalog"
-        if hash_dst:
-            detail += "; backup copy hash verified"
-        return VerifyResult("SOURCE_CHANGED", row.rel, row.source_path, detail,
+    if not source_same:
+        return VerifyResult("SOURCE_CHANGED", row.rel, row.source_path,
+                            "source size/mtime differ from the catalog" + copy_note,
                             dest_verified=dest_verified)
     if not deep:
         return VerifyResult("OK", row.rel, row.source_path, "")
+    if source_error is not None:
+        return VerifyResult("SOURCE_UNREADABLE", row.rel, row.source_path,
+                            f"source cannot be read: {_error_text(source_error)}" + copy_note,
+                            dest_verified=dest_verified)
     if row.sha256:
-        hash_src = _sha256_file(row.source_path)
         if hash_src != row.sha256:
             return VerifyResult("SOURCE_CORRUPT_SUSPECT", row.rel, row.source_path,
                                 "source sha256 differs from the catalog with same size/mtime",
                                 dest_verified=dest_verified)
-    else:
-        hash_dst = _sha256_file(dst)
-        hash_src = _sha256_file(row.source_path)
-        if hash_src == hash_dst:
-            return VerifyResult("HASH_FILLED", row.rel, row.source_path,
-                                "hash recorded", new_hash=hash_dst, dest_verified=True)
-        return VerifyResult("DEST_DIFFERS", row.rel, row.source_path,
-                            "destination differs from the source (no catalog hash)")
-    return VerifyResult("OK", row.rel, row.source_path, "", dest_verified=dest_verified)
+        return VerifyResult("OK", row.rel, row.source_path, "", dest_verified=dest_verified)
+    if hash_src == hash_dst:
+        return VerifyResult("HASH_FILLED", row.rel, row.source_path,
+                            "hash recorded", new_hash=hash_dst, dest_verified=True)
+    return VerifyResult("DEST_DIFFERS", row.rel, row.source_path,
+                        "destination differs from the source (no catalog hash)")
 
 
 def _key_under_prefixes(key, prefixes):
@@ -2492,6 +2807,23 @@ def _key_under_prefixes(key, prefixes):
         if prefix == "" or key == prefix or key.startswith(prefix + "\\"):
             return True
     return False
+
+
+def _list_dest_sizes(jobs, dest):
+    """Quick verify: the size of every job's copy that a listing of its folder
+    answers (see _file_statuses); the others are asked one by one."""
+    by_folder = {}
+    for job in jobs:
+        dst = os.path.join(dest, job.row.rel)
+        by_folder.setdefault(os.path.dirname(dst), []).append((job, os.path.basename(dst)))
+    for folder, items in by_folder.items():
+        listed = _list_dest_folder(folder)
+        if not listed:
+            continue
+        for job, name in items:
+            hit = listed.get(name)
+            if hit is not None:
+                job.dest_size = hit[0]
 
 
 def _run_verify(args, log, plan_fn=None):
@@ -2511,97 +2843,168 @@ def _run_verify(args, log, plan_fn=None):
         catalog = _Catalog(dest, create=False)
     except (RuntimeError, FileNotFoundError) as exc:
         print(str(exc), file=sys.stderr)
+        log.log(f"ERROR {exc}")
         return 2
     deep = args.verify == "full"
-    good = {"OK", "HASH_FILLED"}
     if not deep and args.max_gb > 0:
         log.log("max-gb ignored (quick verify)")
+    reader = _CopyReader() if deep and VERIFY_PARALLEL else None
     try:
-        planned = (plan_fn or plan)(args)
-        for error in planned.errors:
-            log.log(error)
-        for warning in planned.warnings:
-            log.log(warning)
-        for link in planned.links:
-            log.log(f"LINK not followed {link}")
-        for folder in planned.skipped_folders:
-            log.log(f"SKIPPED FOLDER {folder}")
-        rows = {row.key: row for row in catalog.all_rows()}
-        db_keys = set(rows)
-        prefixes = _source_prefixes(planned)
-        checked = set()
-        results = []
-        planned_jobs = []
-        catalog_jobs = []
-        for planned_file in planned.files:
-            key = planned_file.rel.casefold()
-            if key in rows:
-                continue
-            dst = os.path.join(dest, planned_file.rel)
-            if not _exists(dst):
-                results.append(VerifyResult("NOT_BACKED_UP", planned_file.rel, planned_file.src,
-                                            "no destination file and no catalog row"))
-                checked.add(key)
-                continue
-            row = _Row(key, planned_file.rel, planned_file.size, planned_file.mtime_ns,
-                       None, planned_file.src)
-            if deep:
-                catalog.adopt(planned_file)
-                db_keys.add(key)
-            rows[key] = row
-            planned_jobs.append(_VerifyJob(row, key in db_keys))
+        return _verify_catalog(args, log, plan_fn, dest, catalog, deep, reader)
+    except sqlite3.Error as exc:
+        message = f"cannot read catalog {catalog.path}: {exc}"
+        print(message, file=sys.stderr)
+        log.log(f"ERROR {message}")
+        return 2
+    finally:
+        if reader is not None:
+            reader.close()
+        catalog.close()
+
+
+def _verify_catalog(args, log, plan_fn, dest, catalog, deep, reader):
+    """The verify itself (catalog open). What it has checked is written to
+    the catalog every VERIFY_COMMIT_S, in one short transaction, and its
+    summary and _verify.csv are written also when it is interrupted: hours of
+    reading are never lost to a Ctrl+C or to a task that ran out of time."""
+    good = {"OK", "HASH_FILLED"}
+    planned = (plan_fn or plan)(args)
+    for error in planned.errors:
+        log.log(error)
+    for warning in planned.warnings:
+        log.log(warning)
+    for link in planned.links:
+        log.log(f"LINK not followed {link}")
+    for folder in planned.skipped_folders:
+        log.log(f"SKIPPED FOLDER {folder}")
+    reserved = _reserved_rel_error(planned)
+    if reserved:
+        print(reserved, file=sys.stderr)
+        log.log(f"ERROR {reserved}")
+        return 2
+    rows = {row.key: row for row in catalog.all_rows()}
+    db_keys = set(rows)
+    prefixes = _source_prefixes(planned)
+    checked = set()
+    results = []
+    planned_jobs = []
+    catalog_jobs = []
+    uncatalogued = [planned_file for planned_file in planned.files
+                    if planned_file.rel.casefold() not in rows]
+    for status in _file_statuses(uncatalogued, dest):
+        planned_file = status.planned
+        key = planned_file.rel.casefold()
+        if key in checked:
+            continue
+        if status.status == ST_NEW:
+            results.append(VerifyResult("NOT_BACKED_UP", planned_file.rel, planned_file.src,
+                                        "no destination file and no catalog row"))
             checked.add(key)
-        outside = []
-        for key, row in rows.items():
-            if key in checked:
-                continue
-            if not _key_under_prefixes(key, prefixes):
-                outside.append(row)
-                continue
-            catalog_jobs.append(_VerifyJob(row, key in db_keys))
-            checked.add(key)
-        budget = args.max_gb * 1e9 if deep and args.max_gb > 0 else None
-        if budget is not None:
-            catalog_jobs.sort(key=lambda job: (job.row.verified_at is not None,
-                                               job.row.verified_at or "",
-                                               job.row.copied_at or ""))
-        catalog_bytes = sum(job.row.size for job in catalog_jobs)
-        total_bytes = 0
+            continue
+        row = _Row(key, planned_file.rel, planned_file.size, _db_ns(planned_file.mtime_ns),
+                   None, planned_file.src)
         if deep:
-            total_bytes = sum(job.row.size for job in planned_jobs) + (
-                catalog_bytes if budget is None else min(catalog_bytes, budget))
-        job_count = len(planned_jobs) + len(catalog_jobs)
-        done_bytes = 0
-        last_report = time.monotonic()
-        now = datetime.now().isoformat(timespec="seconds")
+            catalog.adopt(planned_file)
+            db_keys.add(key)
+        rows[key] = row
+        planned_jobs.append(_VerifyJob(row, key in db_keys))
+        checked.add(key)
+    if deep and planned_jobs:
+        catalog.commit()
+    outside = []
+    for key, row in rows.items():
+        if key in checked:
+            continue
+        if not _key_under_prefixes(key, prefixes):
+            outside.append(row)
+            continue
+        catalog_jobs.append(_VerifyJob(row, key in db_keys))
+        checked.add(key)
+    budget = args.max_gb * 1e9 if deep and args.max_gb > 0 else None
+    if budget is not None:
+        catalog_jobs.sort(key=lambda job: (job.row.verified_at is not None,
+                                           job.row.verified_at or "",
+                                           job.row.copied_at or ""))
+    if not deep:
+        _list_dest_sizes(planned_jobs + catalog_jobs, dest)
+    catalog_bytes = sum(job.row.size for job in catalog_jobs)
+    total_bytes = 0
+    if deep:
+        total_bytes = sum(job.row.size for job in planned_jobs) + (
+            catalog_bytes if budget is None else min(catalog_bytes, budget))
+    job_count = len(results) + len(planned_jobs) + len(catalog_jobs)
+    done_bytes = 0
+    started = time.monotonic()
+    last_report = started
+    last_write = started
+    now = datetime.now().isoformat(timespec="seconds")
+    marks = []              # (key, new hash or None): verified, not yet in the catalog
+    catalog_error = None
+    stopped = False         # the destination went away: nothing after it was checked
 
-        def verify_one(job):
-            """Verify one row; True when it got a verified_at (it leaves the
-            front of the rolling queue)."""
-            nonlocal done_bytes, last_report
-            result = _verify_row(job, dest, deep)
-            results.append(result)
-            if deep:
-                done_bytes += job.row.size
-                if time.monotonic() - last_report >= PROGRESS_EVERY_S:
-                    print(f"[{len(results)}/{job_count}] {_gb(done_bytes)}/{_gb(total_bytes)}")
-                    last_report = time.monotonic()
-            verified = (result.status in ("HASH_FILLED", "OK") or result.dest_verified)
-            # Only a full verify reads the files: a quick one never records
-            # verified_at, or it would reset the --max-gb queue (B23).
-            if deep and job.in_catalog:
-                if result.status == "HASH_FILLED":
-                    catalog.set_hash_verified(job.row.key, result.new_hash, now)
-                elif verified:
-                    catalog.set_verified(job.row.key, now)
-            return verified
+    def write_marks():
+        """Record what was verified since the last write. The transaction is
+        open only for this moment: a backup started meanwhile is not locked
+        out for the hours a full verify takes."""
+        nonlocal catalog_error, last_write
+        last_write = time.monotonic()
+        if catalog_error is not None or not marks:
+            return
+        try:
+            for key, new_hash in marks:
+                if new_hash is not None:
+                    catalog.set_hash_verified(key, new_hash, now)
+                else:
+                    catalog.set_verified(key, now)
+            catalog.commit()
+        except sqlite3.Error as exc:
+            catalog_error = str(exc) or type(exc).__name__
+            log.log(f"CATALOG NOT WRITTEN ({catalog_error})")
+        marks.clear()
 
+    def verify_one(job):
+        """Verify one row; True when it got a verified_at (it leaves the
+        front of the rolling queue)."""
+        nonlocal done_bytes, last_report, stopped
+        result = _verify_row(job, dest, deep, reader)
+        if result.status in ("DEST_MISSING", "DEST_UNREADABLE") and not _dest_available(dest):
+            stopped = True
+            return False
+        results.append(result)
+        if result.status != "OK":
+            log.log(f"{result.status} {result.rel}"
+                    + (f": {result.detail}" if result.detail else ""))
+        if deep:
+            done_bytes += job.row.size
+            if time.monotonic() - last_report >= PROGRESS_EVERY_S:
+                elapsed = max(time.monotonic() - started, 1e-6)
+                speed = done_bytes / elapsed
+                eta = (total_bytes - done_bytes) / speed if speed > 0 else 0
+                print(f"[{len(results)}/{job_count}] {_gb(done_bytes)}/{_gb(total_bytes)}  "
+                      f"{speed / 1e6:.0f} MB/s  ETA {_hms(eta)}")
+                last_report = time.monotonic()
+        verified = (result.status in ("HASH_FILLED", "OK") or result.dest_verified)
+        # Only a full verify reads the files: a quick one never records
+        # verified_at, or it would reset the --max-gb queue (B23).
+        if deep and job.in_catalog and verified:
+            marks.append((job.row.key,
+                          result.new_hash if result.status == "HASH_FILLED" else None))
+            if time.monotonic() - last_write >= VERIFY_COMMIT_S:
+                write_marks()
+        return verified
+
+    checked_jobs = []
+    deferred = []
+    interrupted = False
+    try:
         for job in planned_jobs:
             verify_one(job)
-        checked_jobs = []
-        deferred = []
+            if stopped:
+                break
         used = 0
         for index, job in enumerate(catalog_jobs):
+            if stopped:
+                break
             if budget is not None and used and used + job.row.size > budget:
                 deferred = catalog_jobs[index:]
                 break
@@ -2612,41 +3015,57 @@ def _run_verify(args, log, plan_fn=None):
             # rest of the backup back from being verified.
             if verify_one(job):
                 used += job.row.size
-        catalog.commit()
-        counts = {}
-        for result in results:
-            counts[result.status] = counts.get(result.status, 0) + 1
-        summary = f"Verify {args.verify}: {_num(len(results))} files  " + "  ".join(
-            f"{status} {_num(counts[status])}" for status in sorted(counts))
-        log.out(summary)
-        if budget is not None:
-            log.out(f"Rolling verify: checked {_num(len(checked_jobs))} files / "
-                    f"{_gb(sum(job.row.size for job in checked_jobs))}, "
-                    f"deferred {_num(len(deferred))} files / "
-                    f"{_gb(sum(job.row.size for job in deferred))} "
-                    f"(oldest verification first; the next run continues; "
-                    f"a row with a problem does not count against --max-gb)")
-        if outside:
-            log.out(f"{_num(len(outside))} files / {_gb(sum(row.size for row in outside))} "
-                    f"of the catalog are outside these sources: not checked")
-        if planned.errors:
-            log.out(f"Errors: {_num(len(planned.errors))} folders/files could not be read -> {log.path}")
-        log.csv("_verify.csv", ["status", "rel", "source_path", "detail"],
-                [(result.status, result.rel, result.source_path, result.detail)
-                 for result in results])
-        status_by_rel = {result.rel: result.status for result in results}
-        log.csv("_plan.csv", ["action", "category", "size", "mtime", "src", "rel"],
-                [(status_by_rel.get(planned_file.rel, ""), planned_file.category,
-                  planned_file.size,
-                  datetime.fromtimestamp(planned_file.mtime_ns / 1e9).strftime("%Y-%m-%d %H:%M:%S"),
-                  planned_file.src, planned_file.rel)
-                 for planned_file in planned.files])
-        bad = [result for result in results if result.status not in good]
-        if planned.errors:
-            return 1
-        return 1 if bad else 0
-    finally:
-        catalog.close()
+    except KeyboardInterrupt:
+        interrupted = True
+    write_marks()
+    counts = {}
+    for result in results:
+        counts[result.status] = counts.get(result.status, 0) + 1
+    summary = f"Verify {args.verify}: {_num(len(results))} files  " + "  ".join(
+        f"{status} {_num(counts[status])}" for status in sorted(counts))
+    log.out(summary)
+    if interrupted or stopped:
+        why = ("INTERRUPTED" if interrupted else
+               f"STOPPED: the destination is not available any more ({dest})")
+        log.out(f"{why}: {_num(job_count - len(results))} of {_num(job_count)} files were "
+                f"not checked; what was checked is recorded")
+    if budget is not None:
+        log.out(f"Rolling verify: checked {_num(len(checked_jobs))} files / "
+                f"{_gb(sum(job.row.size for job in checked_jobs))}, "
+                f"deferred {_num(len(deferred))} files / "
+                f"{_gb(sum(job.row.size for job in deferred))} "
+                f"(oldest verification first; the next run continues; "
+                f"a row with a problem does not count against --max-gb)")
+    if outside:
+        log.out(f"{_num(len(outside))} files / {_gb(sum(row.size for row in outside))} "
+                f"of the catalog are outside these sources: not checked")
+    if planned.errors:
+        log.out(f"Errors: {_num(len(planned.errors))} folders/files could not be read -> {log.path}")
+    if catalog_error is not None:
+        log.out(f"CATALOG: the dates of this verification could not be recorded "
+                f"({catalog_error})")
+    listed = [result for result in results if VERIFY_CSV_OK or result.status != "OK"]
+    log.csv("_verify.csv", ["status", "rel", "source_path", "detail"],
+            [(result.status, result.rel, result.source_path, result.detail)
+             for result in listed])
+    if len(listed) != len(results):
+        log.log(f"_verify.csv: {_num(len(results) - len(listed))} OK files not listed "
+                f"(VERIFY_CSV_OK)")
+    status_by_rel = {result.rel: result.status for result in results}
+    plan_rows = []
+    for planned_file in planned.files:
+        status = status_by_rel.get(planned_file.rel, "")
+        if VERIFY_CSV_OK or status not in ("OK", ""):
+            plan_rows.append((status, planned_file.category, planned_file.size,
+                              _csv_date(planned_file.mtime_ns), planned_file.src,
+                              planned_file.rel))
+    log.csv("_plan.csv", ["action", "category", "size", "mtime", "src", "rel"], plan_rows)
+    if interrupted:
+        print("Interrupted.", file=sys.stderr)
+        log.log("Interrupted.")
+        return 130
+    bad = [result for result in results if result.status not in good]
+    return 1 if bad or planned.errors or stopped or catalog_error is not None else 0
 
 
 def _build_parser():

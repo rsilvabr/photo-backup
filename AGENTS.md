@@ -65,7 +65,15 @@ from the command line. A future job (e.g. a full mirror) is a new
   `--revert-last` must never take it out); `--revert-last` does the same. A
   catalog row without a hash is filled by `--verify` only from a source with the
   row's size and date (`HASH_FILLED`), and its restore checks the size
-  (`RESTORED_UNVERIFIED`).
+  (`RESTORED_UNVERIFIED`). v0.13.1: the `.cmd` and the map are written from the
+  catalog's rows (what the backup holds), never from this run's plan alone; the
+  `.cmd` has `/XF *` + `TEMP_SUFFIX` on every robocopy line and gives
+  `ELEVATED_ARGUMENT` to the instance it elevates. The journal records each
+  file's absolute `target` and `--revert-last` undoes it there
+  (`_journal_target_valid`). A read-only target is made writable only in
+  `before_final` (`_writable_before_swap`), after the current file is in the
+  snapshot. Links are listed in `plan.links` and reported; what could not be
+  read is in `plan.unread` and is never "gone".
 - `mobile_backup.py` — mirrors the `JXL_mobile` folders to another disk as
   one album per event, numbered in shot order (exiftool); its own version
   (`0.1.x`) and its own README (`README_mobile_backup.md`). It is the one
@@ -192,6 +200,48 @@ from the command line. A future job (e.g. a full mirror) is a new
 - **Only `--verify full` records `verified_at` (v0.12.1).** A quick verify
   reads no file; recording it would send the `--max-gb` queue back to its
   start. The same for `manifest_backup.py --verify` (it uses `_run_verify`).
+- **A verify never ends on a file, and keeps what it checked (v0.13.1).**
+  `_verify_row` turns every read error into a status (`DEST_UNREADABLE`,
+  `SOURCE_UNREADABLE`), never an exception. `_verify_catalog` records
+  `verified_at` through `write_marks` every `VERIFY_COMMIT_S`, in one short
+  transaction, and writes the summary and `_verify.csv` on Ctrl+C too. With two
+  drives the copy is hashed on `_CopyReader`'s thread while the main thread
+  hashes the source (`_same_drive`, `VERIFY_PARALLEL`); the catalog stays on the
+  main thread. A `DEST_MISSING` on a destination that no longer answers
+  (`_dest_available`) stops the verify instead of being reported. `upsert`
+  clears `verified_at`: the date belongs to the bytes that were read.
+- **A listing never proves that a destination file is NEW (v0.13.1).**
+  `_file_statuses` takes size and date from one `scandir` per destination
+  folder only for a name the listing holds exactly as planned; a miss asks
+  `os.stat` (`_file_status`). A false NEW would be `os.replace`d over an
+  existing file without the versions folder. Only a folder that does not
+  exist makes its files NEW without asking.
+- **A name Windows rewrites goes through `os.path.relpath` (v0.13.1).**
+  `_Planner._rel` cuts the base's prefix only when `_REL_REWRITTEN` finds no
+  name ending in a dot or a space and no device name: relpath reads `Trip.` as
+  `Trip`, which is how two folders with one destination are found (S8).
+- **One odd file never stops a run (v0.13.1).** A file date goes to a CSV
+  through `_csv_date` and to the catalog through `_db_ns` (SQLite holds 64
+  bits: a date after 2262 is stored at the limit and compared the same way) --
+  never `datetime.fromtimestamp` on a file date. A read asks for what the file
+  holds (`_read_chunks`), never `handle.read(COPY_CHUNK_MB ...)`.
+- **The catalog is checked when it is opened (v0.13.1).** `_Catalog` runs
+  `PRAGMA quick_check`: a damaged catalog is a `RuntimeError` (exit 2) for the
+  backup, the dry-run, the verify, the restore and the menu. A run reads the
+  catalog's rows inside `except sqlite3.Error`. A plan with a path under
+  `CATALOG_FOLDER` is refused (`_reserved_rel_error`, exit 2).
+- **The big CSVs list what changed (v0.13.1).** `_plan.csv` of a run that
+  copies leaves out the UP_TO_DATE lines (`PLAN_CSV_UP_TO_DATE`; a dry-run
+  lists every file); `_verify.csv` and the verify's `_plan.csv` leave out the
+  OK ones (`VERIFY_CSV_OK`). A test that reads those lines sets the setting.
+- **`mobile_backup.py` 0.1.3.** The state records the size and date a photo
+  had while its bytes were read (`_copy` returns them); an entry with no source
+  and no mirror file is dropped (`forget`, never in a run with a read error); a
+  mirror file that a live photo holds is never deleted in another entry's name
+  (`held_by_another`); `chmod` only on our temp suffixes or a file the state
+  proves ours; the album never depends on `--source` (`album_folder` searches
+  up to the drive; a partial album is numbered with the state's other photos,
+  counted only).
 - **`mobile_backup.py` deletes only with proof (0.1.2).** It is the one script
   that deletes on its destination (a mirror). A photo is deleted or renumbered
   only when its path is under a `--source` of this run (`_under_run`; never by

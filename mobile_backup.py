@@ -28,6 +28,12 @@ path is under one of the sources it was given (the state also records each
 photo's root); a folder of a source that cannot be read stops every delete and
 rename of that run (exit 1). A photo whose shot time exiftool did not answer for is read
 again on the next run (exit 1), never recorded as "no date".
+
+The state records what was really copied (v0.1.3): the size and date the
+source had while its bytes were read, not what the scan saw earlier. A state
+entry with nothing behind it (source gone, mirror file gone) is dropped, and a
+mirror file that a photo still in the source holds is never deleted in the
+name of another entry.
 """
 
 import argparse
@@ -35,12 +41,13 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 # ---- Sources and destination ---------------------------------------------------
 SOURCES = ""                        # ';'-separated default for --source (e.g. r"G:\2024;G:\2025;G:\2026")
@@ -50,6 +57,7 @@ DESTINATION = ""                    # default for --dest (e.g. r"H:\MOBILE")
 MOBILE_FOLDER_NAMES = "JXL_mobile"  # ';'-separated folder names (any case) whose files are mirrored
 EXTENSIONS = (".jxl", ".jpg", ".jpeg", ".heic", ".avif", ".png")
 EVENT_NAME_PATTERN = r"^\d{6}"      # the album is the nearest folder ABOVE the mobile folder whose name matches
+                                    # (up to the drive: the same album whatever --source was given)
 EXPORT_NAME_CONTAINS = "export"     # without a match: the nearest folder above whose name does not contain this
 SYSTEM_SKIP_FOLDERS = "$RECYCLE.BIN;System Volume Information"
 
@@ -61,6 +69,11 @@ NUMBER_SEPARATOR = "_"
 STATE_FOLDER = ".mobile_backup"     # under the destination; exclude it in FreeFileSync
 STATE_FILE = "state.json"
 STATE_SAVE_EVERY = 20               # copies between two saves of the state (also saved after the renames)
+STATE_SAVE_SPREAD = 200             # ... and in a long run 1/200 of the copies done so far, when that is more
+                                    # (after 4 000 copies): every save rewrites the whole state. A kill loses
+                                    # the copies since the last save (their albums are skipped until the files
+                                    # are removed by hand), so keep it high; 0 = always STATE_SAVE_EVERY
+PROGRESS_EVERY = 200                # copies between two progress lines on the screen
 TEMP_SUFFIX = ".mbtmp"              # in-progress copy, next to its final name
 RENAME_SUFFIX = ".mbren"            # a file between its old and new number
 SPACE_MARGIN_GB = 5.0
@@ -128,10 +141,15 @@ class Logger:
 
 # ---- Discovery --------------------------------------------------------------------------
 
-def album_folder(mobile_dir, source_root):
-    """The event folder a mobile folder belongs to (absolute path)."""
+def album_folder(mobile_dir, source_root=None):
+    """The event folder a mobile folder belongs to (absolute path): the nearest
+    folder above it whose name matches EVENT_NAME_PATTERN, else the nearest one
+    whose name does not contain EXPORT_NAME_CONTAINS. The search goes up to the
+    drive, also above `source_root` (kept for its callers, not used): the album
+    of a photo depends on where the photo is, never on which --source the run
+    was given. A run with --source on a camera folder inside an event must not
+    move that camera's photos to an album of their own (v0.1.3)."""
     pattern = re.compile(EVENT_NAME_PATTERN)
-    root = os.path.abspath(source_root)
     current = os.path.dirname(os.path.abspath(mobile_dir))
     fallback = None
     while True:
@@ -142,8 +160,6 @@ def album_folder(mobile_dir, source_root):
             return current
         if fallback is None and EXPORT_NAME_CONTAINS.lower() not in name.lower():
             fallback = current
-        if os.path.normcase(current) == os.path.normcase(root):
-            break
         parent = os.path.dirname(current)
         if parent == current:
             break
@@ -325,14 +341,41 @@ def plan(photos, stats, shots, state, dest, run_roots=None):
     albums = {}
     for source, rel in photos.items():
         albums.setdefault(rel, []).append((source, shots.get(source)))
+    if run_roots is not None:
+        # A run given only a part of an event (--source on one camera folder)
+        # numbers that part as the album last was: the album's other photos,
+        # known from the state, keep their place in the count. They are counted
+        # only -- never copied, renamed or deleted here (v0.1.3).
+        by_fold = {os.path.normcase(rel): rel for rel in albums}
+        for source, rec in state.items():
+            if source in photos or _under_run(source, run_roots):
+                continue
+            rel = by_fold.get(os.path.normcase(album_rel(album_folder(os.path.dirname(source)))))
+            if rel is not None:
+                albums[rel].append((source, rec.get("shot")))
     desired = {}
     for rel, entries in albums.items():
         for source, name in numbered_names(entries).items():
-            desired[source] = os.path.join(rel, name)
+            if source in photos:
+                desired[source] = os.path.join(rel, name)
 
-    tracked = {rec["dest"].lower(): source for source, rec in state.items()}
+    # Who holds each mirror name. Two entries with one name is a state gone
+    # wrong (0.1.2 could write that): the photo still in a source is the owner.
+    tracked = {}
+    holders = {}
+    for source, rec in state.items():
+        key = rec["dest"].lower()
+        holders.setdefault(key, []).append(source)
+        if key not in tracked or source in desired:
+            tracked[key] = source
+
+    def held_by_another(source, rel):
+        """A photo still in a source holds this mirror name too: the file there
+        is that photo's, and is not deleted in the name of `source`."""
+        return any(other != source and other in desired for other in holders.get(rel.lower(), ()))
+
     actions = {"copy": [], "rename": [], "delete": [], "keep": [], "conflict": [], "kept_changed": [],
-               "elsewhere": []}
+               "elsewhere": [], "forget": []}
 
     blocked = set()
     for source, rel_dest in desired.items():
@@ -356,16 +399,20 @@ def plan(photos, stats, shots, state, dest, run_roots=None):
         rec = state.get(source)
         current = os.path.join(dest, rec["dest"]) if rec else None
         current_ok = bool(rec) and os.path.exists(_io(current)) and \
-            os.path.getsize(_io(current)) == rec["size"]
+            os.path.getsize(_io(current)) == rec["size"] and \
+            not held_by_another(source, rec["dest"])    # whose file it is cannot be told: copy again
         unchanged = bool(rec) and rec["size"] == size and rec["mtime_ns"] == mtime_ns
+        # the same name in another case is the same file of the mirror (a
+        # --source typed as g:\ instead of G:\): nothing to rename
+        same_name = bool(rec) and os.path.normcase(rec["dest"]) == os.path.normcase(rel_dest)
         if current_ok and unchanged:
-            if rec["dest"] == rel_dest:
+            if same_name:
                 actions["keep"].append(source)
             else:
                 actions["rename"].append((source, rec["dest"], rel_dest))
         else:
             actions["copy"].append((source, rel_dest))
-            if current_ok and rec["dest"] != rel_dest:
+            if current_ok and not same_name:
                 actions["delete"].append((source, rec["dest"]))
 
     for source, rec in sorted(state.items()):
@@ -376,6 +423,13 @@ def plan(photos, stats, shots, state, dest, run_roots=None):
             continue
         current = os.path.join(dest, rec["dest"])
         if not os.path.exists(_io(current)):
+            # Source gone and nothing of it on the mirror: the entry is dropped.
+            # Left in the state, it would delete the file of whatever photo is
+            # copied to that name later (v0.1.3). Dropping deletes nothing.
+            actions["forget"].append(source)
+            continue
+        if held_by_another(source, rec["dest"]):
+            actions["forget"].append(source)        # that file is the other photo's: never deleted
             continue
         if os.path.getsize(_io(current)) != rec["size"]:
             actions["kept_changed"].append(rec["dest"])   # not the file we wrote: leave it
@@ -386,14 +440,68 @@ def plan(photos, stats, shots, state, dest, run_roots=None):
 
 # ---- Execute ----------------------------------------------------------------------------------
 
+def _writable(path):
+    """Clear the read-only attribute. Only ever called on a file that is ours:
+    one with our temp suffixes, or a mirror file the state proves this job
+    wrote (0.1.2 and older carried the attribute over from a read-only source,
+    and then could neither delete nor replace their own copy)."""
+    os.chmod(_io(path), stat.S_IREAD | stat.S_IWRITE)
+
+
+def _is_read_only(path):
+    try:
+        return not os.stat(_io(path)).st_mode & stat.S_IWRITE
+    except OSError:
+        return False
+
+
+def _unlink_ours(path):
+    """Delete a file that is ours (see _writable), read-only or not."""
+    try:
+        os.unlink(_io(path))
+    except PermissionError:
+        if not _is_read_only(path):
+            raise
+        _writable(path)
+        os.unlink(_io(path))
+
+
+def _rename_free(old, new):
+    """Rename to a name nothing holds; never onto a file (os.rename refuses that
+    on Windows by itself)."""
+    if os.path.lexists(_io(new)):
+        raise FileExistsError(f"a file is in the way: {new}")
+    os.rename(_io(old), _io(new))
+
+
 def _copy(source, target):
+    """Copy `source` to `target` through a temp file next to it. Returns the
+    (size, mtime_ns) the source had WHILE ITS BYTES WERE READ: that is what the
+    state must record, not what the scan saw minutes earlier (a photo exported
+    again in between left the album skipped for good). A source that changes
+    during the read is an error; the next run copies it. The copy keeps the
+    source's date and never its read-only attribute."""
     os.makedirs(_io(os.path.dirname(target)), exist_ok=True)
     tmp = target + TEMP_SUFFIX
-    shutil.copy2(_io(source), _io(tmp))
-    if os.path.getsize(_io(tmp)) != os.path.getsize(_io(source)):
-        os.unlink(_io(tmp))
-        raise OSError(f"size mismatch after copy: {source}")
-    os.replace(_io(tmp), _io(target))
+    try:
+        with open(_io(source), "rb") as reader:
+            before = os.fstat(reader.fileno())
+            with open(_io(tmp), "wb") as writer:
+                shutil.copyfileobj(reader, writer)
+                written = writer.tell()
+            after = os.fstat(reader.fileno())
+        if written != before.st_size or \
+                (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+            raise OSError(f"changed while it was copied: {source}")
+        os.utime(_io(tmp), ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(_io(tmp), _io(target))
+    except BaseException:
+        try:
+            _unlink_ours(tmp)
+        except OSError:
+            pass
+        raise
+    return before.st_size, before.st_mtime_ns
 
 
 def _remove_empty_dirs(dest, rel_paths):
@@ -409,31 +517,59 @@ def _remove_empty_dirs(dest, rel_paths):
 
 
 def cleanup_leftovers(dest, log):
-    """Our own temp files from an interrupted run (only our suffixes)."""
+    """Our own temp files from an interrupted run (only our suffixes), read-only
+    or not. Returns how many could not be removed (each is named)."""
+    problems = 0
     for current, dirs, files in os.walk(_io(dest)):
         dirs[:] = [d for d in dirs if d != STATE_FOLDER]
         for name in files:
             if name.endswith(TEMP_SUFFIX) or name.endswith(RENAME_SUFFIX):
-                os.unlink(os.path.join(current, name))
+                try:
+                    _unlink_ours(os.path.join(current, name))
+                except OSError as exc:
+                    log.out(f"ERROR cannot remove the leftover {_plain(os.path.join(current, name))}: {exc}")
+                    problems += 1
+                    continue
                 log.log(f"LEFTOVER removed {name}")
+    return problems
+
+
+def _save_interval(copied):
+    """Copies between two saves of the state, after `copied` copies of this run.
+    Every save rewrites the whole state: at a fixed interval a first run of N
+    photos costs N*N/interval; this way it is a few dozen saves per tenfold."""
+    if STATE_SAVE_SPREAD > 0:
+        return max(STATE_SAVE_EVERY, copied // STATE_SAVE_SPREAD)
+    return STATE_SAVE_EVERY
 
 
 def execute(actions, photos, stats, shots, state, dest, log, unread=frozenset(), roots=None):
     """`unread`: photos whose shot time was not read (their state gets no
     "shot", so the next run reads them again); `roots`: each photo's source root."""
     errors = 0
+    # 0. state entries with nothing behind them, or whose file is another photo's
+    forgotten = 0
+    for source in actions.get("forget", ()):
+        if state.pop(source, None) is not None:
+            forgotten += 1
+            log.log(f"FORGET {source}")
     # 1. renames, step one: every renamed file leaves its old name first
     moving = []
     for source, old, new in actions["rename"]:
         old_path = os.path.join(dest, old)
         tmp = old_path + RENAME_SUFFIX
-        os.replace(_io(old_path), _io(tmp))
-        moving.append((source, tmp, new))
+        try:
+            os.replace(_io(old_path), _io(tmp))
+        except OSError as exc:      # open in another program: it keeps its name and number
+            log.out(f"ERROR rename {old}: {exc}")
+            errors += 1
+            continue
+        moving.append((source, old, tmp, new))
     # 2. deletes (gone from the source, or replaced by a new copy under a new number)
     for source, old in actions["delete"]:
         path = os.path.join(dest, old)
         try:
-            os.unlink(_io(path))
+            _unlink_ours(path)      # the plan proved it ours: in the state, with the size we wrote
             log.log(f"DELETE {old}")
         except OSError as exc:
             log.out(f"ERROR delete {old}: {exc}")
@@ -442,33 +578,59 @@ def execute(actions, photos, stats, shots, state, dest, log, unread=frozenset(),
         if source not in photos:
             state.pop(source, None)
     # 3. renames, step two
-    for source, tmp, new in moving:
+    for source, old, tmp, new in moving:
         target = os.path.join(dest, new)
-        os.makedirs(_io(os.path.dirname(target)), exist_ok=True)
-        os.replace(_io(tmp), _io(target))
+        try:
+            os.makedirs(_io(os.path.dirname(target)), exist_ok=True)
+            _rename_free(tmp, target)
+        except OSError as exc:
+            log.out(f"ERROR rename {old} -> {new}: {exc}")
+            errors += 1
+            try:                    # back to the name the state knows
+                _rename_free(tmp, os.path.join(dest, old))
+            except OSError as back:
+                log.out(f"ERROR {old} is left as {os.path.basename(tmp)}: {back}")
+            continue
         state[source]["dest"] = new
         log.log(f"RENAME {new}")
-    if moving or actions["delete"]:
+    if moving or actions["delete"] or forgotten:
         save_state(dest, state)     # a kill after this point does not leave the old names (B13)
     # 4. copies
+    copied = unsaved = 0
     for done, (source, rel_dest) in enumerate(actions["copy"], 1):
+        target = os.path.join(dest, rel_dest)
+        old = state.get(source)
         try:
-            _copy(source, os.path.join(dest, rel_dest))
+            if old and os.path.normcase(old["dest"]) == os.path.normcase(rel_dest) and \
+                    _is_read_only(target) and os.path.getsize(_io(target)) == old["size"]:
+                _writable(target)   # our own read-only copy of this photo, about to be replaced
+            result = _copy(source, target)
         except OSError as exc:
             log.out(f"ERROR copy {source}: {exc}")
             errors += 1
             continue
-        size, mtime_ns = stats[source]
+        # what was really copied; a stand-in for _copy that returns nothing
+        # (the tests' kill) leaves what the scan saw
+        size, mtime_ns = result or stats[source]
         rec = {"dest": rel_dest, "size": size, "mtime_ns": mtime_ns}
-        if source not in unread:
+        if source in unread:
+            pass                    # no "shot": read again on the next run
+        elif (size, mtime_ns) != tuple(stats[source]):
+            # changed between the scan and the copy: the shot time read is the
+            # old file's, so it is read again too
+            log.log(f"CHANGED since the scan, shot time read again on the next run: {source}")
+        else:
             rec["shot"] = shots.get(source)
         if roots is not None and roots.get(source):
             rec["root"] = roots[source]
         state[source] = rec
         log.log(f"COPY {rel_dest}")
-        if STATE_SAVE_EVERY > 0 and done % STATE_SAVE_EVERY == 0:
+        copied += 1
+        unsaved += 1
+        if STATE_SAVE_EVERY > 0 and unsaved >= _save_interval(copied):
             save_state(dest, state)
-        if done % 200 == 0:
+            unsaved = 0
+        if PROGRESS_EVERY > 0 and done % PROGRESS_EVERY == 0:
             print(f"  copied {done}/{len(actions['copy'])}")
     _remove_empty_dirs(dest, [old for _s, old in actions["delete"]] +
                        [old for _s, old, _n in actions["rename"]])
@@ -495,6 +657,42 @@ def _sources(args):
     return [p.strip() for item in raw for p in item.split(";") if p.strip()]
 
 
+def _dest_problem(dest):
+    """Why `dest` cannot be the mirror, or None. Asked BEFORE the scan: a drive
+    that is not connected must not cost the reading of every shot time first."""
+    current = dest
+    while True:
+        if os.path.exists(_io(current)):
+            if not os.path.isdir(_io(current)):
+                return f"{current} is not a folder"
+            return None
+        parent = os.path.dirname(current)
+        if parent == current:
+            return f"{current} does not answer (a drive that is not connected?)"
+        current = parent
+
+
+def match_state_case(state, photos):
+    """Give a state entry the spelling its photo has in this run. The state is
+    keyed by the source path as text, and the same folder typed in another case
+    (g:\\2026 after G:\\2026) made every photo look new: all read again, all
+    deleted and copied again. An entry moves only when exactly one entry has
+    that path in another case and no photo of this run has the entry's own
+    spelling. Returns how many moved."""
+    folded = {}
+    for key in state:
+        folded.setdefault(os.path.normcase(key), []).append(key)
+    moved = 0
+    for source in photos:
+        if source in state:
+            continue
+        keys = folded.get(os.path.normcase(source), [])
+        if len(keys) == 1 and keys[0] not in photos:
+            state[source] = state.pop(keys[0])
+            moved += 1
+    return moved
+
+
 def run(args, log):
     sources = [os.path.abspath(s) for s in _sources(args)]
     if not sources or not args.dest:
@@ -508,6 +706,10 @@ def run(args, log):
         if _is_inside(dest, source) or _is_inside(source, dest):
             log.out(f"ERROR: the destination and a source contain each other: {dest} / {source}")
             return 2
+    problem = _dest_problem(dest)
+    if problem:
+        log.out(f"ERROR: the destination cannot be used: {problem}")
+        return 2
     meta = {}
     try:
         state = load_state(dest, meta)
@@ -533,13 +735,17 @@ def run(args, log):
             del photos[source]
             continue
         stats[source] = (st.st_size, st.st_mtime_ns)
+    respelled = match_state_case(state, photos)
+    if respelled:
+        log.log(f"{respelled} photo(s) of the state are spelled in another case in this run: the same photos")
 
     def unchanged(s):
         return s in state and state[s]["size"] == stats[s][0] and state[s]["mtime_ns"] == stats[s][1]
 
     # "shot" missing from the state = exiftool did not answer last time: read again
     need = [s for s in photos if not (unchanged(s) and "shot" in state[s])]
-    shots = {s: state[s].get("shot") for s in photos if s not in need}
+    needed = set(need)              # a list here was 9 s of lookups for 50 000 new photos
+    shots = {s: state[s].get("shot") for s in photos if s not in needed}
     unread = set()
     if need:
         log.out(f"Reading the shot time of {len(need)} new or changed file(s)...")
@@ -559,6 +765,7 @@ def run(args, log):
         # deleted, or renamed over. Only new photos go to free names this run.
         actions["delete"] = []
         actions["rename"] = []
+        actions["forget"] = []      # a source not read in full proves nothing gone
         actions["copy"] = [(s, r) for s, r in actions["copy"]
                            if s not in state and not os.path.exists(_io(os.path.join(dest, r)))]
     albums = len(set(photos.values()))
@@ -591,20 +798,33 @@ def run(args, log):
             log.log(f"would RENAME {old} -> {new}")
         for _s, old in actions["delete"]:
             log.log(f"would DELETE {old}")
+        for source in actions["forget"]:
+            log.log(f"would FORGET {source}")
         log.out("Dry run: nothing changed.")
-        return problems
+        # the exit code of the real run this plan gives: a skipped album is 1 there too
+        return 1 if problems or actions["conflict"] else 0
 
-    os.makedirs(_io(dest), exist_ok=True)
-    free = shutil.disk_usage(_io(dest)).free
+    try:
+        os.makedirs(_io(dest), exist_ok=True)
+        free = shutil.disk_usage(_io(dest)).free
+    except OSError as exc:
+        log.out(f"ERROR: the destination cannot be used: {dest}: {exc}")
+        return 2
     if copy_bytes + SPACE_MARGIN_GB * 1e9 > free:
         log.out(f"ERROR: not enough space on {dest}: {copy_bytes / 1e9:.2f} GB to copy, "
                 f"{free / 1e9:.2f} GB free, margin {SPACE_MARGIN_GB} GB")
         return 2
-    cleanup_leftovers(dest, log)
+    errors = cleanup_leftovers(dest, log)
     try:
-        errors = execute(actions, photos, stats, shots, state, dest, log, unread, roots)
-    finally:
-        save_state(dest, state)
+        try:
+            errors += execute(actions, photos, stats, shots, state, dest, log, unread, roots)
+        finally:
+            save_state(dest, state)
+    except OSError as exc:
+        # only the state file raises here (every copy, rename and delete has its
+        # own error line): a destination that went away in the middle
+        log.out(f"ERROR: the run stopped, the state file could not be written: {exc}")
+        return 1
     log.out(f"Done in {time.time() - started:.0f}s: {errors} error(s), "
             f"{len(actions['conflict'])} album(s) skipped.")
     return 1 if errors or actions["conflict"] or problems else 0

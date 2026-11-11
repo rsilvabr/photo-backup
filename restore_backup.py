@@ -19,13 +19,14 @@ CONFLICT and left alone.
 import argparse
 import os
 import shutil
+import sqlite3
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 
 # ---- Settings -------------------------------------------------------------------
 SPACE_MARGIN_GB = 5.0     # free space kept on each restore target drive (default --space-margin-gb)
@@ -125,6 +126,9 @@ def _main(argv):
         return 2
     try:
         rows = catalog.all_rows()
+    except sqlite3.Error as exc:
+        print(f"cannot read catalog {catalog.path}: {exc}", file=sys.stderr)
+        return 2
     finally:
         catalog.close()
     if args.expect_backup_id:
@@ -240,8 +244,20 @@ def _main(argv):
                 return 2
         result_rows = []
         bad = False
+        total_bytes = sum(row.size for _status, row, _src, _target in restores)
+        done_bytes = 0
+        started = time.monotonic()
+        last_report = started
+        tolerance = int(sb.MTIME_TOLERANCE_S * 1_000_000_000)
         try:
             for status, row, src, target in items:
+                now = time.monotonic()
+                if now - last_report >= sb.PROGRESS_EVERY_S:
+                    speed = done_bytes / max(now - started, 1e-6)
+                    eta = (total_bytes - done_bytes) / speed if speed > 0 else 0
+                    print(f"[{len(result_rows)}/{len(items)}] {sb._gb(done_bytes)}/"
+                          f"{sb._gb(total_bytes)}  {speed / 1e6:.0f} MB/s  ETA {sb._hms(eta)}")
+                    last_report = now
                 if status == "MISSING_IN_BACKUP":
                     result_rows.append((status, row.rel, target, "backup file missing"))
                     bad = True
@@ -267,14 +283,23 @@ def _main(argv):
                     log.log(f"{outcome} {row.rel}")
                     continue
                 try:
-                    backup_size = os.stat(sb._io(src)).st_size
+                    backup_stat = os.stat(sb._io(src))
+                    backup_size = backup_stat.st_size
                     if backup_size != row.size:
                         raise RuntimeError(
                             f"content differs from the catalog: backup file size "
                             f"{backup_size} != {row.size} (backup copy corrupt?)")
                     planned = sb.PlannedFile(src, row.rel, row.size, row.mtime_ns, "restore")
+                    # A backup on FAT/exFAT keeps a date in 2 s steps: a copy
+                    # whose date is the catalog's within that step is restored
+                    # with the exact date the original had. Any other copy
+                    # keeps the date it has.
+                    exact = (row.mtime_ns
+                             if abs(backup_stat.st_mtime_ns - row.mtime_ns) <= tolerance
+                             else None)
                     sb._copy_file(planned, target, "hash", expected_sha256=row.sha256,
-                                  no_clobber=True)
+                                  no_clobber=True, mtime_ns=exact)
+                    done_bytes += row.size
                     status = "RESTORED" if row.sha256 else "RESTORED_UNVERIFIED"
                     detail = ""
                 except FileExistsError:

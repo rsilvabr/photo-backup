@@ -31,8 +31,10 @@ that --revert-last puts back.
 import argparse
 import fnmatch
 import json
+import math
 import os
 import shutil
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -42,7 +44,7 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 
 # ---- Settings -------------------------------------------------------------------
 BACKUP_SUBFOLDER = "_captureone"            # under --dest: this script's own backup root
@@ -55,6 +57,8 @@ OLD_PREFIX = "old_"                         # + date_time_ms: a --force snapshot
 REVERT_PREFIX = "revert_old_"               # + date_time_ms: what a --revert-last replaced (never picked as 'last')
 DISABLED_SUFFIX = "_not"                    # rename an old_ folder to end with this and --revert-last skips it
 JOURNAL_FILE = "journal.jsonl"              # in each snapshot: one line per file replaced or added
+ELEVATED_ARGUMENT = "--elevated"            # RESTORE_SCRIPT gives it to the instance it starts as administrator
+SUMMARY_LINK_LINES = 10                     # links/junctions not followed named on the screen (the log has all)
 
 USER_FOLDER_NAME = "CaptureOne"             # under %LOCALAPPDATA%
 PREFERENCES_FOLDER_NAME = "Capture_One"     # under %LOCALAPPDATA%
@@ -86,7 +90,7 @@ PROTECTED_LABELS = (LABEL_INSTALLED, LABEL_WINDOWS)     # writing there needs an
 
 BAD_RESTORE = ("CONFLICT", "NEEDS_ADMIN", "NOT_INSTALLED", "NO_TARGET", "MISSING_IN_BACKUP",
                "CORRUPT_IN_BACKUP", "ERROR")
-BAD_REVERT = ("NEEDS_ADMIN", "MISSING_IN_SNAPSHOT", "NO_TARGET", "ERROR")
+BAD_REVERT = ("NEEDS_ADMIN", "MISSING_IN_SNAPSHOT", "NO_TARGET", "CONFLICT", "ERROR")
 
 
 # ---- Where Capture One keeps things ------------------------------------------------
@@ -184,8 +188,9 @@ def _captureone_running():
 class _Plan:
     files: list = field(default_factory=list)
     errors: list = field(default_factory=list)
-    links: int = 0
+    links: list = field(default_factory=list)   # links/junctions not followed (paths)
     found: list = field(default_factory=list)
+    unread: list = field(default_factory=list)  # rels (a folder or a file) that could not be read
 
 
 def _matches(name, patterns):
@@ -205,13 +210,14 @@ def _walk(root, rel_prefix, plan, top_exclude=(), keep_extensions=None, recurse=
                 entries = list(iterator)
         except OSError as exc:
             plan.errors.append((folder, str(exc)))
+            plan.unread.append(rel)
             continue
         for entry in entries:
             path = os.path.join(folder, entry.name)
             child = os.path.join(rel, entry.name)
             try:
                 if entry.is_symlink() or getattr(entry, "is_junction", lambda: False)():
-                    plan.links += 1
+                    plan.links.append(path)
                 elif entry.is_dir(follow_symlinks=False):
                     if not recurse or _matches(entry.name, any_folder):
                         continue
@@ -229,29 +235,67 @@ def _walk(root, rel_prefix, plan, top_exclude=(), keep_extensions=None, recurse=
                                                      sb.CAT_CAPTURE_ONE))
             except OSError as exc:
                 plan.errors.append((path, str(exc)))
+                plan.unread.append(child)
+
+
+def _folder_there(path, rel, plan):
+    """Whether a folder to back up is there. One that cannot be reached (access
+    denied, a drive that does not answer) is an error of this run and its rows
+    are 'not read', never 'gone': only proof makes a source missing."""
+    if not path:
+        return False
+    state = sb._source_state(path)
+    if state == sb.SOURCE_UNREADABLE:
+        plan.errors.append((path, "cannot be reached (not proven missing)"))
+        plan.unread.append(rel)
+    return state == sb.SOURCE_PRESENT
 
 
 def _build_plan(roots):
     plan = _Plan()
     for label in (LABEL_USER, LABEL_PREFERENCES):
-        if roots[label] and sb._exists(roots[label]):
+        if _folder_there(roots[label], label, plan):
             plan.found.append(label)
             top = sb._split_names(EXCLUDE_TOP_FOLDERS) if label == LABEL_USER else ()
             _walk(roots[label], label, plan, top_exclude=top)
     install = roots[LABEL_INSTALLED]
-    if install and sb._exists(install):
+    if _folder_there(install, LABEL_INSTALLED, plan):
         for name in sb._split_names(INSTALL_DATA_FOLDERS):
             folder = os.path.join(install, name)
-            if sb._exists(folder):
+            if _folder_there(folder, os.path.join(LABEL_INSTALLED, name), plan):
                 if LABEL_INSTALLED not in plan.found:
                     plan.found.append(LABEL_INSTALLED)
                 _walk(folder, os.path.join(LABEL_INSTALLED, name), plan)
     color = roots[LABEL_WINDOWS]
     # The colour folder is only worth keeping next to a Capture One that was found.
-    if plan.found and color and sb._exists(color):
+    if plan.found and _folder_there(color, LABEL_WINDOWS, plan):
         plan.found.append(LABEL_WINDOWS)
         _walk(color, LABEL_WINDOWS, plan, keep_extensions=WINDOWS_COLOR_EXTENSIONS, recurse=False)
     return plan
+
+
+def _not_read(key, plan):
+    """Whether a catalog key is at or under something this run could not read."""
+    for rel in plan.unread:
+        folded = rel.casefold()
+        if key == folded or key.startswith(folded + os.sep):
+            return True
+    return False
+
+
+def _link_lines(plan, log):
+    """Say what was not followed: what is behind a link is NOT in this backup."""
+    if not plan.links:
+        return
+    log.out(f"Links/junctions not followed: {sb._num(len(plan.links))} "
+            f"(what is behind them is NOT in this backup)")
+    for index, link in enumerate(sorted(plan.links, key=str.casefold)):
+        if index < SUMMARY_LINK_LINES:
+            log.out(f"  LINK not followed {link}")
+        else:
+            log.log(f"  LINK not followed {link}")
+    if len(plan.links) > SUMMARY_LINK_LINES:
+        print(f"  ... {sb._num(len(plan.links) - SUMMARY_LINK_LINES)} more in the log")
 
 
 def _confirm(prompt, log):
@@ -268,8 +312,25 @@ def _confirm(prompt, log):
     return True
 
 
-def _write_map(backup, roots, version, plan):
-    """The readable answer to 'where did each thing come from?' (rewritten each run)."""
+def _held_origins(rows):
+    """label -> the folder its files came from, for what the backup holds (the
+    catalog's rows): the source path of a row without the part below the label."""
+    origins = {}
+    for row in rows:
+        label, _sep, rest = row.rel.partition(os.sep)
+        if not rest or label in origins:
+            continue
+        source = row.source_path or ""
+        tail = os.sep + rest
+        origins[label] = (source[:-len(tail)] if source.casefold().endswith(tail.casefold())
+                          else "")
+    return origins
+
+
+def _write_map(backup, roots, version, plan, rows=None):
+    """The readable answer to 'where did each thing come from?' (rewritten each
+    run). `rows`: the catalog's rows; a part the backup holds is named even when
+    this run did not find it on this computer (None = only what this run found)."""
     what = {
         LABEL_USER: "profiles, styles, defaults, presets, recipes, shortcuts, workspaces, ...",
         LABEL_PREFERENCES: "user.config of each Capture One version (restored only with --also)",
@@ -281,8 +342,15 @@ def _write_map(backup, roots, version, plan):
              f"Capture One version: {version or 'unknown'}",
              "",
              "Folder here -> where it came from on this computer:"]
-    for label in plan.found:
-        lines.append(f"  {label:<13} -> {roots[label]}")
+    origins = _held_origins(rows or [])
+    for label in what:
+        if label in plan.found:
+            lines.append(f"  {label:<13} -> {roots[label]}")
+        elif label in origins:
+            lines.append(f"  {label:<13} -> {origins[label] or 'unknown'}"
+                         f"  (not found there in the last run; kept from an earlier one)")
+        else:
+            continue
         lines.append(f"  {'':<13}    {what[label]}")
     lines += ["",
               "On a new computer:",
@@ -314,24 +382,33 @@ def _cmd_install_target(install):
     return _cmd_escape(install)
 
 
-def _write_restore_script(backup, roots, plan):
+def _write_restore_script(backup, roots, plan, rels=None):
     """RESTORE_SCRIPT: everything a new computer needs, with nothing but Windows.
     robocopy with /XC /XN /XO only ever adds missing files. No 'call' and no
-    (...) block around a path: both break on a '%' or a ')' in the backup's path."""
-    no_overwrite = "/XC /XN /XO /R:1 /W:1 /NP /NDL /NFL /NJH /NJS"
+    (...) block around a path: both break on a '%' or a ')' in the backup's path.
+    `rels`: what the backup holds (the catalog's rows after this run), so a run
+    that did not find a folder on this computer does not drop it from the
+    script (None = this run's plan). One of our own temp files left by a run
+    that died is never copied (/XF). The instance started as administrator
+    gets ELEVATED_ARGUMENT and never asks for elevation again, whatever the
+    administrator test answers."""
+    no_overwrite = (f"/XF *{_cmd_escape(sb.TEMP_SUFFIX)} "
+                    "/XC /XN /XO /R:1 /W:1 /NP /NDL /NFL /NJH /NJS")
     exe = sb._split_names(PROCESS_NAMES)[0]
     restored = sb._split_names(RESTORE_USER_FOLDERS)
-    user_folders = set()
-    install_folders = set()
+    user_folders = {}
+    install_folders = {}
     has_color = False
-    for item in plan.files:
-        parts = item.rel.split(os.sep)
+    for rel in ([item.rel for item in plan.files] if rels is None else rels):
+        parts = rel.split(os.sep)
         if parts[0] == LABEL_USER and len(parts) >= 3 and _matches(parts[1], restored):
-            user_folders.add(parts[1])
-        elif parts[0] == LABEL_INSTALLED:
-            install_folders.add(parts[1])
-        elif parts[0] == LABEL_WINDOWS:
+            user_folders.setdefault(parts[1].casefold(), parts[1])
+        elif parts[0] == LABEL_INSTALLED and len(parts) >= 3:
+            install_folders.setdefault(parts[1].casefold(), parts[1])
+        elif parts[0] == LABEL_WINDOWS and len(parts) >= 2:
             has_color = True
+    user_folders = set(user_folders.values())
+    install_folders = set(install_folders.values())
     lines = [
         "@echo off",
         "chcp 65001 >nul",
@@ -341,11 +418,12 @@ def _write_restore_script(backup, roots, plan):
         f'if not defined C1_INSTALL_TARGET set "C1_INSTALL_TARGET={_cmd_install_target(roots[LABEL_INSTALLED])}"',
         f'if not defined C1_COLOR_TARGET set "C1_COLOR_TARGET=%SystemRoot%\\{_cmd_escape(WINDOWS_COLOR_FOLDER)}"',
         'if /i "%~1"=="--unattended" goto :installed',
+        f'if /i "%~1"=="{ELEVATED_ARGUMENT}" goto :checks',
         "net session >nul 2>&1",
         "if not errorlevel 1 goto :checks",
         "echo Asking Windows for administrator rights...",
         'powershell -NoProfile -Command "$q=[char]34; Start-Process -FilePath $env:ComSpec '
-        "-Verb RunAs -ArgumentList ('/c '+$q+$q+$env:SELF+$q+$q)\"",
+        f"-Verb RunAs -ArgumentList ('/c '+$q+$q+$env:SELF+$q+' {ELEVATED_ARGUMENT}'+$q)\"",
         "if not errorlevel 1 exit /b 0",
         "echo Windows did not give administrator rights: nothing was restored.",
         "goto :fail",
@@ -425,6 +503,9 @@ def run_backup(args, log, stamp):
     plan = _build_plan(roots)
     if not plan.files:
         log.out("Capture One settings: nothing found on this computer, nothing to do.")
+        for path, message in plan.errors:
+            log.out(f"Could not read {path}: {message}")
+        _link_lines(plan, log)
         return 1 if plan.errors else 0
     statuses = [sb._file_status(item, backup) for item in plan.files]
     new = [s for s in statuses if s.status == sb.ST_NEW]
@@ -453,6 +534,7 @@ def run_backup(args, log, stamp):
             + ("fits" if fits else "DOES NOT FIT"))
     for path, message in plan.errors:
         log.out(f"Could not read {path}: {message}")
+    _link_lines(plan, log)
     if not fits and not args.dry_run:
         print("Not enough space; nothing copied.", file=sys.stderr)
         log.log("Not enough space; nothing copied.")
@@ -462,14 +544,16 @@ def run_backup(args, log, stamp):
         return 1 if plan.errors or not fits else 0
     if not args.yes and to_copy and not _confirm(f"Copy {sb._num(len(to_copy))} files? [y/N] ", log):
         return 2
-    os.makedirs(sb._io(backup), exist_ok=True)
     try:
+        os.makedirs(sb._io(backup), exist_ok=True)
         catalog = sb._Catalog(backup, create=True)
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
+    except (RuntimeError, OSError) as exc:
+        print(f"Cannot use {backup} as the backup folder: {exc}", file=sys.stderr)
+        log.log(f"Cannot use {backup} as the backup folder: {exc}; nothing copied")
         return 2
     failed = []
     versions = 0
+    started = False
     try:
         for status in statuses:
             if status.status == sb.ST_UP_TO_DATE:
@@ -477,6 +561,7 @@ def run_backup(args, log, stamp):
         catalog.commit()
         last = time.time()
         for index, status in enumerate(to_copy, 1):
+            started = True
             try:
                 before_final = None
                 if status.status == sb.ST_CHANGED:
@@ -505,23 +590,40 @@ def run_backup(args, log, stamp):
                 last = time.time()
                 catalog.commit()
                 print(f"  {sb._num(index)}/{sb._num(len(to_copy))} files", flush=True)
-        keys = {item.rel.casefold() for item in plan.files}
-        gone = [row for row in catalog.all_rows() if row.key not in keys]
         catalog.commit()
+        # what the backup holds after this run: the map and the double-click
+        # restore are made from it, not from what this run happened to find
+        rows = catalog.all_rows()
     except KeyboardInterrupt:
-        catalog.commit()
+        try:
+            catalog.commit()
+        except sqlite3.Error:
+            pass
         print("Interrupted.", file=sys.stderr)
         log.log("Interrupted.")
         return 130
+    except sqlite3.Error as exc:
+        print(f"The catalog of {backup} cannot be read or written: {exc}. Stopped.",
+              file=sys.stderr)
+        log.log(f"Stopped: catalog error: {exc}")
+        return 1 if started else 2
     finally:
         catalog.close()
-    _write_map(backup, roots, version, plan)
-    _write_restore_script(backup, roots, plan)
+    keys = {item.rel.casefold() for item in plan.files}
+    absent = [row for row in rows if row.key not in keys]
+    # a folder that could not be read this run is not a folder that is gone
+    not_read = [row for row in absent if _not_read(row.key, plan)]
+    gone = [row for row in absent if not _not_read(row.key, plan)]
+    _write_map(backup, roots, version, plan, rows)
+    _write_restore_script(backup, roots, plan, [row.rel for row in rows])
     log.csv("_gone.csv", ["rel", "size", "source_path"],
             [(row.rel, row.size, row.source_path) for row in gone])
     log.out(f"Result:    copied {sb._num(len(to_copy) - len(failed))}, "
             f"old copies kept in versions {sb._num(versions)}, failed {sb._num(len(failed))}, "
             f"kept although gone from Capture One {sb._num(len(gone))}")
+    if not_read:
+        log.out(f"  {sb._num(len(not_read))} files of the backup are under a folder that could "
+                f"not be read in this run: kept, and not counted as gone")
     for rel, message in failed:
         log.out(f"  FAILED {rel}: {message}")
     return 1 if failed or plan.errors else 0
@@ -542,6 +644,8 @@ def _open_backup(path):
     catalog = sb._Catalog(backup, create=False, readonly=True)
     try:
         return backup, catalog.all_rows()
+    except sqlite3.Error as exc:        # a damaged catalog: a message, not a traceback
+        raise RuntimeError(f"cannot read catalog {catalog.path}: {exc}") from exc
     finally:
         catalog.close()
 
@@ -615,20 +719,32 @@ def run_verify(args, log):
         if status not in GOOD_VERIFY:
             report.append((status, row.rel))
             log.out(f"  {status} {row.rel}")
+    not_recorded = None
     if filled:
         # Only a row proven by its source gets a hash; the catalog is opened
         # for writing only then (reading it never writes to the backup).
-        catalog = sb._Catalog(backup, create=False)
+        catalog = None
         try:
+            catalog = sb._Catalog(backup, create=False)
             when = time.strftime("%Y-%m-%dT%H:%M:%S")
             for key, sha256 in filled:
                 catalog.set_hash_verified(key, sha256, when)
             catalog.commit()
+        except (sqlite3.Error, RuntimeError, OSError) as exc:
+            # a backup that cannot be written (a write-protected disk, a
+            # read-only share): the files were read and compared all the same
+            not_recorded = str(exc)
+            counts["HASH_NOT_RECORDED"] = counts.pop("HASH_FILLED")
         finally:
-            catalog.close()
+            if catalog is not None:
+                catalog.close()
     log.csv("_verify.csv", ["status", "rel"], report)
     log.out("Verify: " + ("  ".join(f"{status} {sb._num(count)}"
                                     for status, count in sorted(counts.items())) or "(empty)"))
+    if not_recorded is not None:
+        log.out(f"  {sb._num(counts['HASH_NOT_RECORDED'])} copies have the bytes of their source, "
+                f"but the catalog could not be written ({not_recorded}): their hashes were "
+                f"not recorded")
     if counts.get("OK_SIZE_ONLY"):
         log.out(f"  {sb._num(counts['OK_SIZE_ONLY'])} files were not checked by hash: the catalog "
                 f"has no hash for them and their source on this computer changed or is not "
@@ -669,9 +785,12 @@ def _size_check(target, row):
     return check
 
 
-def _existing_outcome(label, row, src, target):
-    """What to do with a target that already has a file: it is never overwritten."""
-    keep = "KEPT_INSTALLED" if label in PROTECTED_LABELS else "CONFLICT"
+def _existing_outcome(label, row, src, target, real_places=True):
+    """What to do with a target that already has a file: it is never overwritten.
+    A different file of the installed program is expected in its real place (a
+    newer Capture One): KEPT_INSTALLED. Under --to nothing is 'installed', and a
+    different file there is a CONFLICT like any other."""
+    keep = "KEPT_INSTALLED" if real_places and label in PROTECTED_LABELS else "CONFLICT"
     if os.stat(sb._io(target), follow_symlinks=False).st_size != row.size:
         return keep
     expected = row.sha256 if row.sha256 is not None else sb._sha256_file(src)
@@ -736,9 +855,14 @@ class _Snapshot:
                 time.sleep(0.001)
         self.folder = folder
 
-    def _journal(self, operation, rel):
+    def _journal(self, operation, rel, target=None):
+        entry = {"op": operation, "rel": rel}
+        if target:
+            # where the file really was: --revert-last undoes it THERE, also when
+            # the label resolves to another folder in that run (--install-folder)
+            entry["target"] = os.path.abspath(target)
         with open(sb._io(os.path.join(self.folder, JOURNAL_FILE)), "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"op": operation, "rel": rel}, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
 
@@ -747,11 +871,30 @@ class _Snapshot:
         self._open()
         sb._copy_file(sb.PlannedFile(target, rel, 0, 0, "old"),
                       os.path.join(self.folder, rel), sb.VERIFY_COPY)
-        self._journal("replaced", rel)
+        self._journal("replaced", rel, target)
 
-    def note_added(self, rel):
+    def note_added(self, rel, target=None):
         self._open()
-        self._journal("added", rel)
+        self._journal("added", rel, target)
+
+
+def _writable_before_swap(target):
+    """before_final for a swap over a target that exists: Windows refuses to
+    replace a read-only file. It runs last, once the current file is safe in the
+    snapshot and the new copy is verified; a copy that fails earlier leaves the
+    target as it was, attribute included."""
+    def clear(_digest=None):
+        _make_writable(target)
+    return clear
+
+
+def _make_writable(path):
+    try:
+        mode = os.stat(sb._io(path), follow_symlinks=False).st_mode
+    except FileNotFoundError:
+        return
+    if not mode & 0o200:
+        os.chmod(sb._io(path), mode | 0o200)
 
 
 def _snapshots_parent():
@@ -764,7 +907,7 @@ def run_restore(args, log):
     except (FileNotFoundError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    to = os.path.abspath(args.to) if args.to else None
+    to = os.path.abspath(args.to) if args.to is not None else None
     if to and (sb._is_under(to, backup) or sb._is_under(backup, to)):
         print(f"--to cannot be inside the backup or contain it: {to} vs {backup}", file=sys.stderr)
         return 2
@@ -804,7 +947,7 @@ def run_restore(args, log):
             status = "NOT_INSTALLED"
         elif sb._exists(target):
             try:
-                status = _existing_outcome(label, row, src, target)
+                status = _existing_outcome(label, row, src, target, real_places=not to)
                 if args.force and status != "ALREADY_THERE":
                     status = _force_outcome(label, status, row, src, target, args, admin)
             except OSError as exc:
@@ -879,7 +1022,8 @@ def run_restore(args, log):
                         # atomic: at no moment is the target missing.
                         snapshot.keep_current(row.rel, target)
                         sb._copy_file(planned, target, sb.VERIFY_COPY,
-                                      expected_sha256=row.sha256)
+                                      expected_sha256=row.sha256,
+                                      before_final=_writable_before_swap(target))
                         status = "REPLACED"
                     else:
                         sb._copy_file(planned, target, sb.VERIFY_COPY,
@@ -889,7 +1033,7 @@ def run_restore(args, log):
                         # appeared meanwhile is someone else's, and --revert-last
                         # must never take it out (B22)
                         if snapshot is not None:
-                            snapshot.note_added(row.rel)
+                            snapshot.note_added(row.rel, target)
                         status = "RESTORED" if row.sha256 else "RESTORED_UNVERIFIED"
                 except FileExistsError:
                     status = "CONFLICT"
@@ -940,8 +1084,22 @@ def _last_snapshot():
     return os.path.join(parent, max(usable)) if usable else None
 
 
+def _journal_target_valid(rel, target):
+    """A journaled target is the absolute place of that same rel: it ends with
+    the part of the rel below its label, and has no '..'."""
+    if not isinstance(target, str) or not os.path.isabs(target):
+        return False
+    parts = target.replace("/", os.sep).split(os.sep)
+    rest = rel.partition(os.sep)[2]
+    return bool(rest) and ".." not in parts and \
+        target.casefold().endswith(os.sep + rest.casefold())
+
+
 def _read_journal(folder):
-    """The journal's entries. Only a last line cut by a crash may be unreadable."""
+    """The journal's entries: (operation, rel, target). `target` is where the
+    file really was (None in a journal written before it was recorded: the
+    label is then resolved on this run). Only a last line cut by a crash may be
+    unreadable."""
     with open(sb._io(os.path.join(folder, JOURNAL_FILE)), encoding="utf-8") as handle:
         lines = [line for line in handle.read().split("\n") if line.strip()]
     entries = []
@@ -949,14 +1107,22 @@ def _read_journal(folder):
         try:
             entry = json.loads(line)
             operation, rel = entry["op"], entry["rel"]
-        except (ValueError, KeyError, TypeError):
+            target = entry.get("target")
+        except (ValueError, KeyError, TypeError, AttributeError):
             if index == len(lines) - 1:
                 break
             raise ValueError(f"line {index + 1} cannot be read")
-        if operation not in ("replaced", "added") or ".." in rel.split(os.sep):
+        if (operation not in ("replaced", "added") or not isinstance(rel, str)
+                or ".." in rel.split(os.sep)):
             raise ValueError(f"line {index + 1} is not valid")
-        entries.append((operation, rel))
+        if target is not None and not _journal_target_valid(rel, target):
+            raise ValueError(f"line {index + 1} is not valid")
+        entries.append((operation, rel, target))
     return entries
+
+
+class _TargetAppeared(Exception):
+    """A --revert-last target that was not there got a file before our copy took its name."""
 
 
 def _same_bytes(first, second):
@@ -988,13 +1154,18 @@ def run_revert(args, log):
     roots, _version = _roots(args)
     admin = _is_admin()
     items = []
-    for operation, rel in entries:
+    for operation, rel, journaled in entries:
         label, _sep, rest = rel.partition(os.sep)
         root = roots.get(label)
-        if not root or not rest:
+        if journaled:
+            # undone where the force really put it, not where the label
+            # resolves in this run (another --install-folder)
+            target = journaled
+        elif not root or not rest:
             items.append(("NO_TARGET", rel, "", ""))
             continue
-        target = os.path.join(root, rest)
+        else:
+            target = os.path.join(root, rest)
         snap = os.path.join(folder, rel)
         protected = label in PROTECTED_LABELS and not admin
         try:
@@ -1035,17 +1206,31 @@ def run_revert(args, log):
             try:
                 if status == "PUT_BACK":
                     existed = sb._exists(target)
+                    planned = sb.PlannedFile(snap, rel, 0, 0, "revert")
                     if existed:
+                        # the current file is safe first; a read-only one (the
+                        # force copies the attribute too) is then replaceable
                         snapshot.keep_current(rel, target)
-                    sb._copy_file(sb.PlannedFile(snap, rel, 0, 0, "revert"), target, sb.VERIFY_COPY)
-                    if not existed:             # journaled once it is there (B22)
-                        snapshot.note_added(rel)
+                        sb._copy_file(planned, target, sb.VERIFY_COPY,
+                                      before_final=_writable_before_swap(target))
+                    else:
+                        # a target that appears meanwhile is someone else's:
+                        # never replaced, as in the restore
+                        try:
+                            sb._copy_file(planned, target, sb.VERIFY_COPY, no_clobber=True)
+                        except FileExistsError:
+                            raise _TargetAppeared() from None
+                        snapshot.note_added(rel, target)    # journaled once it is there (B22)
                     status = "PUT_BACK_DONE"
                 elif status == "TAKE_OUT":
                     # A file the force added leaves Capture One but is not lost.
                     snapshot.keep_current(rel, target)
+                    _make_writable(target)      # Windows refuses to remove a read-only file
                     os.remove(sb._io(target))
                     status = "TAKEN_OUT"
+            except _TargetAppeared:
+                status = "CONFLICT"
+                detail = "the target appeared during the revert; left as it was"
             except Exception as exc:
                 status = "ERROR"
                 detail = str(exc)
@@ -1126,22 +1311,30 @@ def _main(argv):
         if code is None:
             return 0
         return int(code) if isinstance(code, int) else 2
-    if args.space_margin_gb < 0:
-        print("--space-margin-gb cannot be negative", file=sys.stderr)
+    if not math.isfinite(args.space_margin_gb) or args.space_margin_gb < 0:
+        print("--space-margin-gb must be a number, 0 or more", file=sys.stderr)
         return 2
-    if (args.also or args.to) and not args.restore_from:
+    # An empty path (an unset variable in a .cmd: --to "%OUT%") is never "the
+    # option was not given": --to "" would restore into the real places.
+    for flag, value in (("--dest", args.dest), ("--verify", args.verify),
+                        ("--restore-from", args.restore_from), ("--to", args.to),
+                        ("--install-folder", args.install_folder)):
+        if value is not None and not value.strip():
+            print(f"{flag} needs a folder: it was given empty", file=sys.stderr)
+            return 2
+    if (args.also or args.to is not None) and args.restore_from is None:
         print("--also and --to only apply to --restore-from", file=sys.stderr)
         return 2
-    if args.verify and args.dry_run:
+    if args.verify is not None and args.dry_run:
         print("--verify cannot be combined with --dry-run", file=sys.stderr)
         return 2
-    if args.force and not args.restore_from:
+    if args.force and args.restore_from is None:
         print("--force only applies to --restore-from", file=sys.stderr)
         return 2
     if args.force_installed and not args.force:
         print("--force-installed needs --force", file=sys.stderr)
         return 2
-    if args.force and args.to:
+    if args.force and args.to is not None:
         print("--force works on the real places; --to never replaces anything", file=sys.stderr)
         return 2
     stamp = time.strftime("%y%m%d_%H%M%S")
@@ -1151,9 +1344,9 @@ def _main(argv):
         print(f"cannot write the log directory {sb.LOG_DIR}: {exc}", file=sys.stderr)
         return 2
     try:
-        if args.dest:
+        if args.dest is not None:
             return run_backup(args, log, stamp)
-        if args.verify:
+        if args.verify is not None:
             return run_verify(args, log)
         if args.revert_last:
             return run_revert(args, log)
