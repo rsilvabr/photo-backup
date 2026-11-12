@@ -9,7 +9,8 @@ releases are also published as
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **[v0.13.1](#v0131)** | 2026-11-11 | Second bug sweep: a `--verify full` that survives unreadable files and Ctrl+C and reads both disks at once; small files copied and verified faster; a damaged catalog and odd file dates no longer end a run with a traceback; shorter CSVs |
+| **[v0.13.2](#v0132)** | 2026-11-12 | Third bug sweep: a destination or a restore target reached through a junction or a `subst` letter can no longer land in the source or the backup; `--revert-last` trusts a journal line only where Capture One keeps that part; an empty `--to` no longer restores into the current folder; nothing in `versions\` or `orphans\` is ever replaced; a quicker `--verify quick`; the Capture One cache junctions get their own line; `mobile_backup.py` 0.1.4 |
+| [v0.13.1](#v0131) | 2026-11-11 | Second bug sweep: a `--verify full` that survives unreadable files and Ctrl+C and reads both disks at once; small files copied and verified faster; a damaged catalog and odd file dates no longer end a run with a traceback; shorter CSVs |
 | [v0.13.0](#v0130) | 2026-11-11 | A session leaves out only the subfolders its mode names (`LeaveOut`, `_OUTTAKES*` in the shipped modes); any other one is judged alone, so a `+` mode copies it |
 | [v0.12.1](#v0121) | 2026-11-11 | Bug sweep: nothing left out without a count, a bigger mode never copies less, a source that cannot be read is not a source that is gone, the rolling verify keeps turning; `Originals=raw` keeps a photo whose only original is a TIFF, PNG, HEIC or PSD; `[7] Manifest` does what `[1]` does |
 | [v0.12.0](#v0120) | 2026-11-10 | A file never counts as saved when the right content cannot be restored: eight fixes from an audit; `manifest_backup.py --verify` |
@@ -27,6 +28,91 @@ releases are also published as
 | v0.1.0 | 2026-10-06 | First implementation, not released |
 
 `mobile_backup.py` has its own version: [see the end of this page](#mobile_backuppy).
+
+---
+
+## v0.13.2
+
+**Released 2026-11-12.** Fixes from a third bug sweep of v0.13.1 (16 findings,
+8 improvements; the report found one more while fixing). None of them was a
+silent loss of an original in the main backup; several were places where a
+written safety rule could be broken by an unusual input. Nothing to do when
+upgrading; what looks different afterwards is listed first.
+
+**What changes on the screen and in `Logs\`**
+
+- A Capture One cache folder that is itself a junction or a link (a cache
+  moved to another disk that way: 429 of them on the archive this was built
+  for) is named
+  on the `Capture One cache` line of the summary — `(+ N cache folders that
+  are links to another place, not followed)` — and logged as
+  `CACHE LINK not followed <path>`. `links/junctions not followed` now counts
+  only folders whose content is really not in the backup. With `--c1-cache`
+  such a folder is a plain link again.
+- `--verify quick` takes the size and date of a planned original from the
+  listing the plan has just made, as the backup itself does, instead of asking
+  the disk once more per file (about 30% of a quick verify on a warm disk; on
+  a cold one, 425 000 reads fewer). A file listed but whose own record the
+  system refuses is `OK` in a quick verify and `SOURCE_UNREADABLE` in a full
+  one; `VERIFY_QUICK_USES_PLAN = False` asks for each file again.
+- `--revert-last` of `captureone_backup.py` refuses (exit 2) an `old_` folder
+  with no journal or an empty one, instead of undoing the force before it.
+
+**Safety rules that could be broken**
+
+- **A destination reached through a junction or a `subst` letter** that lands
+  inside a source passed the check, which compared the typed paths: the backup
+  wrote into the source, and the next run backed up the backup. The same held
+  for a restore `--to` (and a `--to-original` folder) inside the backup, and
+  for the Capture One backup and `mobile_backup.py`. Every such check now also
+  compares where the paths really are (exit 2, and the message says where they
+  lead).
+- **`restore_backup.py --to ""`** (a variable left empty in a `.cmd`) restored
+  into the current folder — into the backup when the command ran from inside
+  it — and `--only ""` selected everything. Both are refused, exit 2.
+- **`captureone_backup.py --revert-last` trusted the absolute path in its
+  journal.** That journal lives where any program of the user can write, and an
+  undo of `Installed` runs as administrator: a planted line could make it
+  remove or write a file anywhere. A line is now used only where a `--force`
+  of this computer writes (this computer's folder of that part; for
+  `Installed`, a `Color Profiles` / `Film Curves` folder of a Capture One
+  install folder), and one bad line stops the whole undo before anything
+  changes. This came with v0.13.1's fix for `--install-folder`, which still
+  works.
+- **A catalog row with a path leading outside the backup** (`..`, a drive, a
+  root) made the restore read a file from outside the backup and write it
+  outside `--to`, and `--move-orphans` could have moved a file of another
+  folder. Such a catalog is now damaged: every run stops at it, exit 2. This
+  tool never writes such a row.
+- **The versions and orphans folders** are named by the second a run started:
+  two runs in the same second that kept an old copy of one file replaced the
+  first old copy with the second. A taken name now gets ` (2)`. A moved file
+  never lands on a file already at its new place, and the backup ID file is
+  never replaced — before, one that could not be read for a moment got a new
+  identity, and every preset of that backup refused it afterwards.
+
+**Errors that became messages**
+
+- A `--space-margin-gb` of `nan` or `inf` ended `selective_backup.py`,
+  `manifest_backup.py` and `restore_backup.py` with a traceback, and a
+  negative one turned "not enough space" into "fits": both are exit 2 now, as
+  in `captureone_backup.py`. A `--max-gb` that is not a number is refused too.
+- A file named `NUL` (Windows reads that name as a device) in a folder a mode
+  copies stopped the whole plan with a traceback. It is an error of the plan
+  now (`ERROR name ...`, exit 1); the rest is copied.
+- `captureone_backup.py`: an error writing `RESTORE_CAPTUREONE.cmd` or
+  `WHERE_EACH_FOLDER_GOES.txt` after the copy (a read-only old copy, a disk
+  that filled up) was a traceback, and a read-only map stopped every run the
+  same way. The `.cmd` is written first, a read-only old copy is replaced, and
+  an error is a message and exit 1. Its dry-run checks the existing catalog as
+  the copy does. A link where the backup never goes (`Logs`, `EBWebView`, the
+  colour folder's subfolders) is no longer listed as missing from the backup.
+
+**`mobile_backup.py` 0.1.4**: [see below](#014).
+
+**Documentation.** The README now lists every setting of every script (the
+menu's, `manifest_backup.py`'s and `captureone_backup.py`'s were missing), and
+a test keeps it that way.
 
 ---
 
@@ -769,10 +855,63 @@ A separate script with its own version: it mirrors the phone-size
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| 0.1.4 | 2026-11-12 | One run at a time; a run that would empty a large part of the mirror changes nothing without `--allow-mass-delete`; links in the sources are not followed; an unreadable mirror folder is left alone; a failed delete keeps the new copy for the next run; copies and state on the disk before their names, `state.json.bak` |
 | 0.1.3 | 2026-11-11 | A photo exported again during a run no longer leaves its album skipped; the album never depends on `--source`; read-only photos, a source typed in another case and a destination that is not connected are handled |
 | 0.1.2 | 2026-11-11 | Deletes only with proof: never a photo of a source not given in this run, nothing when a source folder could not be read; an exiftool failure is read again next time instead of becoming "no date"; the state is saved more often |
 | 0.1.1 | 2026-10-13 | Photos numbered camera by camera, each camera in its own shooting order (cameras' clocks disagree) |
 | 0.1.0 | 2026-10-13 | First version: one album per event, photos numbered in shooting order, synchronised (only its own files are renamed or removed) |
+
+### 0.1.4
+
+**Released 2026-11-12** with photo-backup v0.13.2. Nothing to do when upgrading:
+a state written by 0.1.3 keeps working. The rule for deleting is the same, with
+more proof asked: only a photo under a source of this run, never in a run where
+a source could not be read, and now also never behind a link the run did not
+follow, never in a mirror folder that could not be read, and never as a large
+part of the mirror at once.
+
+- **One run at a time.** Two runs on one mirror (the nightly task and one by
+  hand) both exited 0, and the one that finished last saved the state it had
+  read at its start: the other run's copies were forgotten and their album was
+  skipped for good. A run now holds `<dest>\.mobile_backup\run.lock`; a second
+  run exits 2 and changes nothing. The lock of a run that is no longer running
+  (killed, the PC turned off; a reused PID is told by the process start time)
+  is taken over and logged. A `--dry-run` takes no lock, and stops while a live
+  run holds one.
+- **A run that would empty the mirror changes nothing.** A renamed
+  `JXL_mobile` folder (a jxl-photo setting) or another disk on the source's
+  letter deleted the whole mirror, exit 0, and the sync then emptied the phone.
+  When the photos gone outnumber the new ones by more than `MAX_DELETE_PERCENT`
+  (20%) of the mirror's photos of those sources, and by at least
+  `MAX_DELETE_MIN` (5), the run says so, changes nothing and exits 1; photos
+  moved (an event renamed) do not count. `--allow-mass-delete` lets it
+  through; `MAX_DELETE_PERCENT = 0` turns the check off.
+- **An old file that cannot be deleted** (open in FreeFileSync or a viewer)
+  while its photo, exported again, moves to a new number: the new copy was
+  made and the state forgot the old file, which stayed in the album next to it
+  (and then the album was skipped). The new copy now waits for the next run.
+- **Links and junctions in the sources are not followed** (`os.walk` follows a
+  junction on Windows): one pointing to a folder above was a loop, and the
+  Capture One caches moved to another drive with junctions were walked on
+  every run (522 000 more files under `G:\2024`–`G:\2026`). The links go to the
+  log; the ones that are not a Capture One cache are counted on the screen. A
+  photo of the mirror behind such a link is left alone.
+- **A mirror folder that cannot be read** made its entries "gone": they were
+  forgotten and their files became "not ours" for good. Only "does not exist"
+  proves that a mirror file is not there; such a folder is named, nothing is
+  done in it, exit 1.
+- **A destination reached through a junction or a subst letter** that lands
+  inside a source (or the reverse) is refused (exit 2); the message says where
+  the link leads.
+- **On the disk before the name**: every copy and every save of the state is
+  flushed first; a power cut leaves the old file or the new one. Every finished
+  run keeps `state.json.bak`; when `state.json` cannot be read, the run uses
+  it, deletes, renames and forgets nothing, copies only new photos, keeps the
+  broken file as `state.json.unreadable` and exits 1 (exit 2 for good before).
+  A `state.json` held for a moment by an antivirus is tried again
+  (`STATE_REPLACE_TRIES`).
+- README: the FreeFileSync filter also leaves out `*.mbtmp;*.mbren`; every
+  setting is in a table.
 
 ### 0.1.3
 

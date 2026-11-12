@@ -34,8 +34,11 @@ from the command line. A future job (e.g. a full mirror) is a new
   it (`_setting`) and always passes every selection option explicitly — a
   default repeated as a literal in the menu would silently override the
   owner's edit of `selective_backup.py` (the bug class of jxl-photo round 43).
-  Its own settings (`CONFIG_PATH`, `VERIFY_MODE`, `FORMAT_ALTERNATIVES`,
-  `RESTORE`) are at its top; tests set `CONFIG_PATH` to a temp file.
+  Its own settings (`CONFIG_PATH`, `VERIFY_MODE`, `MAX_ONLY_CHARS`,
+  `FORMAT_ALTERNATIVES`, `RESTORE`, ...) are at its top; tests set
+  `CONFIG_PATH` to a temp file. Every setting at the top of every script is
+  named in its README: `tests/test_docs.py::test_docs_cover_the_settings`
+  (v0.13.2), with `NOT_SETTINGS` for the constants that are not settings.
 - `restore_backup.py` — restores files out of a backup (`--to` /
   `--to-original`). A backend may import the catalog and the copier from
   `selective_backup.py` (`import selective_backup as sb`); never duplicate
@@ -69,22 +72,46 @@ from the command line. A future job (e.g. a full mirror) is a new
   catalog's rows (what the backup holds), never from this run's plan alone; the
   `.cmd` has `/XF *` + `TEMP_SUFFIX` on every robocopy line and gives
   `ELEVATED_ARGUMENT` to the instance it elevates. The journal records each
-  file's absolute `target` and `--revert-last` undoes it there
-  (`_journal_target_valid`). A read-only target is made writable only in
-  `before_final` (`_writable_before_swap`), after the current file is in the
-  snapshot. Links are listed in `plan.links` and reported; what could not be
-  read is in `plan.unread` and is never "gone".
+  file's absolute `target`; `--revert-last` undoes it there only when
+  `_journal_target_problem` accepts it (v0.13.2, T3 of the 261112 sweep: the
+  journal lives where any program of the user writes, and the revert may run as
+  administrator): this run's root of the label, or for `Installed` an
+  `INSTALL_DATA_FOLDERS` folder of an install folder (this run's, or one
+  holding the program or every data folder: N10), and the real path of the
+  target is its root's real path + rest (no link below the root). One bad line
+  = exit 2, nothing changed; targets outside this run's roots are listed before
+  the question. `_Snapshot._open` creates the journal with the `old_` folder:
+  the newest `old_*` is always the one judged (`_last_snapshot` no longer skips
+  one without a journal); no journal or an empty one = exit 2 ("Nothing to
+  undo"; rename it `_not` to reach the previous one). A read-only target is
+  made writable only in `before_final` (`_writable_before_swap`), after the
+  current file is in the snapshot. Links are listed in `plan.links` and
+  reported, except where `_walk` would not go anyway (`_link_left_out`); what
+  could not be read is in `plan.unread` and is never "gone". The overlap checks
+  (backup × Capture One folders, `--to` × backup) use `sb._overlaps`. The
+  dry-run checks an existing catalog read-only (`_catalog_problem`). The map
+  and the `.cmd` go through `_write_ours` (the `.cmd` first; an `OSError` is a
+  message + exit 1, never a traceback after the copy). The backup's statuses
+  come from `sb._file_statuses`; its copy stays one `sb._copy_file` per file
+  (`test_n8_*` injects failures there; batching was left out on purpose).
 - `mobile_backup.py` — mirrors the `JXL_mobile` folders to another disk as
   one album per event, numbered in shot order (exiftool); its own version
   (`0.1.x`) and its own README (`README_mobile_backup.md`). It is the one
   script that deletes on its destination: see its safety rule below. It saves
-  its state right after the renames and every `STATE_SAVE_EVERY` copies.
+  its state right after the renames and every `STATE_SAVE_EVERY` copies, holds
+  `run.lock` in its state folder while it runs, and keeps `state.json.bak` (the
+  state of the last finished run).
 
 ## Safety rules (these are the product)
 - **The source is READ-ONLY.** No code path may open a source file for
   writing, rename, delete, touch or set attributes on anything under a
   `--source`. Tests snapshot the source tree (path, size, mtime, hash) before
-  and after every run and must find it identical.
+  and after every run and must find it identical. A destination is compared
+  with every source as typed AND where it really is (`_overlaps`, with
+  `os.path.realpath` through `_real`; v0.13.2): a junction, a symbolic link or
+  a `subst` letter cannot lead the backup into a source. Use `_overlaps` for
+  every such safety check (also restore target × backup); `_is_under` stays
+  string-only for the catalog's own paths.
 - **Nothing on the destination is ever deleted.** A file whose source changed
   is reported; with `--update-changed` the old copy is MOVED to the versions
   folder first, never overwritten in place. A new file identical byte for byte
@@ -99,13 +126,24 @@ from the command line. A future job (e.g. a full mirror) is a new
   stops the copy and the reading, exit 1). The one
   exception: a folder left empty by one of our own moves (a detected
   move/rename, or `--move-orphans`) is removed with `os.rmdir` — never a
-  file, and never anything inside `CATALOG_FOLDER`.
+  file, and never anything inside `CATALOG_FOLDER`. Nothing already in
+  `versions\` or `orphans\` is replaced either: `_move_aside` renames with
+  `_rename_no_clobber` and takes ` (2)`, ` (3)`, ... when a name is taken (two
+  runs started in the same second share a stamp); a detected move uses
+  `_rename_no_clobber` too; `_ensure_backup_id` never replaces a
+  `volume.json` that is there, readable or not (v0.13.2). Never `os.replace`
+  onto a name that may hold a file we did not just check.
 - **The restore never writes to the backup.** `restore_backup.py` opens the
   catalog read-only, never writes, moves or deletes anything under `--backup`,
-  and never overwrites a target file that already exists.
+  and never overwrites a target file that already exists. An empty `--to` or
+  `--only` is exit 2 (v0.13.2: `""` meant the current folder / everything),
+  and every target is checked against the backup as typed and where its
+  folder really is (`inside_backup` → `REFUSED`).
 - **Fail closed.** Not enough space, an unreadable catalog, a closed stdin
-  without `--yes`, a destination inside a source (or the reverse): abort
-  BEFORE the first byte is copied, exit code 2.
+  without `--yes`, a destination inside a source (or the reverse, also
+  through a link: `_overlaps`), a `--space-margin-gb` that is not finite or is
+  negative (`_validate_usage`, the restore; v0.13.2): abort BEFORE the first
+  byte is copied, exit code 2.
 - A copy is written to a temp file next to its final name, verified, then
   `os.replace`d — a crash never leaves a half file under the final name.
   The restore uses `no_clobber=True` (`os.rename` on Windows): a target that
@@ -172,7 +210,12 @@ from the command line. A future job (e.g. a full mirror) is a new
   exactly once under `Not copied:`: in one `Stats` counter, or, for a folder
   without an export that is not copied, in its `unexported_folders` entry (a
   new "leave out" branch gets its own counter and summary line; links/junctions
-  are counted in `_list_dir`, once per planner, cache or not). The exception: a
+  are counted in `_list_dir`, once per planner, cache or not; a Capture One
+  cache folder that is itself a link, in a run that does not copy the cache,
+  goes to `cache_links` / `Stats.c1_cache_links` instead of `links`, so
+  "links/junctions not followed" names only what is NOT backed up — the
+  owner's archive has 429 such junctions on G:, caches moved to another disk;
+  v0.13.2). The exception: a
   folder skipped by its name (`SYSTEM_SKIP_FOLDERS`, `--exclude-folders`) is
   never listed, so its files are not counted; the folder is named instead
   (`skipped_folders`, once per planner, `SKIPPED FOLDER` in the log).
@@ -200,6 +243,13 @@ from the command line. A future job (e.g. a full mirror) is a new
 - **Only `--verify full` records `verified_at` (v0.12.1).** A quick verify
   reads no file; recording it would send the `--max-gb` queue back to its
   start. The same for `manifest_backup.py --verify` (it uses `_run_verify`).
+- **A quick verify takes a planned source from the plan's listing (v0.13.2).**
+  With `VERIFY_QUICK_USES_PLAN`, `_listed_sources` gives a job the planned
+  file's size and date only when the planned path IS the row's `source_path`;
+  every other row still goes through `_source_stat` (missing needs proof). A
+  file listed but whose own `stat` is refused is `OK` in a quick verify and
+  `SOURCE_UNREADABLE` in a full one (`test_b4_verify_says_source_unreadable`
+  pins the old behaviour with the setting off).
 - **A verify never ends on a file, and keeps what it checked (v0.13.1).**
   `_verify_row` turns every read error into a status (`DEST_UNREADABLE`,
   `SOURCE_UNREADABLE`), never an exception. `_verify_catalog` records
@@ -224,10 +274,17 @@ from the command line. A future job (e.g. a full mirror) is a new
   through `_csv_date` and to the catalog through `_db_ns` (SQLite holds 64
   bits: a date after 2262 is stored at the limit and compared the same way) --
   never `datetime.fromtimestamp` on a file date. A read asks for what the file
-  holds (`_read_chunks`), never `handle.read(COPY_CHUNK_MB ...)`.
+  holds (`_read_chunks`), never `handle.read(COPY_CHUNK_MB ...)`. A name
+  Windows opens as a device (`NUL`: `relpath` raises `ValueError`) is an error
+  of the plan: `_Planner._rel` records it and returns `None`, `_add` leaves the
+  file out (v0.13.2).
 - **The catalog is checked when it is opened (v0.13.1).** `_Catalog` runs
   `PRAGMA quick_check`: a damaged catalog is a `RuntimeError` (exit 2) for the
-  backup, the dry-run, the verify, the restore and the menu. A run reads the
+  backup, the dry-run, the verify, the restore and the menu. So is a row whose
+  path would lead outside the backup (`_first_unsafe_rel` / `_unsafe_rel`: a
+  `.` or `..` part, a drive or `:`, a root, empty; v0.13.2) — this tool never
+  writes one, and every consumer of the rows (restore, `--move-orphans`, move
+  detection, verify) joins `rel` to the backup's root. A run reads the
   catalog's rows inside `except sqlite3.Error`. A plan with a path under
   `CATALOG_FOLDER` is refused (`_reserved_rel_error`, exit 2).
 - **The big CSVs list what changed (v0.13.1).** `_plan.csv` of a run that
@@ -242,12 +299,32 @@ from the command line. A future job (e.g. a full mirror) is a new
   proves ours; the album never depends on `--source` (`album_folder` searches
   up to the drive; a partial album is numbered with the state's other photos,
   counted only).
+- **`mobile_backup.py` 0.1.4.** One run at a time: `take_lock` creates
+  `run.lock` with O_CREAT|O_EXCL (PID + process start time); a live holder =
+  exit 2, nothing changed; a dead one (or a reused PID) is taken over and
+  logged; `_process_status` never calls `os.kill` on Windows (it would end the
+  process); a `--dry-run` takes no lock and stops while a live run holds one.
+  A delete that fails for a photo still in a source postpones that photo's new
+  copy (`postponed` in `execute`): the state never forgets a file it put in the
+  mirror. A mirror path is "absent" only on FileNotFoundError
+  (`_mirror_stat`); any other error freezes every action that touches that
+  album (`_leave_unreadable_albums`), exit 1. Copies and the state are fsynced
+  before `os.replace`; the state's replace is retried on PermissionError
+  (`_replace_retrying`); `state.json.bak` is written after every finished run
+  and used (no delete/rename/forget, exit 1) when `state.json` cannot be read.
+  The overlap check compares `os.path.realpath` too (`_overlaps`).
 - **`mobile_backup.py` deletes only with proof (0.1.2).** It is the one script
   that deletes on its destination (a mirror). A photo is deleted or renumbered
   only when its path is under a `--source` of this run (`_under_run`; never by
   the root recorded in the state, which a narrower test run would pin), and
   nothing is deleted or renamed in a run where `os.walk` (`onerror`) or a
-  `stat` failed on a source. A photo exiftool gave no record for keeps no `shot` in the state, so
+  `stat` failed on a source. Since 0.1.4 also: never a photo behind a link or
+  junction the walk did not follow (`find_photos` does not follow them;
+  `behind_link` in `plan`), never in a mirror folder that could not be read,
+  and never as a mass delete: a run whose photos gone outnumber its new ones
+  by more than `MAX_DELETE_PERCENT` of the mirror's photos of its sources (and
+  by at least `MAX_DELETE_MIN`) changes nothing and exits 1 unless
+  `--allow-mass-delete`. A photo exiftool gave no record for keeps no `shot` in the state, so
   the next run reads it again; a null `shot` of a state written before 0.1.2
   is read once more.
 

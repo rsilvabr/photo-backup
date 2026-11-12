@@ -17,6 +17,7 @@ CONFLICT and left alone.
 """
 
 import argparse
+import math
 import os
 import shutil
 import sqlite3
@@ -26,7 +27,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.13.1"
+__version__ = "0.13.2"
 
 # ---- Settings -------------------------------------------------------------------
 SPACE_MARGIN_GB = 5.0     # free space kept on each restore target drive (default --space-margin-gb)
@@ -41,13 +42,18 @@ def _drive_root(path):
     return os.path.abspath(os.sep)
 
 
+def _only_text(pattern):
+    """An --only value as it is compared: no quotes, no spaces at its ends, no
+    separator at its end, backslashes, lower case. Empty means it names
+    nothing (before v0.13.2 it meant everything: T2 of the 261112 sweep)."""
+    return str(pattern).strip().strip('"').replace("/", "\\").casefold().rstrip("\\/")
+
+
 def _under_any(rel, patterns):
     folded = rel.replace("/", "\\").casefold()
     for pattern in patterns:
-        text = str(pattern).strip().strip('"').replace("/", "\\").casefold().rstrip("\\/")
-        if not text:
-            return True
-        if folded == text or folded.startswith(text + "\\"):
+        text = _only_text(pattern)
+        if text and (folded == text or folded.startswith(text + "\\")):
             return True
     return False
 
@@ -115,8 +121,17 @@ def _main(argv):
         if code is None:
             return 0
         return int(code) if isinstance(code, int) else 2
-    if args.space_margin_gb < 0:
-        print("--space-margin-gb cannot be negative", file=sys.stderr)
+    if not math.isfinite(args.space_margin_gb) or args.space_margin_gb < 0:
+        print("--space-margin-gb must be a number, 0 or more", file=sys.stderr)
+        return 2
+    # An empty --to (a variable left empty in a .cmd) restored into the current
+    # folder, and an empty --only selected everything (T2 of the 261112 sweep)
+    if args.to is not None and not str(args.to).strip().strip('"').strip():
+        print("--to is empty: give the folder to restore into", file=sys.stderr)
+        return 2
+    if args.only is not None and any(not _only_text(pattern) for pattern in args.only):
+        print("--only is empty: give a folder or a file of the backup "
+              "(without --only, everything is restored)", file=sys.stderr)
         return 2
     backup = os.path.abspath(args.backup)
     try:
@@ -138,14 +153,29 @@ def _main(argv):
                   f"(expected {args.expect_backup_id}, found {found or 'no backup here'})",
                   file=sys.stderr)
             return 2
-    if args.to:
+    if args.to is not None:
         to = os.path.abspath(args.to)
-        if sb._is_under(to, backup) or sb._is_under(backup, to):
-            print(f"--to cannot be inside the backup or contain it: {to} vs {backup}",
-                  file=sys.stderr)
+        # also where the two really are: a junction or a subst letter (T4)
+        if sb._overlaps(to, backup):
+            print(f"--to cannot be inside the backup or contain it: {to} vs {backup}"
+                  + sb._really(to, backup), file=sys.stderr)
             return 2
     else:
         to = None
+    backup_real = sb._real(backup)
+    real_folders = {}
+
+    def inside_backup(target):
+        """Whether a target lands in the backup, as typed or where its folder
+        really is (a junction on the way): the restore never writes there."""
+        if sb._is_under(target, backup):
+            return True
+        folder = os.path.dirname(os.path.abspath(target))
+        key = os.path.normcase(folder)
+        if key not in real_folders:
+            real_folders[key] = sb._real(folder)
+        return sb._is_under(real_folders[key], backup_real)
+
     patterns = args.only
     matched = set()
     items = []
@@ -157,7 +187,7 @@ def _main(argv):
             matched.update(hits)
         src = os.path.join(backup, row.rel)
         target = _target_for(row, args)
-        if args.to_original and sb._is_under(row.source_path, backup):
+        if inside_backup(target):
             status = "REFUSED"
         elif not sb._exists(src):
             status = "MISSING_IN_BACKUP"
@@ -265,9 +295,9 @@ def _main(argv):
                     continue
                 if status == "REFUSED":
                     result_rows.append((status, row.rel, target,
-                                        "source_path is inside the backup"))
+                                        "the target is inside the backup"))
                     bad = True
-                    log.log(f"REFUSED {row.rel}: source_path is inside the backup")
+                    log.log(f"REFUSED {row.rel}: the target is inside the backup")
                     continue
                 if sb._exists(target):
                     try:

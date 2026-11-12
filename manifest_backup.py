@@ -35,7 +35,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.13.1"
+__version__ = "0.13.2"
 
 # ---- Settings -------------------------------------------------------------------
 MODES_FILE = "backup_modes.csv"     # next to this script; --modes reads another
@@ -297,6 +297,7 @@ def _plan_rows(rows, modes, args, list_cache):
     links = []
     inside = []
     skipped_folders = []
+    cache_links = []
     stats = sb.Stats()
     for row in rows:
         planner = _plan_row(row, rows, modes, args, list_cache)
@@ -309,13 +310,14 @@ def _plan_rows(rows, modes, args, list_cache):
         links.extend(planner.links)
         inside.extend(planner.inside_rows())
         skipped_folders.extend(planner.skipped_folders)
+        cache_links.extend(planner.cache_links)
         for field in dataclasses.fields(sb.Stats):
             setattr(stats, field.name,
                     getattr(stats, field.name) + getattr(planner.stats, field.name))
     return sb.Plan(files=files, stats=stats, unexported_folders=unexported_folders,
                    unmatched=unmatched, errors=errors, warnings=warnings,
                    sources=sources, links=links, inside=inside,
-                   skipped_folders=skipped_folders)
+                   skipped_folders=skipped_folders, cache_links=cache_links)
 
 
 def _backend_args(parsed, rows, dest):

@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.13.1"
+__version__ = "0.13.2"
 
 # ---- Settings -------------------------------------------------------------------
 BACKUP_SUBFOLDER = "_captureone"            # under --dest: this script's own backup root
@@ -217,7 +217,9 @@ def _walk(root, rel_prefix, plan, top_exclude=(), keep_extensions=None, recurse=
             child = os.path.join(rel, entry.name)
             try:
                 if entry.is_symlink() or getattr(entry, "is_junction", lambda: False)():
-                    plan.links.append(path)
+                    if not _link_left_out(entry, is_top, recurse, any_folder, top_exclude,
+                                          exclude_files, keep_extensions):
+                        plan.links.append(path)
                 elif entry.is_dir(follow_symlinks=False):
                     if not recurse or _matches(entry.name, any_folder):
                         continue
@@ -236,6 +238,33 @@ def _walk(root, rel_prefix, plan, top_exclude=(), keep_extensions=None, recurse=
             except OSError as exc:
                 plan.errors.append((path, str(exc)))
                 plan.unread.append(child)
+
+
+def _link_is_folder(entry):
+    """Whether a link or junction stands for a folder, without following it:
+    a junction always does; a symbolic link carries the folder attribute."""
+    if getattr(entry, "is_junction", lambda: False)():
+        return True
+    try:
+        attributes = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attributes & 0x10)          # FILE_ATTRIBUTE_DIRECTORY
+
+
+def _link_left_out(entry, is_top, recurse, any_folder, top_exclude, exclude_files,
+                   keep_extensions):
+    """Whether a link or junction stands where _walk would not go anyway: an
+    excluded folder (Logs, EBWebView, ...), a subfolder of a folder that is
+    not walked below (the colour folder), a file of EXCLUDE_FILES or of
+    another extension. Such a link is not something missing from the backup,
+    and is not reported as one (T11 of the 261112 sweep)."""
+    if _link_is_folder(entry):
+        return (not recurse or _matches(entry.name, any_folder)
+                or (is_top and _matches(entry.name, top_exclude)))
+    return (_matches(entry.name, exclude_files)
+            or (keep_extensions is not None
+                and os.path.splitext(entry.name)[1].casefold() not in keep_extensions))
 
 
 def _folder_there(path, rel, plan):
@@ -362,11 +391,24 @@ def _write_map(backup, roots, version, plan, rows=None):
               "With Python, the same restore checks every file against the catalog:",
               "  python captureone_backup.py --restore-from <the backup folder> --dry-run",
               ""]
-    target = os.path.join(backup, MAP_FILE)
+    _write_ours(os.path.join(backup, MAP_FILE), "\n".join(lines))
+
+
+def _write_ours(target, text, newline=None):
+    """Write one of this script's own files in the backup (the map, the
+    double-click restore) through a temp file next to it. A read-only old copy
+    -- ours, rewritten every run -- is made writable first, and a failed write
+    leaves no temp behind (T7 of the 261112 sweep); the caller reports it."""
     tmp = target + sb.TEMP_SUFFIX
-    with open(sb._io(tmp), "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines))
-    os.replace(sb._io(tmp), sb._io(target))
+    sb._remove_temp(tmp)                # ours, left by a run that died
+    try:
+        with open(sb._io(tmp), "w", encoding="utf-8", newline=newline) as handle:
+            handle.write(text)
+        _make_writable(target)
+        os.replace(sb._io(tmp), sb._io(target))
+    except BaseException:
+        sb._remove_temp(tmp)
+        raise
 
 
 def _cmd_escape(value):
@@ -479,11 +521,7 @@ def _write_restore_script(backup, roots, plan, rels=None):
         "exit /b %CODE%",
         "",
     ]
-    target = os.path.join(backup, RESTORE_SCRIPT)
-    tmp = target + sb.TEMP_SUFFIX
-    with open(sb._io(tmp), "w", encoding="utf-8", newline="\r\n") as handle:
-        handle.write("\n".join(lines))
-    os.replace(sb._io(tmp), sb._io(target))
+    _write_ours(os.path.join(backup, RESTORE_SCRIPT), "\n".join(lines), newline="\r\n")
 
 
 # ---- Back up -------------------------------------------------------------------------------
@@ -496,10 +534,17 @@ def run_backup(args, log, stamp):
         return 2
     roots, version = _roots(args)
     for root in roots.values():
-        if root and (sb._is_under(backup, root) or sb._is_under(root, backup)):
-            print(f"The backup cannot overlap a Capture One folder: {backup} vs {root}",
-                  file=sys.stderr)
+        # as typed and where they really are: a --dest through a junction or a
+        # subst letter must not land in a Capture One folder (T4, 261112 sweep)
+        if root and sb._overlaps(backup, root):
+            print(f"The backup cannot overlap a Capture One folder: {backup} vs {root}"
+                  + sb._really(backup, root), file=sys.stderr)
             return 2
+    damaged = _catalog_problem(backup)
+    if damaged is not None:
+        print(damaged, file=sys.stderr)
+        log.log(f"ERROR {damaged}")
+        return 2
     plan = _build_plan(roots)
     if not plan.files:
         log.out("Capture One settings: nothing found on this computer, nothing to do.")
@@ -507,7 +552,8 @@ def run_backup(args, log, stamp):
             log.out(f"Could not read {path}: {message}")
         _link_lines(plan, log)
         return 1 if plan.errors else 0
-    statuses = [sb._file_status(item, backup) for item in plan.files]
+    # one listing per folder of the backup, the same answers (O5, 261112 sweep)
+    statuses = sb._file_statuses(plan.files, backup)
     new = [s for s in statuses if s.status == sb.ST_NEW]
     changed = [s for s in statuses if s.status == sb.ST_CHANGED]
     to_copy = new + changed
@@ -614,8 +660,18 @@ def run_backup(args, log, stamp):
     # a folder that could not be read this run is not a folder that is gone
     not_read = [row for row in absent if _not_read(row.key, plan)]
     gone = [row for row in absent if not _not_read(row.key, plan)]
-    _write_map(backup, roots, version, plan, rows)
-    _write_restore_script(backup, roots, plan, [row.rel for row in rows])
+    # The double-click restore first (it is what a new computer needs), then
+    # the map. Neither may end the run with a traceback after the copy: an
+    # error is said, and the run ends with 1 (T7 of the 261112 sweep).
+    write_errors = []
+    for name, write in ((RESTORE_SCRIPT, lambda: _write_restore_script(
+                            backup, roots, plan, [row.rel for row in rows])),
+                        (MAP_FILE, lambda: _write_map(backup, roots, version, plan, rows))):
+        try:
+            write()
+        except OSError as exc:
+            write_errors.append((name, exc))
+            log.log(f"ERROR {name} not written: {exc}")
     log.csv("_gone.csv", ["rel", "size", "source_path"],
             [(row.rel, row.size, row.source_path) for row in gone])
     log.out(f"Result:    copied {sb._num(len(to_copy) - len(failed))}, "
@@ -626,7 +682,26 @@ def run_backup(args, log, stamp):
                 f"not be read in this run: kept, and not counted as gone")
     for rel, message in failed:
         log.out(f"  FAILED {rel}: {message}")
-    return 1 if failed or plan.errors else 0
+    for name, exc in write_errors:
+        log.out(f"  ERROR {os.path.join(backup, name)} could not be written ({exc}): the copied "
+                f"files are in the backup; run the backup again to write it")
+    return 1 if failed or plan.errors or write_errors else 0
+
+
+def _catalog_problem(backup):
+    """Why the catalog that is already there cannot be used (damaged, a path
+    that leads outside the backup, not ours), or None -- also when there is
+    none yet. Checked before the plan, so a --dry-run (what the menu shows
+    before the copy) never says 'fine' about a catalog the copy then refuses
+    (T9 of the 261112 sweep)."""
+    try:
+        catalog = sb._Catalog(backup, create=False, readonly=True)
+    except FileNotFoundError:
+        return None
+    except RuntimeError as exc:
+        return str(exc)
+    catalog.close()
+    return None
 
 
 # ---- Verify ---------------------------------------------------------------------------------
@@ -838,6 +913,7 @@ class _Snapshot:
     def __init__(self, prefix):
         self.prefix = prefix
         self.folder = None
+        self.journaled = 0          # lines written: 0 = this run changed nothing
 
     def _open(self):
         if self.folder is not None:
@@ -854,6 +930,12 @@ class _Snapshot:
             except FileExistsError:
                 time.sleep(0.001)
         self.folder = folder
+        # The journal is there from the start, empty until a change is safe:
+        # the old_ folder of a --force that changed nothing is the newest one,
+        # and --revert-last says "nothing to undo" instead of skipping it and
+        # undoing the force before (T6 of the 261112 sweep).
+        with open(sb._io(os.path.join(folder, JOURNAL_FILE)), "a", encoding="utf-8"):
+            pass
 
     def _journal(self, operation, rel, target=None):
         entry = {"op": operation, "rel": rel}
@@ -865,6 +947,7 @@ class _Snapshot:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        self.journaled += 1
 
     def keep_current(self, rel, target):
         """Copy the file about to be replaced; it is journaled only once it is safe."""
@@ -908,8 +991,9 @@ def run_restore(args, log):
         print(str(exc), file=sys.stderr)
         return 2
     to = os.path.abspath(args.to) if args.to is not None else None
-    if to and (sb._is_under(to, backup) or sb._is_under(backup, to)):
-        print(f"--to cannot be inside the backup or contain it: {to} vs {backup}", file=sys.stderr)
+    if to and sb._overlaps(to, backup):         # also through a junction (T4, 261112 sweep)
+        print(f"--to cannot be inside the backup or contain it: {to} vs {backup}"
+              + sb._really(to, backup), file=sys.stderr)
         return 2
     if args.force and not _local_appdata():
         print("--force needs %LOCALAPPDATA%: there is nowhere safe to keep the old files.",
@@ -1063,14 +1147,19 @@ def run_restore(args, log):
     if final.get("RESTORED_UNVERIFIED"):
         log.out(f"  {sb._num(final['RESTORED_UNVERIFIED'])} files restored without a catalog "
                 f"hash (RESTORED_UNVERIFIED): only their size was checked")
-    if snapshot is not None and snapshot.folder is not None:
+    if snapshot is not None and snapshot.journaled:
         log.out(f"Old files kept in: {snapshot.folder}  (undo: --revert-last)")
+    elif snapshot is not None and snapshot.folder is not None:
+        log.out(f"Nothing was replaced or added: {snapshot.folder} records no change "
+                f"(--revert-last would undo nothing)")
     return 1 if any(result[0] in BAD_RESTORE for result in results) else 0
 
 
 # ---- Revert ---------------------------------------------------------------------------------
 def _last_snapshot():
-    """The newest old_ folder that is not disabled, or None. Names sort by time."""
+    """The newest old_ folder that is not disabled, or None. Names sort by time.
+    One without a journal is not skipped: skipping it made --revert-last undo
+    the force BEFORE it (T6 of the 261112 sweep); run_revert refuses it."""
     parent = _snapshots_parent()
     try:
         with os.scandir(sb._io(parent)) as iterator:
@@ -1079,8 +1168,7 @@ def _last_snapshot():
         return None
     usable = [name for name in names
               if name.casefold().startswith(OLD_PREFIX.casefold())
-              and not name.casefold().endswith(DISABLED_SUFFIX.casefold())
-              and sb._exists(os.path.join(parent, name, JOURNAL_FILE))]
+              and not name.casefold().endswith(DISABLED_SUFFIX.casefold())]
     return os.path.join(parent, max(usable)) if usable else None
 
 
@@ -1113,12 +1201,66 @@ def _read_journal(folder):
                 break
             raise ValueError(f"line {index + 1} cannot be read")
         if (operation not in ("replaced", "added") or not isinstance(rel, str)
-                or ".." in rel.split(os.sep)):
+                or sb._unsafe_rel(rel) is not None):
             raise ValueError(f"line {index + 1} is not valid")
         if target is not None and not _journal_target_valid(rel, target):
             raise ValueError(f"line {index + 1} is not valid")
         entries.append((operation, rel, target))
     return entries
+
+
+def _same_folder(first, second):
+    return (os.path.normcase(os.path.abspath(first)).rstrip("\\/")
+            == os.path.normcase(os.path.abspath(second)).rstrip("\\/"))
+
+
+def _install_folder_at(folder):
+    """Whether `folder` is a Capture One install folder: it holds the program,
+    or every INSTALL_DATA_FOLDERS folder as a real folder (not a link)."""
+    names = sb._split_names(PROCESS_NAMES)
+    if names and os.path.isfile(sb._io(os.path.join(folder, names[0]))):
+        return True
+    data = sb._split_names(INSTALL_DATA_FOLDERS)
+    if not data:
+        return False
+    for name in data:
+        path = sb._io(os.path.join(folder, name))
+        if (not os.path.isdir(path) or os.path.islink(path)
+                or getattr(os.path, "isjunction", lambda _path: False)(path)):
+            return False
+    return True
+
+
+def _journal_target_problem(label, rest, target, roots):
+    """Why a journaled target is not a place a --force of this computer can
+    have written, or None (T3 of the 261112 sweep). The journal lives in
+    %LOCALAPPDATA%, where any program of the user can write, and --revert-last
+    may run as administrator: a target is trusted only where Capture One keeps
+    that part --
+      UserData, Preferences, WindowsColor: this run's folder of the label;
+      Installed: inside a folder of INSTALL_DATA_FOLDERS of this run's install
+        folder, or of another Capture One install folder (a --force made with
+        --install-folder is undone there, N10);
+    and only if no link or junction below that folder leads somewhere else."""
+    if label not in roots or not rest:
+        return "is not under a part this script keeps"
+    root = target[:len(target) - len(os.sep + rest)]     # it ends with \rest (_journal_target_valid)
+    if label == LABEL_INSTALLED:
+        data = {name.casefold() for name in sb._split_names(INSTALL_DATA_FOLDERS)}
+        if rest.split(os.sep, 1)[0].casefold() not in data:
+            return "is not in a folder of INSTALL_DATA_FOLDERS"
+        if not (roots[label] and _same_folder(root, roots[label])) and not _install_folder_at(root):
+            return "is not in a Capture One install folder"
+    elif not roots[label] or not _same_folder(root, roots[label]):
+        return f"is not in this computer's {label} folder ({roots[label] or 'unknown'})"
+    if (os.path.normcase(sb._real(target)).rstrip("\\/")
+            != os.path.normcase(os.path.join(sb._real(root), rest)).rstrip("\\/")):
+        return "leads somewhere else through a link or a junction"
+    return None
+
+
+def _under_roots(path, roots):
+    return any(root and sb._is_under(path, root) for root in roots.values())
 
 
 class _TargetAppeared(Exception):
@@ -1140,10 +1282,22 @@ def run_revert(args, log):
         print(f"Nothing to undo: no usable {OLD_PREFIX}* folder in {_snapshots_parent()}.",
               file=sys.stderr)
         return 2
+    skip_hint = (f"To undo the --force before it, rename this folder so that its name ends "
+                 f"with {DISABLED_SUFFIX}.")
+    if not sb._exists(os.path.join(folder, JOURNAL_FILE)):
+        print(f"Cannot undo {folder}: it has no {JOURNAL_FILE} (a --force that stopped before "
+              f"it changed a file). Nothing changed. {skip_hint}", file=sys.stderr)
+        log.log(f"Refused: {folder} has no journal")
+        return 2
     try:
         entries = _read_journal(folder)
     except (OSError, ValueError) as exc:
         print(f"Cannot read {folder}: {exc}. Nothing changed.", file=sys.stderr)
+        return 2
+    if not entries:
+        print(f"Nothing to undo in {folder}: that --force changed no file. Nothing changed. "
+              f"{skip_hint}", file=sys.stderr)
+        log.log(f"Nothing to undo: {folder} has an empty journal")
         return 2
     running = _captureone_running()
     if not args.dry_run and running is not False:
@@ -1152,6 +1306,22 @@ def run_revert(args, log):
         log.log("Refused: Capture One may be open")
         return 2
     roots, _version = _roots(args)
+    # Every journaled target is checked before anything is touched (T3 of the
+    # 261112 sweep): one that is not a place a force of this computer writes
+    # makes the whole journal untrusted.
+    outside = []
+    for index, (_operation, rel, journaled) in enumerate(entries, 1):
+        if journaled is None:
+            continue
+        label, _sep, rest = rel.partition(os.sep)
+        why = _journal_target_problem(label, rest, journaled, roots)
+        if why is not None:
+            print(f"Cannot undo {folder}: line {index} of its {JOURNAL_FILE}: {journaled} {why}. "
+                  f"Nothing changed.", file=sys.stderr)
+            log.log(f"Refused: journal line {index}: {journaled} {why}")
+            return 2
+        if not _under_roots(journaled, roots):
+            outside.append(journaled)
     admin = _is_admin()
     items = []
     for operation, rel, journaled in entries:
@@ -1167,6 +1337,8 @@ def run_revert(args, log):
         else:
             target = os.path.join(root, rest)
         snap = os.path.join(folder, rel)
+        # By the place: a target was checked above to be in the folder of its
+        # own label (an install or the colour folder for the protected ones).
         protected = label in PROTECTED_LABELS and not admin
         try:
             if operation == "added":
@@ -1189,6 +1361,13 @@ def run_revert(args, log):
     log.out(f"Undoing: {folder}")
     log.out("Plan:    " + ("  ".join(f"{status} {sb._num(count)}"
                                      for status, count in sorted(counts.items())) or "(empty)"))
+    if outside:
+        # named before the question: where the force went (--install-folder),
+        # not where this run's folders are
+        log.out(f"  {sb._num(len(outside))} files are undone where the --force put them, "
+                f"outside this run's Capture One folders:")
+        for path in outside:
+            log.out(f"    {path}")
     log.csv("_revert_plan.csv", ["status", "rel", "target"],
             [(status, rel, target) for status, rel, _snap, target in items])
     if args.dry_run:

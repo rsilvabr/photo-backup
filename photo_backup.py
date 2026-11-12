@@ -25,7 +25,7 @@ import string
 import subprocess
 import sys
 
-__version__ = "0.13.1"
+__version__ = "0.13.2"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(

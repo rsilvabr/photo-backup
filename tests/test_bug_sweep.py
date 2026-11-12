@@ -393,16 +393,25 @@ def test_b17_links_are_shown_and_logged(tmp_path, capsys, photobackup_log_dir):
                          "E/cache/Proxies/a.cop": 30})
     link = tmp_path / "G" / "2025" / "shoot" / "CaptureOne" / "Cache"
     make_junction(link, tmp_path / "E" / "cache")
+    # v0.13.2 (O2 of the 261112 sweep): a Capture One cache folder that is a
+    # junction (a cache moved to another disk) is named on the Capture One cache line, not as
+    # a folder that is not backed up; with --c1-cache it is a plain link again
+    cache_line = "(+ 1 cache folders that are links to another place, not followed)"
     assert sb.main(argv_for(tmp_path / "G" / "2025", tmp_path / "out", tmp_path,
                             "--dry-run")) == 0
-    assert "links/junctions not followed: 1" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert cache_line in out and "links/junctions not followed" not in out
     assert str(link) in latest_log(photobackup_log_dir)
+    assert sb.main(argv_for(tmp_path / "G" / "2025", tmp_path / "out", tmp_path,
+                            "--dry-run", "--c1-cache")) == 0
+    assert "links/junctions not followed: 1" in capsys.readouterr().out
     manifest = tmp_path / "manifest.csv"
     manifest.write_text(f"Folder,Mode,Originals\n{tmp_path / 'G' / '2025'},3+,raw\n",
                         encoding="utf-8")
     assert mb.main(["--manifest", str(manifest), "--modes", str(SHIPPED_MODES),
                     "--dest", str(tmp_path / "out"), "--dry-run"]) == 0
-    assert "links/junctions not followed: 1" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert cache_line in out and "links/junctions not followed" not in out
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows junctions")
@@ -563,6 +572,10 @@ def test_b4_source_state_needs_positive_proof(tmp_path, monkeypatch):
 
 
 def test_b4_verify_says_source_unreadable(tmp_path, monkeypatch, photobackup_log_dir):
+    # One question per source file, as before v0.13.2: by default a quick
+    # verify takes a listed file's size and date from the plan's listing
+    # (O1 of the 261112 sweep; tests/test_sweep3_main.py covers that default)
+    monkeypatch.setattr(sb, "VERIFY_QUICK_USES_PLAN", False)
     make_tree(tmp_path, {"G/2024/trip/DSC_0001.NEF": 100,
                          "G/2024/trip/_EXPORT/DSC_0001_v1.jpg": 50})
     source = tmp_path / "G" / "2024"

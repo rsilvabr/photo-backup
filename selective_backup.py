@@ -18,6 +18,7 @@ import collections
 import csv
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -32,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeou
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-__version__ = "0.13.1"
+__version__ = "0.13.2"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -114,6 +115,11 @@ VERIFY_PARALLEL = True              # --verify full: read the backup copy and th
                                     # after the other (two partitions of ONE hard disk)
 VERIFY_COMMIT_S = 30.0              # --verify full: the catalog is written at least this often, so a verify that
                                     # is interrupted keeps what it had checked
+VERIFY_QUICK_USES_PLAN = True       # --verify quick: the size and date of a source file come from the listing the
+                                    # plan has just made (as the backup itself decides UP_TO_DATE), not from one
+                                    # more question per file (425 000 on a cold disk). False = ask for each one:
+                                    # a file listed but whose own record is refused is then SOURCE_UNREADABLE
+                                    # (a --verify full reads every file and says it either way)
 SUMMARY_FOLDER_LINES = 25           # lines of the per-folder table in the summary (the CSV has all)
 SUMMARY_INSIDE_NAMES = 5            # subfolder names shown under "inside sessions" (the _inside.csv has all)
 
@@ -490,6 +496,7 @@ class Stats:
     inside_shoot_skipped_bytes: int = 0
     c1_cache_skipped: int = 0
     c1_cache_skipped_bytes: int = 0
+    c1_cache_links: int = 0             # Capture One cache folders that are junctions/links (not followed)
     derivatives_skipped: int = 0
     derivatives_skipped_bytes: int = 0
     manifest_skip_folders: int = 0
@@ -538,6 +545,7 @@ class Plan:
     links: list = field(default_factory=list)    # links/junctions not followed (paths)
     inside: list = field(default_factory=list)   # (session, subfolder, files, bytes) left out
     skipped_folders: list = field(default_factory=list)  # skipped by name, not listed (paths)
+    cache_links: list = field(default_factory=list)  # Capture One cache folders that are links (paths)
 
 
 @dataclass
@@ -599,6 +607,7 @@ class _Planner:
         self.unmatched = []
         self.sources = []
         self.links = []             # links/junctions not followed, each once
+        self.cache_links = []       # ... of them, the Capture One cache folders (moved to another disk)
         self._links_seen = set()
         self.skipped_folders = []   # SYSTEM_SKIP_FOLDERS / --exclude-folders, each once (S4)
         self._skipped_seen = set()
@@ -703,6 +712,13 @@ class _Planner:
             if link_key in self._links_seen or link_key in self.skip_paths:
                 continue
             self._links_seen.add(link_key)
+            if self._is_cache_link(link):
+                # the cache this run leaves out anyway, moved to another disk:
+                # its own line, so that "links not followed" means a folder
+                # that is NOT backed up (O2 of the 261112 sweep: 429 on G:)
+                self.cache_links.append(link)
+                self.stats.c1_cache_links += 1
+                continue
             self.links.append(link)
             self.stats.skipped_links += 1
         if self.skip_paths:
@@ -712,6 +728,15 @@ class _Planner:
         # export or a Capture One folder: every walk lists through here (R2)
         dirs = [item for item in dirs if not self._skipped_by_name(*item)]
         return files, dirs
+
+    def _is_cache_link(self, link):
+        """A link or junction that IS a Capture One cache folder (named in
+        CAPTUREONE_CACHE_NAMES, right inside a Capture One folder) in a run
+        that does not copy the cache. With --c1-cache it stays a plain link:
+        what is behind it is not copied, and the summary says so."""
+        return (not self.copy_cache
+                and os.path.basename(link).casefold() in self.cache_names
+                and os.path.basename(os.path.dirname(link)).casefold() in self.c1_names)
 
     def _skipped_by_name(self, name, dpath):
         """True for a folder of SYSTEM_SKIP_FOLDERS or --exclude-folders, at any
@@ -742,9 +767,21 @@ class _Planner:
             rest = path[len(prefix):]
             if rest and not _REL_REWRITTEN.search(rest):
                 return rest
-        return os.path.relpath(path, base)
+        try:
+            return os.path.relpath(path, base)
+        except ValueError as exc:
+            # A file named NUL is read by Windows as the device '\\.\NUL': it
+            # cannot be opened by its name. One such file stopped the whole
+            # plan with a traceback (T12 of the 261112 sweep); it is an error
+            # of the plan now, and _add leaves it out.
+            self.errors.append(f"ERROR name {path}: Windows opens this name as a device, "
+                               f"not as a file ({exc}); NOT backed up (rename it)")
+            self.stats.scan_errors += 1
+            return None
 
     def _add(self, planned):
+        if planned.rel is None:         # its name cannot be used (_rel said why)
+            return
         key = planned.rel.casefold()
         if key in self.seen:
             kept = self.seen[key].src
@@ -1214,6 +1251,7 @@ def plan(args):
         links=list(planner.links),
         inside=planner.inside_rows(),
         skipped_folders=list(planner.skipped_folders),
+        cache_links=list(planner.cache_links),
     )
 
 
@@ -1223,6 +1261,52 @@ def _is_under(path, root):
     if folded_path == folded_root:
         return True
     return folded_path.startswith(folded_root + os.sep)
+
+
+def _real(path):
+    """Where `path` really is: a junction, a symbolic link or a subst letter
+    on the way is followed (os.path.realpath; a part that does not exist yet
+    is kept as typed). Without the \\\\?\\ prefix, so that it compares with a
+    typed path."""
+    try:
+        real = os.path.realpath(os.path.abspath(path))
+    except (OSError, ValueError):
+        return os.path.abspath(path)
+    if real.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + real[len("\\\\?\\UNC\\"):]
+    if real.startswith("\\\\?\\"):
+        return real[len("\\\\?\\"):]
+    return real
+
+
+def _overlaps(first, second):
+    """Whether one of two folders is inside the other (or both are one), as
+    typed or where they really are: a destination reached through a junction
+    or a subst letter that lands inside a source is caught too. For the safety
+    checks only (destination x source, restore target x backup); _is_under
+    stays for the paths of the catalog."""
+    if _is_under(first, second) or _is_under(second, first):
+        return True
+    real_first, real_second = _real(first), _real(second)
+    return _is_under(real_first, real_second) or _is_under(real_second, real_first)
+
+
+def _unsafe_rel(rel):
+    """Why a catalogued relative path would lead outside the backup, or None:
+    empty, starting at a root, with a drive or a stream (':'), or with a '.'
+    or '..' part. A path this tool plans never has one; only a damaged or a
+    forged catalog does."""
+    if not isinstance(rel, str):
+        return "a path that is not text"
+    if not rel.strip():
+        return "an empty path"
+    if ":" in rel:
+        return "a drive or a stream (':')"
+    if rel[0] in "\\/":
+        return "a path that starts at a root"
+    if any(part.rstrip(" ") in (".", "..") for part in re.split(r"[\\/]", rel)):
+        return "a '.' or '..' part"
+    return None
 
 
 def _validate_usage(args):
@@ -1239,6 +1323,12 @@ def _validate_usage(args):
         errors.append("--move-orphans cannot be combined with --verify")
     if args.max_gb < 0:
         errors.append("--max-gb cannot be negative")
+    elif not math.isfinite(args.max_gb):
+        errors.append("--max-gb must be a number, 0 or more")
+    # A margin that is not a number stopped the run with a traceback, and a
+    # negative one turned "not enough space" into "fits" (T8 of the 261112 sweep)
+    if not math.isfinite(args.space_margin_gb) or args.space_margin_gb < 0:
+        errors.append("--space-margin-gb must be a number, 0 or more")
     sources = [os.path.abspath(source) for source in args.source]
     for source in sources:
         if not os.path.isdir(_io(source)):
@@ -1256,9 +1346,21 @@ def _validate_usage(args):
             if _is_under(source, other) or _is_under(other, source):
                 errors.append(f"sources overlap: {source} and {other}")
     for source in sources:
-        if _is_under(dest, source) or _is_under(source, dest):
-            errors.append(f"destination overlaps source: dest {dest}, source {source}")
+        # also where the two really are: a junction or a subst letter that
+        # leads the destination into a source (T4 of the 261112 sweep)
+        if _overlaps(dest, source):
+            errors.append(f"destination overlaps source: dest {dest}, source {source}"
+                          + _really(dest, source))
     return errors
+
+
+def _really(*paths):
+    """' (really: ...)' for the paths a junction, a link or a subst letter
+    leads somewhere else, '' when every one is where it says."""
+    moved = [f"{path} -> {_real(path)}" for path in paths
+             if os.path.normcase(_real(path)).rstrip("\\/")
+             != os.path.normcase(os.path.abspath(path)).rstrip("\\/")]
+    return f" (really: {'; '.join(moved)})" if moved else ""
 
 
 def _status_of(planned, dst, size, mtime_ns):
@@ -1398,12 +1500,26 @@ def _ensure_backup_id(dest, log):
         "path": os.path.splitdrive(os.path.abspath(dest))[1].lstrip("\\/"),
     }
     folder = os.path.join(os.path.abspath(dest), CATALOG_FOLDER)
-    os.makedirs(_io(folder), exist_ok=True)
     target = os.path.join(folder, BACKUP_ID_FILE)
     tmp = target + TEMP_SUFFIX
-    with open(_io(tmp), "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
-    os.replace(_io(tmp), _io(target))
+    try:
+        os.makedirs(_io(folder), exist_ok=True)
+        with open(_io(tmp), "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+        # Never over a file that is there: one that could not be read for a
+        # moment (locked, half written) was replaced by a new identity, and
+        # every preset of this backup refused it from then on (T17 of the
+        # 261112 sweep).
+        _rename_no_clobber(tmp, target)
+    except FileExistsError:
+        _remove_temp(tmp)
+        log.log(f"WARNING {target} is there but could not be read: it is kept as it is "
+                f"(the backup ID was not checked in this run)")
+        return None
+    except OSError as exc:
+        _remove_temp(tmp)
+        log.log(f"WARNING the backup ID could not be written ({exc}): {target}")
+        return None
     log.log(f"Backup ID {backup_id} (new)")
     return backup_id
 
@@ -1471,12 +1587,36 @@ class _Catalog:
                 raise RuntimeError(
                     f"catalog is damaged ({found}): {self.path}. The copied files are not "
                     f"touched; see 'A damaged catalog' in the README.")
+            # A valid database can still hold a path that leads out of the
+            # backup ('..\\x'): the restore read and wrote outside, --move-orphans
+            # would move a file of somewhere else (T13 of the 261112 sweep).
+            unsafe = self._first_unsafe_rel()
+            if unsafe is not None:
+                raise RuntimeError(
+                    f"catalog is damaged: the row {unsafe[0]!r} has {unsafe[1]}, which would "
+                    f"lead outside the backup: {self.path}. Nothing was read or written "
+                    f"through it; see 'A damaged catalog' in the README.")
         except sqlite3.Error as exc:
             self.close()
             raise RuntimeError(f"cannot open catalog {self.path}: {exc}")
         except RuntimeError:
             self.close()
             raise
+
+    def _first_unsafe_rel(self):
+        """(rel, why) of the first row whose path would lead outside the
+        backup (_unsafe_rel), or None. SQLite picks the few candidates: a
+        path with ':', starting at a root, or with a part that starts with a
+        dot."""
+        cursor = self.conn.execute(
+            "SELECT rel FROM files WHERE typeof(rel) != 'text' OR trim(rel) = '' "
+            "OR instr(rel, ':') > 0 OR substr(rel, 1, 1) IN ('\\', '/', '.') "
+            "OR instr(rel, '\\.') > 0 OR instr(rel, '/.') > 0")
+        for (rel,) in cursor:
+            why = _unsafe_rel(rel)
+            if why is not None:
+                return rel, why
+        return None
 
     def all_rows(self):
         cursor = self.conn.execute(
@@ -1592,11 +1732,38 @@ class _Logger:
             pass
 
 
+def _rename_no_clobber(src, dst):
+    """Rename that never replaces: FileExistsError when `dst` is there
+    (Windows' rename refuses it; elsewhere a hard link does)."""
+    if os.name == "nt":
+        os.rename(_io(src), _io(dst))
+    else:
+        os.link(_io(src), _io(dst))
+        os.remove(_io(src))
+
+
+def _move_aside(src, target):
+    """Move `src` to `target` -- or to 'name (2).ext', 'name (3).ext', ...
+    when that name is taken: a file already there is never replaced (two runs
+    started in the same second share the stamp of versions\\ and orphans\\,
+    T16 of the 261112 sweep). Returns the path used."""
+    stem, ext = os.path.splitext(target)
+    candidate = target
+    for counter in range(2, 10000):
+        try:
+            _rename_no_clobber(src, candidate)
+            return candidate
+        except FileExistsError:
+            candidate = f"{stem} ({counter}){ext}"
+    raise FileExistsError(f"no free name next to {target}")
+
+
 def _move_to_versions(dest, stamp, status, log):
     target = os.path.join(dest, CATALOG_FOLDER, "versions", stamp, status.planned.rel)
     os.makedirs(_io(os.path.dirname(target)), exist_ok=True)
-    os.replace(_io(status.dst), _io(target))
-    log.log(f"VERSION {status.planned.rel}")
+    used = _move_aside(status.dst, target)
+    log.log(f"VERSION {status.planned.rel}"
+            + ("" if used == target else f" (kept as {os.path.basename(used)})"))
 
 
 def _handle_old_copy(dest, stamp, status, log):
@@ -2007,7 +2174,8 @@ def _apply_moves(candidates, dest, catalog, log):
             old = os.path.join(dest, chosen.rel)
             old_dir = os.path.dirname(old)
             os.makedirs(_io(os.path.dirname(new)), exist_ok=True)
-            os.replace(_io(old), _io(new))
+            # never over a file that appeared there since the check above
+            _rename_no_clobber(old, new)
             os.utime(_io(new), ns=(stat0.st_atime_ns, stat0.st_mtime_ns))
             catalog.delete(chosen.key)
             catalog.upsert(status.planned, sha_src, stat0.st_size, stat0.st_mtime_ns)
@@ -2073,9 +2241,10 @@ def _move_orphans(dest, stamp, orphans, catalog, log):
         if _exists(src):
             target = os.path.join(target_root, row.rel)
             os.makedirs(_io(os.path.dirname(target)), exist_ok=True)
-            os.replace(_io(src), _io(target))
+            used = _move_aside(src, target)
             catalog.delete(row.key)
-            log.log(f"ORPHAN {row.rel}")
+            log.log(f"ORPHAN {row.rel}"
+                    + ("" if used == target else f" (kept as {os.path.basename(used)})"))
             _prune_empty_parents(os.path.dirname(src), dest, log)
             moved += 1
         else:
@@ -2336,9 +2505,11 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
     lines.append(f"  export files filtered (formats / excluded subfolders): "
                  f"{_num(planned.stats.export_filtered + planned.stats.export_excluded)} / "
                  f"{_gb(planned.stats.export_filtered_bytes + planned.stats.export_excluded_bytes)}")
+    cache_links = (f" (+ {_num(len(planned.cache_links))} cache folders that are links to "
+                   f"another place, not followed)" if planned.cache_links else "")
     lines.append(f"  unselected originals: {_num(planned.stats.unselected_skipped)} / "
                  f"{_gb(planned.stats.unselected_skipped_bytes)}      "
-                 f"Capture One cache: {_gb(planned.stats.c1_cache_skipped_bytes)}")
+                 f"Capture One cache: {_gb(planned.stats.c1_cache_skipped_bytes)}{cache_links}")
     if planned.stats.add_filtered_skipped:
         lines.append(f"  left out inside added folders (Originals filter): "
                      f"{_num(planned.stats.add_filtered_skipped)} / "
@@ -2405,6 +2576,8 @@ def _run_backup(args, log, stamp, plan_fn=None):
         log.log(warning)
     for link in planned.links:
         log.log(f"LINK not followed {link}")
+    for link in planned.cache_links:
+        log.log(f"CACHE LINK not followed {link}")
     for folder in planned.skipped_folders:
         log.log(f"SKIPPED FOLDER {folder}")
     reserved = _reserved_rel_error(planned)
@@ -2656,6 +2829,8 @@ class _VerifyJob:
     row: _Row
     in_catalog: bool
     dest_size: int = None       # from the listing of its folder (quick verify); None = ask
+    source_listed: tuple = None     # (size, mtime_ns) of the source from the plan's listing
+                                    # (quick verify, VERIFY_QUICK_USES_PLAN); None = ask
 
 
 def _same_drive(first, second):
@@ -2743,10 +2918,17 @@ def _verify_row(job, dest, deep, reader=None):
     if dest_size != row.size:
         return VerifyResult("DEST_SIZE", row.rel, row.source_path,
                             f"destination size {dest_size} != {row.size}")
-    state, source_stat = _source_stat(row.source_path)
+    if not deep and job.source_listed is not None:
+        # the plan listed this very file seconds ago (VERIFY_QUICK_USES_PLAN)
+        state = SOURCE_PRESENT
+        source_size, source_mtime_ns = job.source_listed
+    else:
+        state, source_stat = _source_stat(row.source_path)
+        source_size = source_stat.st_size if source_stat is not None else None
+        source_mtime_ns = source_stat.st_mtime_ns if source_stat is not None else None
     tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
-    source_same = (state == SOURCE_PRESENT and source_stat.st_size == row.size
-                   and abs(_db_ns(source_stat.st_mtime_ns) - row.mtime_ns) <= tolerance)
+    source_same = (state == SOURCE_PRESENT and source_size == row.size
+                   and abs(_db_ns(source_mtime_ns) - row.mtime_ns) <= tolerance)
     # The backup copy is judged BEFORE the source: when the original is gone
     # or changed, the copy may be the only one left, and its health matters
     # most. A copy with a catalog hash is always read; one without is read
@@ -2826,6 +3008,19 @@ def _list_dest_sizes(jobs, dest):
                 job.dest_size = hit[0]
 
 
+def _listed_sources(jobs, planned_files):
+    """Quick verify (VERIFY_QUICK_USES_PLAN): the size and date the plan's own
+    listing gave for each job's source, when the plan holds that very file
+    (same path) -- one question less per file. A row whose source the plan
+    does not hold is still asked (_source_stat: missing needs proof)."""
+    by_key = {planned_file.rel.casefold(): planned_file for planned_file in planned_files}
+    for job in jobs:
+        planned_file = by_key.get(job.row.key)
+        if (planned_file is not None
+                and os.path.normcase(planned_file.src) == os.path.normcase(job.row.source_path)):
+            job.source_listed = (planned_file.size, planned_file.mtime_ns)
+
+
 def _run_verify(args, log, plan_fn=None):
     dest = os.path.abspath(args.dest)
     if not os.path.isdir(_io(dest)):
@@ -2875,6 +3070,8 @@ def _verify_catalog(args, log, plan_fn, dest, catalog, deep, reader):
         log.log(warning)
     for link in planned.links:
         log.log(f"LINK not followed {link}")
+    for link in planned.cache_links:
+        log.log(f"CACHE LINK not followed {link}")
     for folder in planned.skipped_folders:
         log.log(f"SKIPPED FOLDER {folder}")
     reserved = _reserved_rel_error(planned)
@@ -2927,6 +3124,8 @@ def _verify_catalog(args, log, plan_fn, dest, catalog, deep, reader):
                                            job.row.copied_at or ""))
     if not deep:
         _list_dest_sizes(planned_jobs + catalog_jobs, dest)
+        if VERIFY_QUICK_USES_PLAN:
+            _listed_sources(planned_jobs + catalog_jobs, planned.files)
     catalog_bytes = sum(job.row.size for job in catalog_jobs)
     total_bytes = 0
     if deep:
