@@ -37,8 +37,9 @@ from the command line. A future job (e.g. a full mirror) is a new
   Its own settings (`CONFIG_PATH`, `VERIFY_MODE`, `MAX_ONLY_CHARS`,
   `FORMAT_ALTERNATIVES`, `RESTORE`, ...) are at its top; tests set
   `CONFIG_PATH` to a temp file. Every setting at the top of every script is
-  named in its README: `tests/test_docs.py::test_docs_cover_the_settings`
-  (v0.13.2), with `NOT_SETTINGS` for the constants that are not settings.
+  named in its docs (`README.md` + `docs/`, or `README_mobile_backup.md`):
+  `tests/test_docs.py::test_docs_cover_the_settings` (v0.13.2), with
+  `NOT_SETTINGS` for the constants that are not settings.
 - `restore_backup.py` — restores files out of a backup (`--to` /
   `--to-original`). A backend may import the catalog and the copier from
   `selective_backup.py` (`import selective_backup as sb`); never duplicate
@@ -396,10 +397,44 @@ Same as the sibling repo `jxl-photo`. Documents live in `AI_tools/`
 - Tags: `vX.Y.Z`, betas `vX.Y.Z_betaN`.
 
 ## Docs map
-- `README.md` — what it does, safety guarantees, every `--flag` (enforced by
-  `tests/test_docs_cover_the_flags.py`), every setting, examples, exit codes.
+- `README.md` — short by design, in jxl-photo's format (owner's rule,
+  2026-11-18: the README must not grow; about 250 lines, from 1365): the
+  opening lines, one session tree, "Does it fit" in short, features one line
+  each, the scripts, a short install, the menu's and the command line's quick
+  start, the modes table, safety and "Good to know" one line each, the
+  documentation table and a SHORT "What's new" for the current release ONLY
+  (replaced at each release, never appended to; the same bullets go to the
+  top of `docs/whats_new.md`). No table of contents, no release table, no
+  option or setting tables. Anything longer goes to a page below, with a link
+  and a row in the documentation table.
+- `docs/how_it_selects.md` — sessions, how an export finds its originals,
+  "Does it fit" in full, export formats, jxl-photo derivatives,
+  `--unselected`, folders without an export, inside sessions.
+- `docs/per_folder_modes.md` — `manifest_backup.py`: the two CSVs, every
+  column, the shipped modes and their sizes, its options and settings.
+- `docs/menu.md` — the menu item by item, unattended runs, after jxl-photo,
+  the menu's settings.
+- `docs/commands_and_settings.md` — every option and setting of
+  `selective_backup.py`, the logs and CSVs, exit codes.
+- `docs/safety.md` — every safety guarantee in full (the README keeps one
+  line each).
+- `docs/reruns_and_moves.md` — re-runs, the versions folder, moves, orphans.
+- `docs/verifying.md` — verify, statuses, the check after each copy, a
+  damaged catalog (the backend's message points to "A damaged catalog", which
+  the README's "Good to know" names too), rolling verify, backup ID.
+- `docs/restoring.md` — `restore_backup.py`: options, outcomes, its setting.
+- `docs/captureone.md` — `captureone_backup.py`: what is kept, the restore,
+  force and undo, its options and settings.
+- `docs/related_projects.md` — the Windows program and jxl-photo.
+- `docs/whats_new.md` — the short notes of each release, newest first, and
+  the at-a-glance table. `docs/version_history.md` — every release in detail.
 - `README_mobile_backup.md` — `mobile_backup.py`: usage, how it numbers,
   the sync and delete rules, its settings.
+- `tests/test_docs.py`: every `--flag` and every setting appears in
+  `README.md` + `docs/` (the release notes do not count), and every relative
+  link of the README, the mobile README and `docs/` leads to a file and a
+  heading that exist. A section moved between pages keeps its heading or
+  updates every link to it.
 
 ## Pending list
 The owner keeps one list of everything still pending, across all repos, in

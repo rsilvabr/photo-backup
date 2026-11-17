@@ -1,8 +1,8 @@
 # Version history
 
 Detailed notes for every release, newest first — the current one included.
-The [main README](../README.md) describes how the tool works today; the
-releases are also published as
+The [main README](../README.md) and the pages next to this one describe how
+the tool works today; the releases are also published as
 [GitHub Releases](https://github.com/rsilvabr/photo-backup/releases).
 
 ## Release history
@@ -135,7 +135,7 @@ different afterwards, listed first.
   a copy is no longer the list of everything in the backup, and after a
   rolling verify it no longer says which files were checked that night; full
   lists keep both, at 83 MB or more per run
-  ([README](../README.md#short-or-full-lists-in-the-csvs-v0131)).
+  ([Short or full lists](commands_and_settings.md#short-or-full-lists-in-the-csvs-v0131)).
 - A dry-run over a catalog that cannot be read (damaged, or not a
   photo-backup catalog) now exits 2, as the copy after it always did.
 - The menu's dry-run of `[1]` and `[7]` now shows the changed files that the
@@ -166,8 +166,8 @@ different afterwards, listed first.
   rolling queue took it for verified. The date is now cleared with the copy.
 - **A catalog with a damaged page**: a dry-run and a `--verify quick` said
   `OK`, the backup and the restore died with a traceback. Every run now checks
-  the catalog when it opens it and stops with a message, exit 2. The README
-  says how to go on ([A damaged catalog](../README.md#a-damaged-catalog)).
+  the catalog when it opens it and stops with a message, exit 2. The docs
+  say how to go on ([A damaged catalog](verifying.md#a-damaged-catalog)).
 
 **Backup**
 
