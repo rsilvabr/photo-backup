@@ -252,29 +252,31 @@ def capture_mirror(monkeypatch, codes=None):
     return calls
 
 
-def test_menu_mirror_is_a_dry_run_then_a_mirror(tmp_path, monkeypatch, menu_config):
+def test_menu_mirror_asks_in_the_mirror_itself(tmp_path, monkeypatch, menu_config):
+    """One real run, without --yes: the mirror asks right below its own box,
+    with the numbers of the run that changes the backup (finding 5 of the rc1
+    review: a dry-run confirmed in the menu, then --yes)."""
     calls = capture_mirror(monkeypatch)
     manifest, dest = str(tmp_path / "m.csv"), str(tmp_path / "out")
-    script(monkeypatch, ["8", "1", manifest, dest, "n", "y", "n", "0", "0"])
+    script(monkeypatch, ["8", "1", manifest, dest, "n", "n", "0", "0"])
     assert menu.main([]) == 0
-    assert calls == [["--manifest", manifest, "--dest", dest, "--dry-run"],
-                     ["--manifest", manifest, "--dest", dest, "--yes"]]
+    assert calls == [["--manifest", manifest, "--dest", dest]]
 
 
-def test_menu_mirror_step_two_defaults_to_no(tmp_path, monkeypatch, menu_config):
-    calls = capture_mirror(monkeypatch)
-    script(monkeypatch, ["8", "1", str(tmp_path / "m.csv"), str(tmp_path / "out"), "n", "",
+def test_menu_mirror_answered_no_offers_nothing(tmp_path, monkeypatch, menu_config):
+    calls = capture_mirror(monkeypatch, codes=[2])      # "no" inside the mirror: exit 2
+    script(monkeypatch, ["8", "1", str(tmp_path / "m.csv"), str(tmp_path / "out"), "n",
                          "0", "0"])
     assert menu.main([]) == 0
-    assert len(calls) == 1 and "--dry-run" in calls[0]
+    assert len(calls) == 1 and "--yes" not in calls[0] and "--dry-run" not in calls[0]
 
 
-def test_menu_total_mirror_and_a_stopped_dry_run(tmp_path, monkeypatch, menu_config):
+def test_menu_total_mirror_and_a_stopped_one(tmp_path, monkeypatch, menu_config):
     calls = capture_mirror(monkeypatch)
-    script(monkeypatch, ["8", "2", str(tmp_path / "m.csv"), str(tmp_path / "out"), "n", "y",
+    script(monkeypatch, ["8", "2", str(tmp_path / "m.csv"), str(tmp_path / "out"), "n",
                          "0", "0"])           # a total mirror never offers a preset
     assert menu.main([]) == 0
-    assert all("--total" in call for call in calls) and len(calls) == 2
+    assert all("--total" in call for call in calls) and len(calls) == 1
     calls = capture_mirror(monkeypatch, codes=[2])
     script(monkeypatch, ["8", "1", "", "", "n", "0", "0"])     # the remembered manifest/dest
     assert menu.main([]) == 0
@@ -284,7 +286,7 @@ def test_menu_total_mirror_and_a_stopped_dry_run(tmp_path, monkeypatch, menu_con
 def test_menu_mirror_preset_runs_unattended(tmp_path, monkeypatch, menu_config, capsys):
     calls = capture_mirror(monkeypatch)
     manifest, dest = str(tmp_path / "m.csv"), str(tmp_path / "out")
-    script(monkeypatch, ["8", "1", manifest, dest, "n", "y", "y", "MIRROR NIGHT", "0", "0"])
+    script(monkeypatch, ["8", "1", manifest, dest, "n", "y", "MIRROR NIGHT", "0", "0"])
     assert menu.main([]) == 0
     saved = json.loads(menu_config.read_text(encoding="utf-8"))["presets"]["MIRROR NIGHT"]
     assert saved["kind"] == menu.KIND_MIRROR and saved["manifest"] == os.path.abspath(manifest)

@@ -14,7 +14,20 @@ from the command line. A future job (e.g. a full mirror) is a new
 `<job>_backup.py` run by the menu — never folded into `selective_backup.py`.
 
 - `selective_backup.py` — the backend: planner, copy, catalog, verify. Every
-  safety rule below lives here.
+  safety rule below lives here. Since v0.14.0-rc2 it also keeps a TIFF as JXL
+  (`docs/tiff_to_jxl.md`): `_Planner._add` gives a TIFF of a line with a
+  profile (`FolderRules.tiff` / `--tiff`; never under an export-named folder)
+  the rel `<name>.tif.jxl` and `convert`; `_convert_status` judges it from its
+  group (catalog schema 2, table `converted`: one row per JXL, with the
+  TIFF's size/date/SHA-256, page, pages, tool, settings); `_copy_all` leaves
+  it out of the copy loop and `_convert_all` runs jxl-photo
+  (`_convert_one`, a thread each, `TIFF_JXL_WORKERS`), puts each proven group
+  in place on the main thread (`_place_group`), then retires a TIFF copy it
+  replaces (`replaces` → `keep_old_file`: versions, or the mirror's own);
+  a failure is `_copy_tiff_as_is`. `_keep_tools` keeps photo-backup, jxl-photo
+  and `KEEP_TOOLS_EXTRA` in `_photo_backup\tools` on every real run. jxl-photo
+  always runs through `_run_jxlphoto` (`-B`, `JXLPHOTO_LOG_DIR` = our
+  `Logs\jxl-photo`, `JXLPHOTO_NO_UPDATE_CHECK`).
 - `manifest_backup.py` — per-folder modes, read from `backup_manifest.csv`
   (gitignored; `backup_manifest.example.csv` is versioned) and
   `backup_modes.csv` (versioned, UTF-8; `--modes` reads another). The code
@@ -43,7 +56,13 @@ from the command line. A future job (e.g. a full mirror) is a new
   `manifest_backup.read_manifest` and ignored by `manifest_backup.py` itself.
   Its screen: the verdict first, the mirror's box last (right above the
   question), tables label | files | size, concrete dates, the trash folder
-  always printed; keep it that way (the owner reads it under pressure).
+  always printed; keep it that way (the owner reads it under pressure). The
+  menu runs it ONCE, without `--yes`: the mirror asks with the numbers of the
+  run that changes the backup (v0.14.0-rc2, finding 5 of the rc1 review; never
+  a dry-run confirmed in the menu and then `--yes`). `keep_old_file` is its
+  home for an old JXL group or a TIFF copy a JXL replaces: ours (a row, or no
+  row and still the source TIFF's size and date: `adoptable`) to the trash,
+  anything else to `versions\`.
 - `photo_backup.py` — interactive menu + presets (`--run-preset`). It
   never copies by itself: it builds an argv and runs `selective_backup.py` (or
   `restore_backup.py`, via `run_restore`) as a child process (`run_backend`).
@@ -60,7 +79,13 @@ from the command line. A future job (e.g. a full mirror) is a new
 - `restore_backup.py` — restores files out of a backup (`--to` /
   `--to-original`). A backend may import the catalog and the copier from
   `selective_backup.py` (`import selective_backup as sb`); never duplicate
-  the catalog format or the copy routine — they exist once.
+  the catalog format or the copy routine — they exist once. A TIFF kept as
+  JXL is one entry (`_TiffGroup`): its JXL files are copied (hash checked)
+  under jxl-photo's own names into a folder of the restore NEXT TO THE TARGET,
+  decoded there (`decode --mode 0 --depth-policy preserve_original
+  --no-preview`), and the one TIFF takes the target's name with
+  `_rename_no_clobber` (`RESTORED_FROM_JXL`; `NEEDS_JXLPHOTO`; `--keep-jxl`).
+  `_find_jxlphoto` falls back to the newest jxl-photo kept in the backup.
 - `captureone_backup.py` — keeps what Capture One itself holds (profiles,
   styles, defaults, ...) in `<dest>\_captureone`, a backup root with its own
   catalog, so `selective_backup.py`'s orphan logic never sees those rows. Rows
@@ -173,7 +198,36 @@ from the command line. A future job (e.g. a full mirror) is a new
   a total mirror need the number of files typed (`_typed_confirmation`);
   `--unattended` never asks and stops instead (exit 2, nothing changed). One
   real run at a time (`mirror.lock`). Files it did not write are never
-  removed, only counted (`stray`).
+  removed, only counted (`stray`). Since v0.14.0-rc2 (the rc1 review,
+  `tests/test_mirror_review.py`): the limit per line counts `remove` AND
+  `replace` items of ours (not `AUTO_UPDATE_EXTENSIONS`), checked after both
+  are known; Ctrl+C while removing or purging still calls `finish`; the trash
+  expires by its day (`(now.date() - run.when.date()).days`); a link inside a
+  trash run is left and is not a problem; the space options are sorted by
+  what they delete; an old copy whose `_dest_stat` is `unreadable` raises
+  (the copy fails, the old copy stays); a typed choice must be ASCII digits.
+- **Nothing is written, moved or deleted through a link inside the backup
+  (v0.14.0-rc2, finding 1 of the rc1 review).** `_run_backup` refuses (exit 2,
+  before the first byte; the mirror's STOP box) when `_first_dest_link` finds
+  a link, junction or other reparse point (`_is_reparse`: lstat, a path that
+  cannot be asked counts as one) on the way from the backup root to the folder
+  of any planned file or catalog row: a junction into a source would let a
+  copy, a versions move or the mirror's trash act on source files.
+  `_prune_empty_parents` never `rmdir`s a reparse point (Windows removes a
+  junction whose target is full), and `_source_stat`'s walk-up asks each folder
+  about itself (`follow_symlinks=False`): behind a dangling junction a file is
+  unreadable, never missing.
+- **A TIFF kept as JXL needs proof, and a failure copies the TIFF
+  (v0.14.0-rc2).** A JXL group is kept only when jxl-photo exited 0 with
+  `--verify-roundtrip`, every file's `jxlphoto-srcsum` is
+  `_jxlphoto_srcsum(SHA-256 photo-backup took before)`, `jxlphoto-pages` = the
+  number of files, and the TIFF's size/date did not change; anything else is
+  `CONVERT FAILED` + `_copy_tiff_as_is` (exit 1). Order: the group gets its
+  final names (`_rename_no_clobber`) and rows, THEN the old group / the TIFF
+  copy it replaces leaves (never before). Our own folders under
+  `_photo_backup\converting` and `.pbtmp` folders under `tools` are the only
+  folders this removes (`_remove_own_folder`, never a link). Nothing in
+  `tools` is replaced or deleted otherwise.
 - **The restore never writes to the backup.** `restore_backup.py` opens the
   catalog read-only, never writes, moves or deletes anything under `--backup`,
   and never overwrites a target file that already exists. An empty `--to` or
@@ -477,6 +531,10 @@ Same as the sibling repo `jxl-photo`. Documents live in `AI_tools/`
 - `docs/restoring.md` — `restore_backup.py`: options, outcomes, its setting.
 - `docs/captureone.md` — `captureone_backup.py`: what is kept, the restore,
   force and undo, its options and settings.
+- `docs/tiff_to_jxl.md` — a TIFF kept as JXL in the backup: profiles and the
+  `Tiff` column, the proof, a second run, TIFF copies already there, moving
+  from FreeFileSync, the restore, verify, space, the tools kept in the backup,
+  its options and settings (v0.14.0-rc2).
 - `docs/related_projects.md` — the Windows program and jxl-photo.
 - `docs/whats_new.md` — the short notes of each release, newest first, and
   the at-a-glance table. `docs/version_history.md` — every release in detail.

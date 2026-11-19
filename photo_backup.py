@@ -28,7 +28,7 @@ import string
 import subprocess
 import sys
 
-__version__ = "0.14.0-rc1"
+__version__ = "0.14.0-rc2"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
@@ -217,7 +217,7 @@ def choose(prompt, options, default_value):
         say(f"  [{index}] {value:<14} {text}{mark}")
     while True:
         answer = ask(prompt, default_index)
-        if answer.isdigit() and 1 <= int(answer) <= len(options):
+        if answer.isascii() and answer.isdigit() and 1 <= int(answer) <= len(options):
             return options[int(answer) - 1][0]
         say(f"  Type a number from 1 to {len(options)}.", "yellow")
 
@@ -643,7 +643,7 @@ def presets_menu(config):
             session = edit_session(session_from(config["last"]), verify=True)
             offer_preset(config, session, KIND_VERIFY)
             continue
-        if answer.isdigit() and 1 <= int(answer) <= len(names):
+        if answer.isascii() and answer.isdigit() and 1 <= int(answer) <= len(names):
             name = names[int(answer) - 1]
             preset = config["presets"][name]
             dest = _locate_backup(preset)
@@ -726,7 +726,7 @@ def restore_flow(config):
         part = part.strip().strip('"')
         if not part:
             continue
-        if part.isdigit() and 1 <= int(part) <= len(folders):
+        if part.isascii() and part.isdigit() and 1 <= int(part) <= len(folders):
             only.extend(folders[int(part) - 1][3])
         else:
             only.append(part)
@@ -934,26 +934,17 @@ def mirror_flow(config, total=False, manifest=None, dest=None, backup_id=None,
     step = {"dest": dest, "captureone": bool(captureone)}
     base = _with_backup_id(["--manifest", manifest, "--dest", dest]
                            + (["--total"] if total else []), backup_id)
-    title("Step 1/2 - what the mirror would do (dry-run, nothing is written)")
-    rc = run_mirror(base + ["--dry-run"])
+    # One run: the mirror shows what it will do and asks right below its box,
+    # with the numbers of this very run (finding 5 of the rc1 review: a dry-run
+    # confirmed here, then a real run with --yes, removed what changed in
+    # between without asking). Nothing else prints between the box and the
+    # question (finding 10).
+    title("Mirror - what will change, then one question (Enter = no)")
+    say(f"  {_trash_sentence()[0].upper()}{_trash_sentence()[1:]}.")
+    rc = run_mirror(base)
     if rc == 2:
-        say(f"Dry-run: {_MIRROR_EXIT_TEXT[2]}.", "red")
-        return rc
-    if rc == 130:
-        return rc
-    captureone_step(step, "dry-run")
-    if rc == 1:
-        say("Some folders or files could not be read: they are NOT backed up, and their lines "
-            "remove nothing (see the log).", "yellow")
-        if not yes_no("Mirror the rest anyway?", False):
-            say("Nothing changed.")
-            return rc
-    say(f"  Read the box above: {_trash_sentence()}.")
-    if not yes_no("Step 2/2 - mirror now?", False):
-        say("Nothing changed.")
-        return 0
-    title("Mirroring")
-    rc = run_mirror(base + ["--yes"])
+        say(f"Mirror: {_MIRROR_EXIT_TEXT[2]}.", "yellow")
+        return 0 if preset_name is None else rc
     if rc in (0, 1):
         rc = max(rc, 1 if captureone_step(step, "copy") else 0)
     say(f"Mirror: {_MIRROR_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "green" if rc == 0 else "yellow")
@@ -1098,6 +1089,9 @@ def settings_menu(config):
                  "UNSELECTED", "UNEXPORTED", "COPY_CAPTUREONE_CACHE",
                  "COPY_JXLPHOTO_DERIVATIVES", "AUTO_UPDATE",
                  "AUTO_UPDATE_EXTENSIONS", "SPACE_MARGIN_GB", "VERIFY_COPY"):
+        say(f"    {name:<26} {_setting(name)!r}")
+    say("  TIFF kept as JXL in the backup (a manifest's Tiff column names a profile):")
+    for name in ("JXLPHOTO", "TIFF_JXL_PROFILES", "KEEP_TOOLS_IN_BACKUP", "KEEP_TOOLS_EXTRA"):
         say(f"    {name:<26} {_setting(name)!r}")
     say("  Defaults of mirror_backup.py (edit the top of that file to change them):")
     for name in ("MIRROR_KEEP_DAYS", "MIRROR_MAX_DELETE_PERCENT", "MIRROR_MAX_DELETE_MIN"):

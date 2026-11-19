@@ -10,7 +10,10 @@ Two CSV files say what to do:
 
 - **The manifest** (`--manifest`, required) lists the folders:
   `Folder,Mode,Originals`, and optionally `Mirror` (`disk` or `selection`),
-  which only [the mirror](mirror.md#the-mirror-column) reads. The owner's real
+  which only [the mirror](mirror.md#the-mirror-column) reads, and `Tiff`
+  *(v0.14.0-rc2)*: `copy` (empty: the TIFFs as they are) or the name of a
+  profile of `TIFF_JXL_PROFILES` — that line's TIFFs are kept as JXL in the
+  backup, made by jxl-photo ([tiff_to_jxl.md](tiff_to_jxl.md)). The owner's real
   manifest (`backup_manifest.csv`) stays out of git;
   `backup_manifest.example.csv` shows the format.
 - **The modes table** (`--modes`, default `backup_modes.csv` beside the
@@ -151,6 +154,7 @@ From the menu: `[7] Manifest` ([menu.md](menu.md)).
 | `--space-margin-gb N` | free space kept on the destination, in GB (default: `20.0`, from `selective_backup.py`) |
 | `--export-formats SPEC` | `all`, `a>b>c` fallback or `a+b` multiple (default: `jxl>tif>jpg`, from `selective_backup.py`) |
 | `--expect-backup-id ID` | abort (exit 2) unless the destination holds this backup ID |
+| `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, for the lines whose `Tiff` column names a profile (default `JXLPHOTO`, from `selective_backup.py`). A line with a profile and no jxl-photo is refused before anything is read, exit 2 *(v0.14.0-rc2)* |
 | `--verify {quick,full}` | verify the backup against what the manifest selects; copies nothing. Same statuses and exit codes as `selective_backup.py --verify` |
 | `--max-gb N` | with `--verify full`: verify at most N GB in this run, oldest verification first (default: `0.0` = everything, from `selective_backup.py`) |
 | `--version` | print the version and exit |
@@ -180,7 +184,10 @@ line selects. A file a line selects that is not on the backup is
 
 `--analyze` plans every mode of the table with every `Originals` value through
 the same `_Planner` the copy uses, sharing the folder scan between the modes,
-and marks the mode chosen by each manifest line. A folder that could not be
+and marks the mode chosen by each manifest line. The column
+`tiff_to_jxl_bytes` *(v0.14.0-rc2)* says how much of each line is TIFF that its
+`Tiff` profile would keep as JXL (counted at the TIFF's size: the JXL is
+smaller). A folder that could not be
 read makes the numbers partial: the run says so and exits 1. The copy itself is
 `selective_backup.py`'s `_run_backup`: the same catalog, space check, versions
 folder, move detection and orphan report.

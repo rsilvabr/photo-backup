@@ -3,6 +3,18 @@
 The short notes of each recent release, newest first; the README keeps the
 current one. Every release in detail: [version_history.md](version_history.md).
 
+## v0.14.0-rc2 (test version, not released yet)
+
+2026-11-19. TIFF kept as JXL in the backup, and the fixes of an independent
+review of rc1. Everything of rc1 below holds.
+
+- **TIFF on the computer, JPEG XL in the backup**: a manifest line's new `Tiff` column (or `--tiff`) names a profile of `TIFF_JXL_PROFILES`, and jxl-photo converts that line's TIFFs — a developed TIFF beside its RAW, a film scan; never an export. Each JXL is kept only with proof that it came from those very bytes; anything else copies the TIFF as it is. Measured: a 218 MB NX Studio TIFF took 34 MB at distance 0.05; film scans, lossless, 59 to 71% and the same pixels back ([tiff_to_jxl.md](tiff_to_jxl.md)).
+- **The restore gives the TIFF back** under its own name, with its pages and its date (`RESTORED_FROM_JXL`); `--keep-jxl` gives the JXL as it is. A verify checks each JXL against the TIFF it came from (`DEST_NOT_FROM_SOURCE`).
+- **A TIFF copy already in the backup becomes JXL**: the JXL first, then the TIFF copy leaves (to `versions\`; in the mirror, to its trash) — also one FreeFileSync made, which lets the mirror take over a FreeFileSync backup.
+- **The programs that restore a backup are kept in it**: `_photo_backup\tools\` holds photo-backup and jxl-photo of each version that wrote there, plus what `KEEP_TOOLS_EXTRA` names, and `HOW TO RESTORE.txt`.
+- **Fixes from the rc1 review**: a junction inside the backup that leads into a source could let the mirror move or delete source files — now every run refuses a link inside the backup (exit 2); the mirror's limit counts replaced files too (a program that rewrites every file in place); a junction whose target is not connected is "cannot be read", never "gone"; a junction is never removed as an empty folder; the menu runs the mirror once and the mirror asks with the real numbers (rc1 confirmed a dry-run, then ran with `--yes`); Ctrl+C while removing keeps the box and the list; a run with nothing to copy needs no space; the trash goes on the day it shows; the smallest "make room" option comes first; an old copy that cannot be read is never replaced; a superscript digit no longer stops the space question with a traceback.
+- A photo kept only as JXL is a photo (`.jxl` in `ANCHOR_EXTENSIONS`): `Originals=raw` keeps it when it has no RAW.
+
 ## v0.14.0-rc1 (test version, not released yet)
 
 2026-11-19. The mirror, for testing before v0.14.0.

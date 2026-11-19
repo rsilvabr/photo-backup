@@ -412,7 +412,7 @@ def test_t16_the_limit_per_line(env, monkeypatch, capsys):
     capsys.readouterr()
     assert mirror("--manifest", env.man, "--dest", env.dest, "--unattended") == 2
     out = capsys.readouterr().out
-    assert "CHECK: these lines would remove more than 20% of their files" in out
+    assert "CHECK: these lines would remove or replace more than 20% of their files" in out
     assert "MIRROR STOPPED - nothing changed" in out
     answers(monkeypatch, "2")
     assert mirror("--manifest", env.man, "--dest", env.dest, "--yes") == 2

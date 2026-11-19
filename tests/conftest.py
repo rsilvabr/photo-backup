@@ -15,6 +15,9 @@ def photobackup_log_dir(tmp_path, monkeypatch):
     log_dir = tmp_path / "logs"
     monkeypatch.setenv("PHOTOBACKUP_LOG_DIR", str(log_dir))
     monkeypatch.setattr(selective_backup, "LOG_DIR", str(log_dir))
+    # the tools kept in a backup (v0.14.0-rc2) would add files to every
+    # destination a test compares; the tests of that feature turn it on
+    monkeypatch.setattr(selective_backup, "KEEP_TOOLS_IN_BACKUP", False)
     log_dir.mkdir(parents=True, exist_ok=True)
     # No test may ever read the real Capture One folders of this computer.
     empty = tmp_path / "no_capture_one"

@@ -24,16 +24,17 @@ import re
 import shutil
 import sqlite3
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-__version__ = "0.14.0-rc1"
+__version__ = "0.14.0-rc2"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -56,7 +57,8 @@ RAW_EXTENSIONS = (".nef", ".nrw", ".cr2", ".cr3", ".crw", ".arw", ".srf", ".sr2"
                   ".x3f", ".erf", ".mrw", ".kdc", ".dcr")
 JPEG_EXTENSIONS = (".jpg", ".jpeg")
 ANCHOR_EXTENSIONS = RAW_EXTENSIONS + (".jpg", ".jpeg", ".tif", ".tiff", ".png",
-                                      ".heic", ".heif", ".hif", ".psd")  # files whose stem can be a photo key
+                                      ".heic", ".heif", ".hif", ".psd",
+                                      ".jxl")  # files whose stem can be a photo key
 SIDECAR_EXTENSIONS = (".xmp", ".dop", ".pp3")   # copied with an unselected RAW under --unselected raw
 NAME_SEPARATORS = "_-. ("           # a key must be followed by one of these in a longer name
 UNSELECTED = "skip"                 # default --unselected: skip | raw | raw_or_jpeg | raw_jpeg | all
@@ -123,6 +125,25 @@ VERIFY_QUICK_USES_PLAN = True       # --verify quick: the size and date of a sou
 SUMMARY_FOLDER_LINES = 25           # lines of the per-folder table in the summary (the CSV has all)
 SUMMARY_INSIDE_NAMES = 5            # subfolder names shown under "inside sessions" (the _inside.csv has all)
 
+# ---- TIFF as JXL in the backup (jxl-photo) ------------------------------------------------
+JXLPHOTO = ""                       # jxl-photo's jxl_photo.py (or jxl-photo.exe): converts a TIFF to JXL in
+                                    # the backup and back on restore; "" = no conversion (--jxlphoto)
+TIFF_JXL_PROFILES = {               # the manifest's Tiff column (or --tiff) names one; "copy" = the TIFF as is.
+    "jxl": {"distance": 0.05,       # jxl-photo picks per TIFF: a film scan gets scan_distance, an 8-bit
+            "scan_distance": 0,     # TIFF eight_bit_distance, any other TIFF distance (0 = lossless)
+            "eight_bit_distance": 0},
+}
+TIFF_EXTENSIONS = (".tif", ".tiff") # what a profile converts (outside the export folders)
+TIFF_JXL_EFFORT = 7                 # cjxl effort of these conversions
+TIFF_JXL_WORKERS = 4                # TIFFs converted at the same time (one jxl-photo each, --workers 1)
+TIFF_JXL_TIMEOUT_MIN = 30           # a conversion that takes longer is given up: the TIFF is copied as is
+TIFF_JXL_FOLDER = "converting"      # under CATALOG_FOLDER: each conversion's own folder while it runs
+KEEP_TOOLS_IN_BACKUP = True         # every real run keeps photo-backup (and JXLPHOTO's jxl-photo) in
+                                    # <dest>\_photo_backup\tools\, one folder per version, never replaced
+KEEP_TOOLS_EXTRA = ()               # more files or folders kept there (the .zip of photo-backup-exe and of
+                                    # jxl-photo-exe): copied once each, never replaced
+TOOLS_FOLDER = "tools"              # under CATALOG_FOLDER
+
 # ---- Logs ---------------------------------------------------------------------------
 LOG_DIR = os.environ.get("PHOTOBACKUP_LOG_DIR") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "Logs")
@@ -145,7 +166,7 @@ ST_CHANGED = "CHANGED"
 ST_UP_TO_DATE = "UP_TO_DATE"
 ST_MOVED = "MOVED"
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"                # 2 (v0.14.0-rc2): the table of TIFFs kept as JXL ("converted")
 
 
 def _split_names(value):
@@ -224,7 +245,10 @@ def _source_stat(path):
             return SOURCE_UNREADABLE, None
         parent = up
         try:
-            os.stat(_io(parent))
+            # the folder itself, never what a link of that name leads to: a
+            # junction whose target is not connected is then listed below and
+            # fails -- unreadable, never "missing" (finding 3 of the rc1 review)
+            os.stat(_io(parent), follow_symlinks=False)
         except FileNotFoundError:
             continue
         except OSError:
@@ -363,10 +387,10 @@ def _match_key(stem, anchors):
 _JXL_CONTAINER = b"\x00\x00\x00\x0cJXL \r\n\x87\n"
 
 
-def _jxl_role(path):
-    """'derivative', 'master' or None for a .jxl, from the jxl-photo tokens in
-    its XMP box. Only positive evidence counts: a bare codestream, a
-    compressed (brob) or missing XMP box, both tokens, a read error -> None."""
+def _jxl_xmp(path):
+    """The XMP box of a JXL container, as bytes, or None: a bare codestream, a
+    compressed (brob) or missing XMP box, one past XMP_SCAN_LIMIT_MB, a read
+    error."""
     limit = XMP_SCAN_LIMIT_MB * 1024 * 1024
     try:
         with open(_io(path), "rb") as handle:
@@ -394,18 +418,48 @@ def _jxl_role(path):
                     if length > limit:
                         return None
                     handle.seek(pos + head)
-                    xmp = handle.read(length - head)
-                    derived = DERIVATIVE_TOKEN.encode() in xmp
-                    master = MASTER_TOKEN.encode() in xmp
-                    if derived and not master:
-                        return "derivative"
-                    if master and not derived:
-                        return "master"
-                    return None
+                    return handle.read(length - head)
                 pos += length
     except OSError:
         return None
     return None
+
+
+def _jxl_role(path):
+    """'derivative', 'master' or None for a .jxl, from the jxl-photo tokens in
+    its XMP box. Only positive evidence counts: a bare codestream, a
+    compressed (brob) or missing XMP box, both tokens, a read error -> None."""
+    xmp = _jxl_xmp(path)
+    if xmp is None:
+        return None
+    derived = DERIVATIVE_TOKEN.encode() in xmp
+    master = MASTER_TOKEN.encode() in xmp
+    if derived and not master:
+        return "derivative"
+    if master and not derived:
+        return "master"
+    return None
+
+
+_JXLPHOTO_TOKEN = re.compile(rb"jxlphoto-[a-z0-9]+:[^\s<>\"']*", re.IGNORECASE)
+
+
+def _jxl_tokens(path):
+    """{name: [values]} of the jxl-photo tokens ('jxlphoto-srcsum:ab12...') in
+    a JXL's XMP box; {} when the box cannot be read. Names in lower case."""
+    tokens = {}
+    for match in _JXLPHOTO_TOKEN.finditer(_jxl_xmp(path) or b""):
+        name, _, value = match.group().decode("utf-8", "replace").partition(":")
+        tokens.setdefault(name.casefold(), []).append(value)
+    return tokens
+
+
+def _jxlphoto_srcsum(sha256_hex):
+    """The `jxlphoto-srcsum` jxl-photo writes into a JXL made from a file whose
+    SHA-256 is `sha256_hex`: its content id of one source, the first 16 hex
+    digits of the SHA-256 of that file's raw SHA-256 (jxl_photo_common.
+    _file_content_id). A JXL that carries it was made from those very bytes."""
+    return hashlib.sha256(bytes.fromhex(sha256_hex)).hexdigest()[:16]
 
 
 def _parse_formats(spec):
@@ -546,6 +600,7 @@ class PlannedFile:
     size: int
     mtime_ns: int
     category: str       # export | source | unselected | capture_one | nx_studio | unexported
+    convert: str = None     # a TIFF_JXL_PROFILES name: this TIFF is kept as JXL (rel ends in .tif.jxl)
 
 
 @dataclass
@@ -580,6 +635,11 @@ class FileStatus:
     planned: PlannedFile
     dst: str
     status: str
+    extra_keys: tuple = ()      # a TIFF kept as JXL: the other files of its group, and a TIFF copy
+                                # that the JXL replaces -- planned too (never orphans)
+    old_outputs: tuple = ()     # ... the rels of the JXL group that is there now (CHANGED)
+    replaces: str = None        # ... the rel of a TIFF copy of it in the backup (ours, or the same
+                                # size and date as the source TIFF), retired once the JXL is in place
 
 
 @dataclass
@@ -615,6 +675,7 @@ class FolderRules:
     leave_out: tuple = field(default_factory=lambda: tuple(_split_names(SESSION_LEAVE_OUT)))
                                 # patterns: direct subfolders of a session left out ("inside
                                 # sessions"); any other one is judged alone (v0.13.0)
+    tiff: str = None            # a TIFF_JXL_PROFILES name (or "copy"); None = the run's --tiff
 
 
 class _Planner:
@@ -655,6 +716,9 @@ class _Planner:
         self.base = os.path.abspath(args.base) if args.base else None
         self.formats = _parse_formats(args.export_formats)
         self.copy_derivatives = bool(args.derivatives)
+        self.tiff_profile = ((rules.tiff if rules is not None else None)
+                             or getattr(args, "tiff", None) or "copy")
+        self.tiff_extensions = {ext.casefold() for ext in TIFF_EXTENSIONS}
 
     def _drop_derivatives(self, chosen):
         """Remove the jxl-photo derivatives of a photo whose master is chosen
@@ -809,6 +873,14 @@ class _Planner:
     def _add(self, planned):
         if planned.rel is None:         # its name cannot be used (_rel said why)
             return
+        if (self.tiff_profile != "copy" and planned.category != CAT_EXPORT
+                and os.path.splitext(planned.src)[1].casefold() in self.tiff_extensions
+                and not any(self._is_export_name(part)
+                            for part in planned.rel.replace("/", "\\").split("\\")[:-1])):
+            # kept as JXL in the backup: the TIFF's own name, then .jxl (v0.14.0-rc2);
+            # an export stays a TIFF, also one copied with its whole folder (mode 6)
+            planned.rel = planned.rel + ".jxl"
+            planned.convert = self.tiff_profile
         key = planned.rel.casefold()
         if key in self.seen:
             kept = self.seen[key].src
@@ -1336,6 +1408,28 @@ def _unsafe_rel(rel):
     return None
 
 
+def _tiff_profile_errors():
+    """What is wrong in TIFF_JXL_PROFILES, TIFF_JXL_WORKERS or TIFF_JXL_TIMEOUT_MIN."""
+    errors = []
+    if not isinstance(TIFF_JXL_PROFILES, dict):
+        return ["TIFF_JXL_PROFILES must be a dict of profiles"]
+    for name, profile in TIFF_JXL_PROFILES.items():
+        if not isinstance(name, str) or not name.strip() or name.casefold() == "copy":
+            errors.append(f"TIFF_JXL_PROFILES: {name!r} cannot be a profile name")
+            continue
+        for key in ("distance", "scan_distance", "eight_bit_distance"):
+            value = profile.get(key) if isinstance(profile, dict) else None
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                errors.append(f"TIFF_JXL_PROFILES[{name!r}][{key!r}] must be a number, "
+                              f"0 or more (it is {value!r})")
+    for name in ("TIFF_JXL_WORKERS", "TIFF_JXL_TIMEOUT_MIN"):
+        value = globals()[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            errors.append(f"{name} must be a whole number, 1 or more (it is {value!r})")
+    return errors
+
+
 def _validate_usage(args):
     errors = []
     try:
@@ -1356,6 +1450,11 @@ def _validate_usage(args):
     # negative one turned "not enough space" into "fits" (T8 of the 261112 sweep)
     if not math.isfinite(args.space_margin_gb) or args.space_margin_gb < 0:
         errors.append("--space-margin-gb must be a number, 0 or more")
+    errors += _tiff_profile_errors()
+    if getattr(args, "tiff", "copy") != "copy" and not args.verify:
+        problem = _jxlphoto_problem(getattr(args, "jxlphoto", None) or JXLPHOTO)
+        if problem:
+            errors.append(f"--tiff {args.tiff}: {problem}")
     sources = [os.path.abspath(source) for source in args.source]
     for source in sources:
         if not os.path.isdir(_io(source)):
@@ -1429,7 +1528,71 @@ def _list_dest_folder(folder):
     return listed
 
 
-def _file_statuses(files, dest, listings=None):
+def _profile_settings(name):
+    """'jxl: d=0.05 scan=0 8bit=0 e=7': what a TIFF kept as JXL was made with;
+    a group made with other settings is made again."""
+    profile = TIFF_JXL_PROFILES[name]
+    return (f"{name}: d={profile['distance']} scan={profile['scan_distance']} "
+            f"8bit={profile['eight_bit_distance']} e={TIFF_JXL_EFFORT}")
+
+
+def _listed_or_stat(path, listed):
+    """(size, mtime_ns) of a destination file from its folder's listing (only
+    a name it holds exactly), else from the system; None when it is not there
+    or cannot be read."""
+    if listed is not None:
+        hit = listed.get(os.path.basename(path))
+        if hit is not None:
+            return hit
+    try:
+        stat = os.stat(_io(path), follow_symlinks=False)
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _convert_status(planned, dst, dest, listed, groups, catalog_rows):
+    """The state of a TIFF kept as JXL (planned.convert): from its JXL group in
+    the catalog -- a JXL never has the TIFF's size, so no file of the planned
+    name can say UP_TO_DATE by itself. A TIFF copy of it in the backup (ours,
+    or the same size and date as the source TIFF: made by another program) is
+    retired once the JXL is in place."""
+    tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
+    rows = catalog_rows or {}
+    tiff_rel = planned.rel[:-len(".jxl")]
+    source_key = tiff_rel.casefold()
+    group = (groups or {}).get(source_key, [])
+    extra = [item.key for item in group if item.key != planned.rel.casefold()]
+    replaces = None
+    copy_stat = _listed_or_stat(os.path.join(dest, tiff_rel), listed)
+    if copy_stat is not None:
+        size, mtime_ns = copy_stat
+        row = rows.get(source_key)
+        same_as_source = size == planned.size and abs(mtime_ns - planned.mtime_ns) <= tolerance
+        ours = (row is not None and size == row.size
+                and abs(_db_ns(mtime_ns) - row.mtime_ns) <= tolerance)
+        if same_as_source or ours:
+            replaces = tiff_rel
+            extra.append(source_key)
+    if not group:
+        return FileStatus(planned, dst, ST_NEW, tuple(extra), (), replaces)
+    first = group[0]
+    outputs_ok = len(group) == first.pages
+    for item in group:
+        row = rows.get(item.key)
+        found = _listed_or_stat(os.path.join(dest, row.rel), listed) if row is not None else None
+        if found is None or found[0] != row.size:
+            outputs_ok = False
+    same_source = (first.source_size == planned.size
+                   and abs(first.source_mtime_ns - _db_ns(planned.mtime_ns)) <= tolerance)
+    same_settings = first.settings == _profile_settings(planned.convert)
+    if outputs_ok and same_source and same_settings:
+        return FileStatus(planned, dst, ST_UP_TO_DATE, tuple(extra), (), replaces)
+    old = tuple(rows[item.key].rel for item in group if item.key in rows)
+    return FileStatus(planned, dst, ST_CHANGED, tuple(extra), old, replaces)
+
+
+def _file_statuses(files, dest, listings=None, groups=None, catalog_rows=None):
     """_file_status of every planned file, in the same order, with one listing
     per destination folder instead of one question per file (6 times faster on
     96 000 files, and no file record is read from a cold disk). The listing
@@ -1438,7 +1601,9 @@ def _file_statuses(files, dest, listings=None):
     asks the system, so a file that is there is never taken for a NEW one.
     `listings` (a dict), when given, receives {folder: what _list_dest_folder
     returned} for every destination folder listed: the mirror looks there for
-    files this tool did not write without listing them again."""
+    files this tool did not write without listing them again. A TIFF kept as
+    JXL takes its state from its group (`groups`, from the catalog's
+    converted rows, and `catalog_rows`: _convert_status)."""
     statuses = [None] * len(files)
     by_folder = {}
     for index, planned in enumerate(files):
@@ -1449,6 +1614,10 @@ def _file_statuses(files, dest, listings=None):
         if listings is not None:
             listings[folder] = listed
         for index, planned, dst in items:
+            if planned.convert:
+                statuses[index] = _convert_status(planned, dst, dest, listed, groups,
+                                                  catalog_rows)
+                continue
             if listed is None:
                 statuses[index] = FileStatus(planned, dst, ST_NEW)
                 continue
@@ -1556,6 +1725,145 @@ def _ensure_backup_id(dest, log):
     return backup_id
 
 
+_RESTORE_NOTE = """\
+photo-backup keeps here what is needed to restore this backup on another computer.
+Nothing in this folder is ever replaced or deleted: each folder is the version that
+wrote to this backup.
+
+- photo-backup <version>\\  the scripts (Python 3.12 or newer, standard library only):
+    python photo_backup.py           ->  [5] Restore from a backup
+    python restore_backup.py --backup <this backup's folder> --to <a folder>
+  The Windows program, when it is kept here (photo-backup-exe ... .zip), needs no Python.
+
+- TIFF files kept as JXL in this backup are named like photo.tif.jxl. The restore turns
+  them back into photo.tif through jxl-photo: the jxl-photo <version>\\ folder here
+  (Python 3.12, libjxl's cjxl/djxl and ExifTool), or jxl-photo-exe when it is kept here.
+  Without jxl-photo: restore_backup.py ... --keep-jxl gives the JXL files as they are.
+"""
+
+
+def _tool_files(folder, patterns, recursive=False):
+    """[(name inside the tool folder, path)] of the files of `folder` that match
+    `patterns` (and of docs\\*.md); every file below it with `recursive`.
+    Links and junctions are never followed."""
+    found = []
+    if recursive:
+        for current, dirs, names in os.walk(folder):
+            dirs[:] = [name for name in dirs
+                       if not os.path.islink(os.path.join(current, name))
+                       and not os.path.isjunction(os.path.join(current, name))]
+            for name in names:
+                path = os.path.join(current, name)
+                if not os.path.islink(path):
+                    found.append((os.path.relpath(path, folder), path))
+        return found
+    import fnmatch
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name)
+        if os.path.isfile(path) and any(fnmatch.fnmatch(name.casefold(), pattern.casefold())
+                                        for pattern in patterns):
+            found.append((name, path))
+    docs = os.path.join(folder, "docs")
+    if os.path.isdir(docs):
+        for name in sorted(os.listdir(docs)):
+            if name.casefold().endswith(".md") and os.path.isfile(os.path.join(docs, name)):
+                found.append((os.path.join("docs", name), os.path.join(docs, name)))
+    return found
+
+
+def _keep_tool_folder(root, name, files, log):
+    """Copy `files` into root\\name -- written as name.pbtmp and renamed at the
+    end, so a folder with the final name is always whole. A folder that is
+    there already is left as it is. True when it was written now."""
+    final = os.path.join(root, name)
+    if os.path.lexists(_io(final)):
+        return False
+    temp = final + TEMP_SUFFIX
+    _remove_own_folder(temp)
+    for inside, path in files:
+        target = os.path.join(temp, inside)
+        os.makedirs(_io(os.path.dirname(target)), exist_ok=True)
+        shutil.copy2(_io(path), _io(target))
+    os.rename(_io(temp), _io(final))
+    log.log(f"TOOLS kept {name} ({len(files)} files)")
+    return True
+
+
+def _keep_tool_extra(root, path, log):
+    """Keep one more file or folder (KEEP_TOOLS_EXTRA) in root under its own
+    name; a name taken by something of another size gets ' (2)'. True when it
+    was written now."""
+    if os.path.isdir(_io(path)):
+        return _keep_tool_folder(root, os.path.basename(path.rstrip("\\/")),
+                                 _tool_files(path, (), recursive=True), log)
+    size = os.stat(_io(path)).st_size
+    stem, ext = os.path.splitext(os.path.basename(path))
+    for counter in range(1, 100):
+        name = f"{stem}{ext}" if counter == 1 else f"{stem} ({counter}){ext}"
+        target = os.path.join(root, name)
+        if os.path.lexists(_io(target)):
+            if os.path.isfile(_io(target)) and os.stat(_io(target)).st_size == size:
+                return False            # kept already
+            continue
+        temp = target + TEMP_SUFFIX
+        _remove_temp(temp)
+        shutil.copy2(_io(path), _io(temp))
+        _rename_no_clobber(temp, target)
+        log.log(f"TOOLS kept {name}")
+        return True
+    return False
+
+
+def _keep_tools(dest, log, jxlphoto=""):
+    """Keep the programs that restore this backup in it (KEEP_TOOLS_IN_BACKUP):
+    photo-backup of this version, jxl-photo (when set) and KEEP_TOOLS_EXTRA, in
+    <dest>\\CATALOG_FOLDER\\TOOLS_FOLDER, one folder per version, never replaced
+    or deleted; a HOW TO RESTORE.txt says what to do with them. Lines to show;
+    a problem is a warning, never the end of the backup."""
+    if not KEEP_TOOLS_IN_BACKUP:
+        return []
+    root = os.path.join(dest, CATALOG_FOLDER, TOOLS_FOLDER)
+    kept = []
+    try:
+        os.makedirs(_io(root), exist_ok=True)
+        with os.scandir(_io(root)) as listing:      # an interrupted run's own temp copies
+            for entry in listing:
+                if entry.name.endswith(TEMP_SUFFIX):
+                    path = os.path.join(root, entry.name)
+                    if entry.is_dir(follow_symlinks=False):
+                        _remove_own_folder(path)
+                    else:
+                        _remove_temp(path)
+        here = os.path.dirname(os.path.abspath(__file__))
+        own = _tool_files(here, ("*.py", "backup_modes.csv", "backup_manifest.example.csv",
+                                 "README*.md", "LICENSE"))
+        if _keep_tool_folder(root, f"photo-backup {__version__}", own, log):
+            kept.append(f"photo-backup {__version__}")
+        if jxlphoto and _jxlphoto_problem(jxlphoto) is None:
+            folder = os.path.dirname(os.path.abspath(jxlphoto))
+            files = (_tool_files(folder, ("*.py", "README*.md", "LICENSE"))
+                     if jxlphoto.casefold().endswith(".py")
+                     else _tool_files(folder, (), recursive=True))
+            name = _jxlphoto_version(jxlphoto)
+            if _keep_tool_folder(root, name, files, log):
+                kept.append(name)
+        for extra in KEEP_TOOLS_EXTRA:
+            if extra and _keep_tool_extra(root, extra, log):
+                kept.append(os.path.basename(str(extra).rstrip("\\/")))
+        note = os.path.join(root, "HOW TO RESTORE.txt")
+        if not os.path.lexists(_io(note)):
+            with open(_io(note + TEMP_SUFFIX), "w", encoding="utf-8", newline="\r\n") as handle:
+                handle.write(_RESTORE_NOTE)
+            _rename_no_clobber(note + TEMP_SUFFIX, note)
+    except OSError as exc:
+        log.log(f"WARNING the tools were not all kept in {root}: {exc}")
+        return [f"WARNING the tools were not all kept in the backup ({exc}): see the log"]
+    if kept:
+        return [f"Kept in the backup, to restore it anywhere: {', '.join(kept)} "
+                f"({os.path.join(CATALOG_FOLDER, TOOLS_FOLDER)})"]
+    return []
+
+
 class _Catalog:
     def __init__(self, dest, create, readonly=False):
         self.dir = os.path.join(os.path.abspath(dest), CATALOG_FOLDER)
@@ -1570,6 +1878,7 @@ class _Catalog:
         self._writer_recorded = True        # nothing to record until it is open to write
         self._changes_at_open = 0
         self._first_copy = ""
+        self.has_converted = False
         database = self.path
         if readonly and _exists(self.path + "-journal"):
             # An interrupted commit left its journal: reading the catalog here
@@ -1593,7 +1902,7 @@ class _Catalog:
                     raise RuntimeError(f"not a photo-backup catalog: {self.path}") from exc
                 if row is None:
                     raise RuntimeError(f"not a photo-backup catalog: {self.path}")
-                if row[0] != SCHEMA_VERSION:
+                if row[0] not in ("1", SCHEMA_VERSION):     # 1: before the converted table
                     raise RuntimeError(
                         f"catalog schema_version {row[0]} != {SCHEMA_VERSION}: {self.path}")
             else:
@@ -1607,7 +1916,17 @@ class _Catalog:
                 row = self.conn.execute(
                     "SELECT v FROM meta WHERE k='schema_version'").fetchone()
                 created_now = row is None
-                if row is None:
+                if row is None or row[0] == "1":
+                    # new, or made before v0.14.0-rc2: the table of TIFFs kept as
+                    # JXL comes in, and the version that knows it (an older
+                    # program refuses this catalog: it would take a JXL for a copy)
+                    self.conn.execute(
+                        "CREATE TABLE IF NOT EXISTS converted ("
+                        "key TEXT PRIMARY KEY, source_key TEXT NOT NULL, "
+                        "source_rel TEXT NOT NULL, source_size INTEGER NOT NULL, "
+                        "source_mtime_ns INTEGER NOT NULL, source_sha256 TEXT NOT NULL, "
+                        "page INTEGER NOT NULL, pages INTEGER NOT NULL, tool TEXT NOT NULL, "
+                        "settings TEXT NOT NULL)")
                     self.conn.execute(
                         "INSERT OR REPLACE INTO meta(k, v) VALUES('schema_version', ?)",
                         (SCHEMA_VERSION,))
@@ -1633,6 +1952,15 @@ class _Catalog:
                     f"catalog is damaged: the row {unsafe[0]!r} has {unsafe[1]}, which would "
                     f"lead outside the backup: {self.path}. Nothing was read or written "
                     f"through it; see 'A damaged catalog' in the README.")
+            self.has_converted = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='converted'"
+            ).fetchone() is not None
+            unsafe = self._first_unsafe_source_rel()
+            if unsafe is not None:
+                raise RuntimeError(
+                    f"catalog is damaged: the TIFF {unsafe[0]!r} kept as JXL has {unsafe[1]}, "
+                    f"which would lead outside the backup: {self.path}. Nothing was read or "
+                    f"written through it; see 'A damaged catalog' in the README.")
             # who made it and who wrote it last, as they were before this run;
             # this run is recorded at its first commit that changes something
             self.writers = self._writers()
@@ -1706,14 +2034,47 @@ class _Catalog:
                 return rel, why
         return None
 
+    def _first_unsafe_source_rel(self):
+        """(source_rel, why) of the first TIFF kept as JXL whose name would
+        lead outside the backup (the restore writes with it), or None."""
+        if not self.has_converted:
+            return None
+        for (rel,) in self.conn.execute("SELECT source_rel FROM converted"):
+            why = _unsafe_rel(rel)
+            if why is not None:
+                return rel, why
+        return None
+
     def all_rows(self):
         cursor = self.conn.execute(
             "SELECT key, rel, size, mtime_ns, sha256, source_path, "
             "copied_at, verified_at FROM files")
         return [_Row(*row) for row in cursor.fetchall()]
 
+    def converted_rows(self):
+        """{key: _Converted} of the backup files that are a TIFF kept as JXL."""
+        if not self.has_converted:
+            return {}
+        cursor = self.conn.execute(
+            "SELECT key, source_key, source_rel, source_size, source_mtime_ns, source_sha256, "
+            "page, pages, tool, settings FROM converted")
+        return {row[0]: _Converted(*row) for row in cursor.fetchall()}
+
+    def record_converted(self, converted):
+        """Record one file of a TIFF's JXL group (its files row is upserted
+        apart, with the JXL's own size, date and hash)."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO converted(key, source_key, source_rel, source_size, "
+            "source_mtime_ns, source_sha256, page, pages, tool, settings) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (converted.key, converted.source_key, converted.source_rel, converted.source_size,
+             _db_ns(converted.source_mtime_ns), converted.source_sha256, converted.page,
+             converted.pages, converted.tool, converted.settings))
+
     def delete(self, key):
         self.conn.execute("DELETE FROM files WHERE key=?", (key,))
+        if self.has_converted:
+            self.conn.execute("DELETE FROM converted WHERE key=?", (key,))
 
     def adopt(self, planned):
         """Record an up-to-date destination file. A row whose size/mtime no
@@ -1790,6 +2151,31 @@ class _Row:
     verified_at: str = None
 
 
+@dataclass
+class _Converted:
+    """One file of a TIFF kept as JXL (catalog table `converted`, v0.14.0-rc2)."""
+    key: str                # the JXL's own key (= files.key)
+    source_key: str         # the TIFF's rel, casefolded: groups the pages
+    source_rel: str         # the TIFF's rel as written: the name the restore gives back
+    source_size: int
+    source_mtime_ns: int
+    source_sha256: str
+    page: int               # 0 = the main file
+    pages: int              # how many JXL the TIFF became
+    tool: str               # "jxl-photo 2.30.2"
+    settings: str           # "jxl: d=0.05 scan=0 8bit=0 e=7"
+
+
+def _converted_groups(converted):
+    """{source_key: [_Converted, ...] by page} of the catalog's TIFFs kept as JXL."""
+    groups = {}
+    for item in converted.values():
+        groups.setdefault(item.source_key, []).append(item)
+    for items in groups.values():
+        items.sort(key=lambda item: (item.page, item.key))
+    return groups
+
+
 class _Logger:
     def __init__(self, prefix):
         os.makedirs(_io(LOG_DIR), exist_ok=True)
@@ -1851,12 +2237,17 @@ def _move_aside(src, target):
     raise FileExistsError(f"no free name next to {target}")
 
 
-def _move_to_versions(dest, stamp, status, log):
-    target = os.path.join(dest, CATALOG_FOLDER, "versions", stamp, status.planned.rel)
+def _move_file_to_versions(dest, stamp, rel, log):
+    """Move the backup file at `rel` into the versions folder of this run."""
+    target = os.path.join(dest, CATALOG_FOLDER, "versions", stamp, rel)
     os.makedirs(_io(os.path.dirname(target)), exist_ok=True)
-    used = _move_aside(status.dst, target)
-    log.log(f"VERSION {status.planned.rel}"
+    used = _move_aside(os.path.join(dest, rel), target)
+    log.log(f"VERSION {rel}"
             + ("" if used == target else f" (kept as {os.path.basename(used)})"))
+
+
+def _move_to_versions(dest, stamp, status, log):
+    _move_file_to_versions(dest, stamp, status.planned.rel, log)
 
 
 def _handle_old_copy(dest, stamp, status, log, keep_old=None):
@@ -2165,7 +2556,8 @@ def _will_copy(status, args):
 
 def _adopt_rows(catalog, statuses):
     for status in statuses:
-        if status.status == ST_UP_TO_DATE:
+        # a TIFF kept as JXL is in the catalog already, as its group
+        if status.status == ST_UP_TO_DATE and not status.planned.convert:
             catalog.adopt(status.planned)
     catalog.commit()
 
@@ -2185,7 +2577,7 @@ def _find_move_candidates(statuses, rows, dest, sources=None):
         index.setdefault((os.path.basename(row.rel).casefold(), row.size), []).append(row)
     candidates = {}
     for status in statuses:
-        if status.status != ST_NEW:
+        if status.status != ST_NEW or status.planned.convert:    # a JXL is made, not moved
             continue
         matches = index.get((os.path.basename(status.planned.rel).casefold(),
                              status.planned.size))
@@ -2209,6 +2601,64 @@ def _find_move_candidates(statuses, rows, dest, sources=None):
     return candidates
 
 
+_REPARSE_POINT = 0x400              # FILE_ATTRIBUTE_REPARSE_POINT: a link, a junction, ...
+
+
+def _is_reparse(path):
+    """Whether `path` itself is a link, a junction or another reparse point
+    (a path that cannot be asked counts as one: fail closed)."""
+    try:
+        info = os.lstat(_io(path))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return (bool(getattr(info, "st_file_attributes", 0) & _REPARSE_POINT)
+            or (info.st_mode & 0o170000) == 0o120000)
+
+
+def _dest_link(dest, folder_rel, cache):
+    """The folder on the way from `dest` to `folder_rel` (a folder of the
+    backup) that is a link, a junction or another reparse point, or None.
+    The backup never writes, moves or deletes through one: it could lead into
+    a source (finding 1 of the rc1 review). `cache`: {folded path: state}."""
+    path = dest
+    for part in folder_rel.replace("/", "\\").split("\\"):
+        if not part:
+            continue
+        path = os.path.join(path, part)
+        key = os.path.normcase(path)
+        state = cache.get(key)
+        if state is None:
+            if not os.path.lexists(_io(path)):
+                state = "absent"
+            else:
+                state = "link" if _is_reparse(path) else "folder"
+            cache[key] = state
+        if state == "absent":
+            return None             # nothing below it exists yet
+        if state == "link":
+            return path
+    return None
+
+
+def _first_dest_link(dest, rels):
+    """The first link or junction inside the backup on the way to one of
+    `rels` (backup files), or None. One question per folder."""
+    cache = {}
+    seen = set()
+    for rel in rels:
+        folder = os.path.dirname(rel.replace("/", "\\"))
+        key = folder.casefold()
+        if not folder or key in seen:
+            continue
+        seen.add(key)
+        found = _dest_link(dest, folder, cache)
+        if found is not None:
+            return found
+    return None
+
+
 def _prune_empty_parents(path, stop, log):
     """Remove the folders left empty by one of our own moves, from `path` up to
     (not including) `stop`. This is the only place a folder is removed on the
@@ -2224,6 +2674,10 @@ def _prune_empty_parents(path, stop, log):
             return
         parent = os.path.dirname(current)
         if parent == current:
+            return
+        if _is_reparse(current):
+            # os.rmdir takes a junction away even when what it leads to is
+            # not empty (finding 4 of the rc1 review): never
             return
         try:
             os.rmdir(_io(current))
@@ -2303,8 +2757,10 @@ def _find_orphans(rows, statuses, prefixes, used_keys, sources=None, states=None
     shares the folder names) is other_source; only a source proven gone
     (_source_state) is source_missing -- the one --move-orphans moves.
     `states` (a dict) keeps the answer of _source_state per row, for a second
-    list of the same run that moves nothing."""
+    list of the same run that moves nothing. The other files of a TIFF kept
+    as JXL, and a TIFF copy its JXL replaces, count as planned (extra_keys)."""
     planned_keys = {status.planned.rel.casefold() for status in statuses}
+    planned_keys.update(key for status in statuses for key in status.extra_keys)
     orphans = []
     for row in rows:
         if not _key_under_prefixes(row.key, prefixes):
@@ -2395,7 +2851,353 @@ def _orphan_csv_rows(orphans):
             for reason, row in orphans]
 
 
-def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_copy=None):
+# ---- TIFF kept as JXL (jxl-photo) ------------------------------------------------------------
+class _ConvertFailed(Exception):
+    """A TIFF that could not be kept as JXL: it is copied as it is instead."""
+
+
+@dataclass
+class _Conversion:
+    source_size: int
+    source_mtime_ns: int
+    source_sha256: str
+    work: str               # the conversion's own folder (under TIFF_JXL_FOLDER)
+    files: list             # [(name, path, size, mtime_ns, sha256, page)], page 0 first
+
+
+def _jxlphoto_problem(path):
+    """Why `path` cannot run jxl-photo, or None."""
+    if not path:
+        return "JXLPHOTO is not set (the path of jxl-photo's jxl_photo.py or jxl-photo.exe)"
+    if not path.casefold().endswith((".py", ".exe")):
+        return f"JXLPHOTO must be jxl-photo's jxl_photo.py or jxl-photo.exe, not {path}"
+    if not os.path.isfile(_io(path)):
+        return f"jxl-photo not found: {path}"
+    return None
+
+
+def _jxlphoto_command(path):
+    """The command that runs jxl-photo: the script with this Python (-B: no
+    __pycache__ beside it -- the restore may run the copy kept in a backup,
+    which it never writes to), or the exe."""
+    if path.casefold().endswith(".py"):
+        return [sys.executable, "-B", path]
+    return [path]
+
+
+def _jxlphoto_env():
+    """jxl-photo's environment: its logs go to this tool's log folder (never
+    beside the copy kept in a backup), no update check (no network from a
+    backup), UTF-8 output."""
+    env = dict(os.environ)
+    env["JXLPHOTO_LOG_DIR"] = os.path.join(os.path.abspath(LOG_DIR), "jxl-photo")
+    env["JXLPHOTO_NO_UPDATE_CHECK"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def _run_jxlphoto(path, arguments, timeout_s):
+    """Run jxl-photo with `arguments`; the CompletedProcess (OSError and
+    subprocess.TimeoutExpired go to the caller)."""
+    return subprocess.run(_jxlphoto_command(path) + list(arguments), stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          timeout=timeout_s, env=_jxlphoto_env())
+
+
+_JXLPHOTO_VERSIONS = {}
+
+
+def _jxlphoto_version(path):
+    """'jxl-photo 2.30.2' from the encoder's own --version; 'jxl-photo ?' when
+    it does not answer."""
+    if path not in _JXLPHOTO_VERSIONS:
+        text = ""
+        try:
+            run = _run_jxlphoto(path, ["encode", "--version"], 120)
+            text = (run.stdout or run.stderr or "").strip().splitlines()
+            text = text[0].strip() if text else ""
+        except (OSError, subprocess.SubprocessError):
+            text = ""
+        match = re.search(r"(\d+\.\d+\.\d+\S*)", text)
+        _JXLPHOTO_VERSIONS[path] = f"jxl-photo {match.group(1)}" if match else "jxl-photo ?"
+    return _JXLPHOTO_VERSIONS[path]
+
+
+def _tail(text, lines=4):
+    kept = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    return " | ".join(kept[-lines:])
+
+
+def _convert_one(status, work_root, stamp, index, jxlphoto):
+    """Encode one TIFF with jxl-photo into a folder of its own, and prove what
+    came out (on a worker thread: no catalog here). Every JXL must carry the
+    jxlphoto-srcsum of the bytes this run hashed, a group must be whole, and
+    the TIFF must be the same at the end. Raises _ConvertFailed."""
+    planned = status.planned
+    tiff = planned.src
+    try:
+        stat0 = os.stat(_io(tiff), follow_symlinks=False)
+        source_sha = _sha256_file(tiff)
+    except OSError as exc:
+        raise _ConvertFailed(f"the TIFF cannot be read: {exc}")
+    work = os.path.join(work_root, f"{stamp}_{index}")
+    os.makedirs(_io(work))
+    profile = TIFF_JXL_PROFILES[planned.convert]
+    command = [
+        "encode", tiff, work, "--mode", "0",
+        "--distance", str(profile["distance"]),
+        "--scan-distance", str(profile["scan_distance"]),
+        "--eight-bit-distance", str(profile["eight_bit_distance"]),
+        "--effort", str(TIFF_JXL_EFFORT), "--workers", "1", "--verify-roundtrip"]
+    try:
+        run = _run_jxlphoto(jxlphoto, command, max(TIFF_JXL_TIMEOUT_MIN, 1) * 60)
+    except subprocess.TimeoutExpired:
+        raise _ConvertFailed(f"jxl-photo took more than {TIFF_JXL_TIMEOUT_MIN} min")
+    except OSError as exc:
+        raise _ConvertFailed(f"jxl-photo could not be started: {exc}")
+    said = _tail((run.stdout or "") + "\n" + (run.stderr or ""))
+    if run.returncode != 0:
+        raise _ConvertFailed(f"jxl-photo stopped with exit {run.returncode}: {said}")
+    with os.scandir(_io(work)) as listing:
+        names = sorted(entry.name for entry in listing
+                       if entry.is_file(follow_symlinks=False)
+                       and entry.name.casefold().endswith(".jxl"))
+    if not names:
+        raise _ConvertFailed(f"jxl-photo wrote no JXL: {said}")
+    want = _jxlphoto_srcsum(source_sha)
+    stem = os.path.splitext(os.path.basename(tiff))[0].casefold()
+    files = []
+    for name in names:
+        path = os.path.join(work, name)
+        tokens = _jxl_tokens(path)
+        if want not in [value.casefold() for value in tokens.get("jxlphoto-srcsum", [])]:
+            raise _ConvertFailed(f"{name} does not say it was made from these bytes "
+                                 f"(jxlphoto-srcsum)")
+        pages = tokens.get("jxlphoto-pages", [])
+        if len(names) > 1 and not pages:
+            raise _ConvertFailed(f"{len(names)} JXL without a group mark (jxlphoto-pages)")
+        if pages and any(value != str(len(names)) for value in pages):
+            raise _ConvertFailed(f"the group is not whole: {len(names)} JXL, "
+                                 f"jxlphoto-pages:{pages[0]}")
+        page_token = tokens.get("jxlphoto-page", [])
+        if page_token and page_token[0].isdigit():
+            page = int(page_token[0])
+        else:
+            page = 0 if name[:-4].casefold() == stem else None
+        files.append([name, path, 0, 0, None, page])
+    try:
+        stat1 = os.stat(_io(tiff), follow_symlinks=False)
+    except OSError as exc:
+        raise _ConvertFailed(f"the TIFF cannot be read any more: {exc}")
+    if (stat1.st_size, stat1.st_mtime_ns) != (stat0.st_size, stat0.st_mtime_ns):
+        raise _ConvertFailed("the TIFF changed while it was converted")
+    taken = {item[5] for item in files if item[5] is not None}
+    spare = (number for number in range(len(files)) if number not in taken)
+    for item in files:
+        if item[5] is None:
+            item[5] = next(spare)
+        _flush_temp(item[1])
+        stat = os.stat(_io(item[1]))
+        item[2], item[3] = stat.st_size, stat.st_mtime_ns
+        item[4] = _sha256_file(item[1])
+    files.sort(key=lambda item: (item[5], item[0].casefold()))
+    return _Conversion(stat0.st_size, stat0.st_mtime_ns, source_sha, work,
+                       [tuple(item) for item in files])
+
+
+def _keep_old_file(dest, stamp, rel, log):
+    """The default home of a backup file a TIFF's JXL replaces: the versions
+    folder (the mirror passes its own: the trash for what is ours)."""
+    _move_file_to_versions(dest, stamp, rel, log)
+
+
+def _retire_file(dest, stamp, rel, catalog, log, keep_old_file):
+    """Move the backup file at `rel` aside (keep_old_file) and drop its row."""
+    if os.path.lexists(_io(os.path.join(dest, rel))):
+        keep_old_file(dest, stamp, rel, log)
+    catalog.delete(rel.casefold())
+
+
+def _place_group(status, conversion, dest, stamp, catalog, log, keep_old_file, tool):
+    """On the main thread: the JXL group takes its place beside where the TIFF
+    would be (each name with the TIFF's extension before .jxl) and the catalog
+    learns it. A TIFF copy it replaces is retired by the caller, after this."""
+    planned = status.planned
+    ext = os.path.splitext(planned.src)[1]
+    tiff_rel = planned.rel[:-len(".jxl")]
+    folder_rel = os.path.dirname(planned.rel)
+    final = []
+    for name, path, size, mtime_ns, sha256, page in conversion.files:
+        file_name = name[:-len(".jxl")] + ext + ".jxl"
+        rel = os.path.join(folder_rel, file_name) if folder_rel else file_name
+        final.append((rel, path, size, mtime_ns, sha256, page))
+    for old_rel in status.old_outputs:
+        _retire_file(dest, stamp, old_rel, catalog, log, keep_old_file)
+    os.makedirs(_io(os.path.dirname(os.path.join(dest, planned.rel))), exist_ok=True)
+    for rel, path, _size, _mtime_ns, _sha256, _page in final:
+        target = os.path.join(dest, rel)
+        if os.path.lexists(_io(target)):         # a file of another program in the way
+            _retire_file(dest, stamp, rel, catalog, log, keep_old_file)
+        _rename_no_clobber(path, target)
+    settings = _profile_settings(planned.convert)
+    for rel, _path, size, mtime_ns, sha256, page in final:
+        catalog.upsert(PlannedFile(planned.src, rel, size, mtime_ns, planned.category),
+                       sha256, size, mtime_ns)
+        catalog.record_converted(_Converted(
+            rel.casefold(), tiff_rel.casefold(), tiff_rel, conversion.source_size,
+            conversion.source_mtime_ns, conversion.source_sha256, page, len(final), tool,
+            settings))
+    log.log(f"CONVERTED {tiff_rel} -> {len(final)} JXL, "
+            f"{_gb(conversion.source_size)} -> {_gb(sum(item[2] for item in final))}")
+
+
+def _copy_tiff_as_is(status, dest, stamp, catalog, log, keep_old_file, args):
+    """A conversion that failed: the TIFF is backed up as it is, under its own
+    name (nothing is left without a copy); the next run tries again."""
+    planned = status.planned
+    tiff_rel = planned.rel[:-len(".jxl")]
+    copy = PlannedFile(planned.src, tiff_rel, planned.size, planned.mtime_ns, planned.category)
+    dst = os.path.join(dest, tiff_rel)
+    there = _listed_or_stat(dst, None)
+    tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
+    if (there is not None and there[0] == planned.size
+            and abs(there[1] - planned.mtime_ns) <= tolerance):
+        catalog.adopt(copy)             # a copy of this TIFF is there already
+        log.log(f"KEPT {tiff_rel} as TIFF (the conversion failed; the copy there is current)")
+    else:
+        if there is not None or os.path.lexists(_io(dst)):
+            _retire_file(dest, stamp, tiff_rel, catalog, log, keep_old_file)
+        digest, size, mtime_ns = _copy_file(copy, dst, args.verify_copy)
+        catalog.upsert(copy, digest, size, mtime_ns)
+        log.log(f"COPY {tiff_rel} (as TIFF: the conversion failed)")
+    # the JXL of an older version of this TIFF: the old copy of a changed file,
+    # retired only now that the new bytes are in the backup
+    for old_rel in status.old_outputs:
+        _retire_file(dest, stamp, old_rel, catalog, log, keep_old_file)
+
+
+def _remove_own_folder(path):
+    """Remove one of this tool's own working folders (a conversion's, a temp
+    copy of the tools): never a link, never anything outside it."""
+    if (os.path.lexists(_io(path)) and not os.path.islink(_io(path))
+            and not os.path.isjunction(_io(path))):
+        shutil.rmtree(_io(path), ignore_errors=True)
+
+
+def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, info=None):
+    """The TIFFs kept as JXL: jxl-photo encodes TIFF_JXL_WORKERS at a time, each
+    in a folder of its own under CATALOG_FOLDER; the main thread puts each proven
+    group in place and records it. A TIFF that cannot be converted is copied as
+    it is. Returns True when interrupted (Ctrl+C)."""
+    info = {} if info is None else info
+    for name in ("converted", "failed", "retired", "bytes_in", "bytes_out", "errors"):
+        info.setdefault(name, 0)
+    keep_old_file = keep_old_file or _keep_old_file
+    todo = [status for status in statuses
+            if status.planned.convert and _will_copy(status, args)]
+    retire_only = [status for status in statuses
+                   if status.planned.convert and status.replaces
+                   and status.status == ST_UP_TO_DATE]
+    for status in retire_only:          # the JXL is there: only the old TIFF copy goes
+        try:
+            _retire_file(dest, stamp, status.replaces, catalog, log, keep_old_file)
+            info["retired"] += 1
+        except OSError as exc:
+            info["errors"] += 1
+            log.log(f"ERROR retiring {status.replaces}: {exc}")
+    catalog.commit()
+    if not todo:
+        return False
+    jxlphoto = getattr(args, "jxlphoto", None) or JXLPHOTO
+    problem = _jxlphoto_problem(jxlphoto)
+    tool = _jxlphoto_version(jxlphoto) if problem is None else "jxl-photo ?"
+    work_root = os.path.join(dest, CATALOG_FOLDER, TIFF_JXL_FOLDER)
+    if os.path.isdir(_io(work_root)):               # an interrupted run's own folders
+        with os.scandir(_io(work_root)) as listing:
+            for entry in listing:
+                _remove_own_folder(os.path.join(work_root, entry.name))
+    os.makedirs(_io(work_root), exist_ok=True)
+    workers = max(1, int(TIFF_JXL_WORKERS))
+    total = len(todo)
+    log.out(f"Converting {_num(total)} TIFF to JXL ({tool}, {workers} at a time; "
+            f"{_gb(sum(status.planned.size for status in todo))} of TIFF)")
+    started = time.monotonic()
+    last_report = started
+    finished = 0
+    interrupted = False
+    pool = ThreadPoolExecutor(max_workers=workers)
+    futures = {}
+    try:
+        if problem is None:
+            for index, status in enumerate(todo):
+                futures[pool.submit(_convert_one, status, work_root, stamp, index,
+                                    jxlphoto)] = status
+            results = ((futures[future], future) for future in as_completed(futures))
+        else:
+            results = ((status, None) for status in todo)
+        for status, future in results:
+            conversion, why = None, problem
+            if future is not None:
+                try:
+                    conversion = future.result()
+                except _ConvertFailed as exc:
+                    why = str(exc)
+                except Exception as exc:
+                    why = f"{type(exc).__name__}: {exc}"
+            if conversion is not None:
+                try:
+                    _place_group(status, conversion, dest, stamp, catalog, log, keep_old_file,
+                                 tool)
+                    info["converted"] += 1
+                    info["bytes_in"] += conversion.source_size
+                    info["bytes_out"] += sum(item[2] for item in conversion.files)
+                except OSError as exc:
+                    why = f"the JXL could not be put in place: {exc}"
+                    conversion = None
+            if conversion is not None and status.replaces:
+                # the JXL is in the backup and in the catalog: only now does the
+                # TIFF copy it replaces leave (a failure here is an error of its
+                # own, never a failed conversion)
+                try:
+                    _retire_file(dest, stamp, status.replaces, catalog, log, keep_old_file)
+                    info["retired"] += 1
+                except OSError as exc:
+                    info["errors"] += 1
+                    log.log(f"ERROR retiring {status.replaces}: {exc}")
+            if conversion is None:
+                info["failed"] += 1
+                log.log(f"CONVERT FAILED {status.planned.rel[:-len('.jxl')]}: {why}")
+                try:
+                    _copy_tiff_as_is(status, dest, stamp, catalog, log, keep_old_file, args)
+                except Exception as exc:
+                    info["errors"] += 1
+                    log.log(f"ERROR {status.planned.rel[:-len('.jxl')]}: {exc}")
+            if future is not None and future.done() and future.exception() is None:
+                _remove_own_folder(future.result().work)
+            finished += 1
+            if finished % max(FLUSH_BATCH_FILES, 1) == 0:
+                catalog.commit()
+            now = time.monotonic()
+            if now - last_report >= PROGRESS_EVERY_S or finished == total:
+                elapsed = max(now - started, 1e-6)
+                eta = elapsed / finished * (total - finished)
+                print(f"[{finished}/{total}] TIFF to JXL: {_gb(info['bytes_in'])} -> "
+                      f"{_gb(info['bytes_out'])}, {info['failed']} kept as TIFF  "
+                      f"ETA {_hms(eta)}")
+                last_report = now
+    except KeyboardInterrupt:
+        interrupted = True
+        log.log("INTERRUPTED while converting TIFF to JXL")
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+        catalog.commit()
+        _remove_own_folder(work_root)
+    return interrupted
+
+
+def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_copy=None,
+              keep_old_file=None, convert_info=None):
     """Copy what the plan says. `stop_info` (a dict) receives why the copy
     stopped early and what was left, when the destination stopped taking
     writes: after DEST_CHECK_AFTER_ERRORS failed copies in a row the
@@ -2404,8 +3206,11 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_cop
     that stopped taking writes too: nothing more is tried, and `unrecorded`
     says how many copies have their final name but no row (R1).
     `old_copy(dest, stamp, status, log)` decides what happens to the old copy
-    of a CHANGED file (default: _handle_old_copy; the mirror passes its own)."""
-    to_copy = [status for status in statuses if _will_copy(status, args)]
+    of a CHANGED file (default: _handle_old_copy; the mirror passes its own).
+    The TIFFs kept as JXL go through _convert_all after the copies
+    (`keep_old_file`, `convert_info`)."""
+    to_copy = [status for status in statuses
+               if _will_copy(status, args) and not status.planned.convert]
     total_bytes = sum(status.planned.size for status in to_copy)
     done = 0
     done_bytes = 0
@@ -2533,6 +3338,10 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_cop
                     break
                 in_a_row = 0
         finish_pending()
+        if stopped is None and catalog_error is None:
+            if _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file,
+                            convert_info):
+                raise KeyboardInterrupt
         if stopped is None and catalog_error is not None:
             # the last commit failed: every file was tried, none is left
             stopped = (f"the catalog could not be written: {catalog_error}", None, [])
@@ -2690,28 +3499,8 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
         print(reserved, file=sys.stderr)
         log.log(f"ERROR {reserved}")
         return 2
-    listings = {} if mirror is not None else None
-    statuses = _file_statuses(planned.files, dest, listings)
-    to_copy = [status for status in statuses if _will_copy(status, args)]
-    needed = sum(status.planned.size for status in to_copy)
-    dest_error = None
-    try:
-        free = shutil.disk_usage(_io(_existing_ancestor(dest))).free
-    except OSError as exc:      # drive not connected / not mounted
-        free = 0
-        dest_error = exc.strerror or str(exc)
-    margin = int(float(args.space_margin_gb) * 1e9)
-    fits = dest_error is None and needed <= free - margin
-    log_paths = {
-        "log": log.path,
-        "plan": log.prefix + "_plan.csv",
-        "unexported": log.prefix + "_unexported.csv",
-        "unmatched": log.prefix + "_unmatched.csv",
-        "orphans_csv": log.prefix + "_orphans.csv",
-        "by_folder_csv": log.prefix + "_by_folder.csv",
-        "inside": log.prefix + "_inside.csv",
-    }
     rows = []
+    converted = {}
     candidates = {}
     try:
         read_only_catalog = _Catalog(dest, create=False, readonly=True)
@@ -2730,6 +3519,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             log.log(f"catalog: {catalog_note}")
         try:
             rows = read_only_catalog.all_rows()
+            converted = read_only_catalog.converted_rows()
         except sqlite3.Error as exc:
             message = f"cannot read catalog {read_only_catalog.path}: {exc}"
             print(message, file=sys.stderr)
@@ -2737,8 +3527,46 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             return 2
         finally:
             read_only_catalog.close()
-        if args.detect_moves:
-            candidates = _find_move_candidates(statuses, rows, dest, planned.sources)
+    # the state of every planned file (a TIFF kept as JXL: from its group, which
+    # only the catalog knows -- so the catalog is read first)
+    listings = {} if mirror is not None else None
+    statuses = _file_statuses(planned.files, dest, listings, _converted_groups(converted),
+                              {row.key: row for row in rows})
+    to_copy = [status for status in statuses if _will_copy(status, args)]
+    needed = sum(status.planned.size for status in to_copy)
+    dest_error = None
+    try:
+        free = shutil.disk_usage(_io(_existing_ancestor(dest))).free
+    except OSError as exc:      # drive not connected / not mounted
+        free = 0
+        dest_error = exc.strerror or str(exc)
+    margin = int(float(args.space_margin_gb) * 1e9)
+    # nothing to copy always fits: a full disk must not stop the removals of a
+    # mirror (finding 9 of the rc1 review), nor a run with nothing new
+    fits = dest_error is None and (needed == 0 or needed <= free - margin)
+    log_paths = {
+        "log": log.path,
+        "plan": log.prefix + "_plan.csv",
+        "unexported": log.prefix + "_unexported.csv",
+        "unmatched": log.prefix + "_unmatched.csv",
+        "orphans_csv": log.prefix + "_orphans.csv",
+        "by_folder_csv": log.prefix + "_by_folder.csv",
+        "inside": log.prefix + "_inside.csv",
+    }
+    link = _first_dest_link(dest, [item.rel for item in planned.files] + [row.rel for row in rows])
+    if link is not None:
+        message = (f"The backup holds a link or junction: {link} (it leads to {_real(link)}). "
+                   f"The backup never writes, moves or deletes through one -- it could lead into "
+                   f"a source. Take it out of the backup, then run again.")
+        print(message, file=sys.stderr)
+        log.log(f"ERROR {message}")
+        if mirror is not None:
+            mirror._stop(f"the backup holds a link or junction: {link}",
+                         "take that link or junction out of the backup (the backup never "
+                         "writes one), then run the mirror again")
+        return 2
+    if rows and args.detect_moves:
+        candidates = _find_move_candidates(statuses, rows, dest, planned.sources)
     prefixes = _source_prefixes(planned)
     tentative_used = set()
     for _status, matches in candidates.values():
@@ -2766,6 +3594,21 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             f"{_gb(sum(status.planned.size for status in possible))} "
             f"(same name and size as backup files whose source is gone; "
             f"confirmed by hash before moving)")
+    converts = [status for status in statuses if status.planned.convert]
+    if converts:
+        settings = "; ".join(_profile_settings(name)
+                             for name in sorted({status.planned.convert for status in converts}))
+        to_make = [status for status in converts if _will_copy(status, args)]
+        same = [status for status in converts if status.status == ST_UP_TO_DATE]
+        extra_lines.append(
+            f"  TIFF kept as JXL ({settings}): {_num(len(to_make))} to convert "
+            f"({_gb(sum(status.planned.size for status in to_make))} of TIFF), "
+            f"{_num(len(same))} up to date")
+        retire = [status for status in converts if status.replaces]
+        if retire:
+            where = "the mirror's trash" if mirror is not None else "versions\\"
+            extra_lines.append(f"  TIFF copies in the backup that their JXL replaces: "
+                               f"{_num(len(retire))} (to {where})")
     gone = [row for reason, row in tentative_orphans if reason == "source_missing"]
     unselected = [row for reason, row in tentative_orphans if reason == "not_selected"]
     unreadable = [row for reason, row in tentative_orphans if reason == "source_unreadable"]
@@ -2787,7 +3630,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     if mirror is not None:
         mirror_lines, freed = mirror.review(planned, statuses, rows, prefixes, tentative_orphans,
                                             tentative_used, listings, dest, log, possible)
-        fits = dest_error is None and needed <= free + freed - margin
+        fits = dest_error is None and (needed == 0 or needed <= free + freed - margin)
     orphans_blocked = (f"nothing moved: {_num(len(planned.errors))} errors in the plan of this "
                        f"run (a source that cannot be read is not one that is gone)")
     if args.move_orphans and args.dry_run:
@@ -2887,6 +3730,9 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
         if answer.strip().casefold() not in ("y", "yes"):
             print("Aborted.")
             log.log("Aborted by the user")
+            if mirror is not None:
+                mirror._stop("the answer was no", "nothing to do: run the mirror again when "
+                                                   "you want it")
             return 2
     try:
         catalog = _Catalog(dest, create=True)
@@ -2904,8 +3750,11 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     interrupted = False
     stop_info = {}
     mirror_problems = False
+    convert_info = {}
     try:
         _ensure_backup_id(dest, log)
+        for line in _keep_tools(dest, log, getattr(args, "jxlphoto", None) or JXLPHOTO):
+            log.out(line)
         _adopt_rows(catalog, statuses)
         if candidates:
             moved, moved_bytes, move_errors, interrupted = _apply_moves(
@@ -2921,12 +3770,25 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
         if mirror is not None:
             mirror.remove(dest, stamp, catalog, orphans, log)
             if mirror.interrupted:
+                # what was removed before Ctrl+C, and where it is (finding 6)
+                mirror.finish(log, 0, 0, 0, interrupted=True)
                 return 130
         done, done_bytes, error_count, interrupted = _copy_all(
             args, statuses, dest, stamp, catalog, log, stop_info,
-            mirror.old_copy if mirror is not None else None)
+            mirror.old_copy if mirror is not None else None,
+            mirror.keep_old_file if mirror is not None else None, convert_info)
         log.log(f"moved {moved} files / {_gb(moved_bytes)}")
         log.out(f"copied {done} files / {_gb(done_bytes)}; {error_count} errors")
+        if any(convert_info.get(name) for name in ("converted", "failed", "retired")):
+            log.out(f"TIFF kept as JXL: {_num(convert_info['converted'])} converted "
+                    f"({_gb(convert_info['bytes_in'])} of TIFF -> "
+                    f"{_gb(convert_info['bytes_out'])} of JXL)")
+            if convert_info["retired"]:
+                log.out(f"  {_num(convert_info['retired'])} TIFF copies in the backup replaced "
+                        f"by their JXL (to {'the trash' if mirror is not None else 'versions'})")
+            if convert_info["failed"]:
+                log.out(f"  {_num(convert_info['failed'])} copied as TIFF: the conversion "
+                        f"failed (CONVERT FAILED in the log)")
         if error_count or move_errors:
             log.out(f"ERRORS: {_num(error_count + move_errors)} files were NOT copied -> {log.path}")
         if stop_info:
@@ -2941,6 +3803,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                         f"in the catalog (it could not be written); they keep their final "
                         f"names and the next run adopts them by their size and date")
         if mirror is not None:
+            mirror.convert_info = convert_info
             mirror_problems = mirror.finish(log, done, done_bytes, error_count, interrupted)
         if interrupted:
             return 130
@@ -2959,7 +3822,8 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
         return 1 if done or moved else 2
     finally:
         catalog.close()
-    return 1 if error_count or move_errors or planned.errors or stop_info or mirror_problems else 0
+    return 1 if (error_count or move_errors or planned.errors or stop_info or mirror_problems
+                 or convert_info.get("failed") or convert_info.get("errors")) else 0
 
 
 @dataclass
@@ -2969,6 +3833,7 @@ class _VerifyJob:
     dest_size: int = None       # from the listing of its folder (quick verify); None = ask
     source_listed: tuple = None     # (size, mtime_ns) of the source from the plan's listing
                                     # (quick verify, VERIFY_QUICK_USES_PLAN); None = ask
+    converted: object = None    # a _Converted: this file is a TIFF kept as JXL
 
 
 def _same_drive(first, second):
@@ -3065,8 +3930,13 @@ def _verify_row(job, dest, deep, reader=None):
         source_size = source_stat.st_size if source_stat is not None else None
         source_mtime_ns = source_stat.st_mtime_ns if source_stat is not None else None
     tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
-    source_same = (state == SOURCE_PRESENT and source_size == row.size
-                   and abs(_db_ns(source_mtime_ns) - row.mtime_ns) <= tolerance)
+    # a TIFF kept as JXL: the source is the TIFF the conversion recorded, the
+    # copy is the JXL with its own size and hash
+    conv = job.converted
+    source_want = ((conv.source_size, conv.source_mtime_ns, conv.source_sha256)
+                   if conv is not None else (row.size, row.mtime_ns, row.sha256))
+    source_same = (state == SOURCE_PRESENT and source_size == source_want[0]
+                   and abs(_db_ns(source_mtime_ns) - source_want[1]) <= tolerance)
     # The backup copy is judged BEFORE the source: when the original is gone
     # or changed, the copy may be the only one left, and its health matters
     # most. A copy with a catalog hash is always read; one without is read
@@ -3091,6 +3961,13 @@ def _verify_row(job, dest, deep, reader=None):
             return VerifyResult("DEST_CORRUPT", row.rel, row.source_path,
                                 "destination sha256 differs from the catalog")
         dest_verified = True
+        if conv is not None:
+            sums = [value.casefold()
+                    for value in _jxl_tokens(dst).get("jxlphoto-srcsum", [])]
+            if _jxlphoto_srcsum(conv.source_sha256) not in sums:
+                return VerifyResult("DEST_NOT_FROM_SOURCE", row.rel, row.source_path,
+                                    "the JXL does not say it was made from the TIFF the "
+                                    "catalog recorded (jxlphoto-srcsum)")
     copy_note = "; backup copy hash verified" if dest_verified else ""
     if state == SOURCE_MISSING:
         return VerifyResult("SOURCE_MISSING", row.rel, row.source_path,
@@ -3110,7 +3987,7 @@ def _verify_row(job, dest, deep, reader=None):
                             f"source cannot be read: {_error_text(source_error)}" + copy_note,
                             dest_verified=dest_verified)
     if row.sha256:
-        if hash_src != row.sha256:
+        if hash_src != source_want[2]:
             return VerifyResult("SOURCE_CORRUPT_SUSPECT", row.rel, row.source_path,
                                 "source sha256 differs from the catalog with same size/mtime",
                                 dest_verified=dest_verified)
@@ -3218,6 +4095,7 @@ def _verify_catalog(args, log, plan_fn, dest, catalog, deep, reader):
         log.log(f"ERROR {reserved}")
         return 2
     rows = {row.key: row for row in catalog.all_rows()}
+    converted = catalog.converted_rows()
     db_keys = set(rows)
     prefixes = _source_prefixes(planned)
     checked = set()
@@ -3231,6 +4109,9 @@ def _verify_catalog(args, log, plan_fn, dest, catalog, deep, reader):
         key = planned_file.rel.casefold()
         if key in checked:
             continue
+        if planned_file.convert and planned_file.rel[:-len(".jxl")].casefold() in rows:
+            checked.add(key)        # its conversion failed: the TIFF copy is checked below
+            continue
         if status.status == ST_NEW:
             results.append(VerifyResult("NOT_BACKED_UP", planned_file.rel, planned_file.src,
                                         "no destination file and no catalog row"))
@@ -3242,7 +4123,7 @@ def _verify_catalog(args, log, plan_fn, dest, catalog, deep, reader):
             catalog.adopt(planned_file)
             db_keys.add(key)
         rows[key] = row
-        planned_jobs.append(_VerifyJob(row, key in db_keys))
+        planned_jobs.append(_VerifyJob(row, key in db_keys, converted=converted.get(key)))
         checked.add(key)
     if deep and planned_jobs:
         catalog.commit()
@@ -3253,7 +4134,7 @@ def _verify_catalog(args, log, plan_fn, dest, catalog, deep, reader):
         if not _key_under_prefixes(key, prefixes):
             outside.append(row)
             continue
-        catalog_jobs.append(_VerifyJob(row, key in db_keys))
+        catalog_jobs.append(_VerifyJob(row, key in db_keys, converted=converted.get(key)))
         checked.add(key)
     budget = args.max_gb * 1e9 if deep and args.max_gb > 0 else None
     if budget is not None:
@@ -3456,6 +4337,12 @@ def _build_parser():
                         help="copy a moved/renamed file again instead of moving its backup copy")
     parser.add_argument("--move-orphans", action="store_true",
                         help="move backup files whose source is gone into the orphans folder")
+    parser.add_argument("--tiff", choices=("copy",) + tuple(TIFF_JXL_PROFILES), default="copy",
+                        help="TIFFs outside the export folders: copy them as they are, or keep "
+                             "them as JXL with this profile of TIFF_JXL_PROFILES (jxl-photo)")
+    parser.add_argument("--jxlphoto", default=JXLPHOTO, metavar="PATH",
+                        help="jxl-photo's jxl_photo.py or jxl-photo.exe, for --tiff "
+                             "(default: JXLPHOTO)")
     parser.add_argument("--expect-backup-id", default=None, metavar="ID",
                         help="abort unless the destination holds this backup ID")
     parser.add_argument("--space-margin-gb", type=float, default=SPACE_MARGIN_GB, metavar="N",

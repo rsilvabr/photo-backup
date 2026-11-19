@@ -21,8 +21,8 @@ removed, and a changed file it did not write goes to the versions folder, as in
 a normal backup. Removed and replaced files go to a trash inside the backup
 (<dest>\\_photo_backup\\trash\\<run>) and stay there MIRROR_KEEP_DAYS days.
 
-Locks: a line with read errors removes nothing; a line that would remove more
-than MIRROR_MAX_DELETE_PERCENT of its files stops the run unless a person types
+Locks: a line with read errors removes nothing; a line that would remove or
+replace more than MIRROR_MAX_DELETE_PERCENT of its files stops the run unless a person types
 the number of files (or --allow-mass-delete); nothing behind a link or junction;
 one real run at a time. Deleting anything for good before its date (to make
 room, or --empty-trash) needs a person who types the number of files.
@@ -47,19 +47,20 @@ import sys
 import textwrap
 import time
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 import manifest_backup as mb
 
-__version__ = "0.14.0-rc1"
+__version__ = "0.14.0-rc2"
 
 # ---- Settings -------------------------------------------------------------------
 MIRROR_KEEP_DAYS = 30               # days a file the mirror removed or replaced stays in the trash
                                     # (<dest>\_photo_backup\trash\<run>); then the next mirror deletes it for
                                     # good. 0 = no trash: removed at once (and the next run empties the trash)
 MIRROR_MAX_DELETE_PERCENT = 20      # a manifest line (without a manifest: the whole run) that would remove
-MIRROR_MAX_DELETE_MIN = 5           # more than this % of its files in the backup, and at least
+MIRROR_MAX_DELETE_MIN = 5           # or replace more than this % of its files in the backup, and at least
                                     # MIRROR_MAX_DELETE_MIN files, changes nothing unless the number of files
                                     # is typed (or --allow-mass-delete); MIRROR_MAX_DELETE_PERCENT = 0 = no limit
 MIRROR_TRASH_FOLDER = "trash"       # under selective_backup.CATALOG_FOLDER
@@ -248,6 +249,7 @@ def _plain_backend_args(args, extra):
     for source in args.source:
         argv += ["--source", source]
     argv += ["--dest", os.path.abspath(args.dest),
+             "--jxlphoto", args.jxlphoto,
              "--export-formats", args.export_formats,
              "--verify-copy", args.verify_copy,
              "--space-margin-gb", str(args.space_margin_gb),
@@ -450,8 +452,9 @@ def _purge_trash_run(run, dest, log):
             path = os.path.join(folder, entry.name)
             try:
                 if entry.is_symlink() or entry.is_junction():
+                    # left where it is, never followed; not a problem of each
+                    # later run either (finding 8 of the rc1 review)
                     log.log(f"MIRROR TRASH LINK left {path} (never followed)")
-                    counts[2] += 1
                 elif entry.is_dir(follow_symlinks=False):
                     purge(path)
                     try:
@@ -730,7 +733,10 @@ class MirrorJob:
         self.actions_csv = None
         self.errors = 0
         self.purged = [0, 0, 0]             # files, bytes, problems
-        self.replaced = collections.Counter()   # trash | for_good | versions | done
+        self.replaced = collections.Counter()   # trash | for_good | versions | done | jxl_*
+        self.convert_info = {}              # _copy_all's TIFF-to-JXL counts
+        self.retire_items = {}              # TIFF copies a JXL replaces: {key: _Item}
+        self.adoptable = {}                 # ... without a row: {key: (size, mtime_ns) of the source}
         if rows is not None:
             self.lines = [_Line(row.folder, row.mirror) for row in rows]
             keys = [(_fold(row.folder), line) for row, line in zip(rows, self.lines)]
@@ -788,6 +794,7 @@ class MirrorJob:
         self.prefixes = list(prefixes)
         self.rows_by_key = {row.key: row for row in rows}
         self.planned_keys = {status.planned.rel.casefold() for status in statuses}
+        self.planned_keys.update(key for status in statuses for key in status.extra_keys)
         self.run_errors = len(planned.errors)
         link_keys = {_fold(path) for path in list(planned.links) + list(planned.cache_links)}
         self.items = []
@@ -843,7 +850,6 @@ class MirrorJob:
                                             row.source_path, row=row))
                 else:
                     self._keep(reason, line, row, "changed in the backup by hand", size)
-        self._check_limit(rows)
         # changed files: ours go to the trash, any other old copy to versions\
         self.ours_changed = {}
         for status in statuses:
@@ -854,12 +860,14 @@ class MirrorJob:
             state, size, mtime_ns = _dest_stat(status.dst, listings.get(os.path.dirname(status.dst)))
             if row is not None and state == "ok" and _ours(row, size, mtime_ns):
                 self.ours_changed[key] = row
-                self.items.append(_Item("replace", "changed", None, status.planned.rel, size,
-                                        status.planned.src, row=row))
+                self.items.append(_Item("replace", "changed", self.line_of(status.planned.src),
+                                        status.planned.rel, size, status.planned.src, row=row))
             else:
                 self.items.append(_Item("versions", "not_catalogued" if row is None else "changed",
                                         None, status.planned.rel, size or 0, status.planned.src,
                                         "not written by the backup: the old copy goes to versions\\"))
+        # the limit per line counts what is removed and what of ours is replaced
+        self._check_limit(rows)
         # files the backup did not write, in the folders the mirror touches
         for folder, listed in listings.items():
             if not listed:
@@ -883,34 +891,62 @@ class MirrorJob:
         if self.trash_problem is not None:
             self.trash_runs, self.trash_foreign = [], []
         now = datetime.now()
+        # by its day, as the screen shows it: the first mirror on or after that
+        # day deletes it, at any hour (finding 11 of the rc1 review)
         self.expired = [run for run in self.trash_runs
-                        if now - run.when >= timedelta(days=MIRROR_KEEP_DAYS)]
+                        if (now.date() - run.when.date()).days >= MIRROR_KEEP_DAYS]
         for run in self.expired:
             self.items.append(_Item("trash_purge", "expired", None, os.path.relpath(run.path, dest),
                                     run.nbytes, "", f"{run.files} files, past their date"))
         for path in self.trash_foreign:
             self.items.append(_Item("trash_foreign", "not_a_run", None, os.path.relpath(path, dest),
                                     0, "", "not made by the mirror: never touched"))
+        for status in statuses:
+            if status.planned.convert and status.replaces:
+                row = self.rows_by_key.get(status.replaces.casefold())
+                found = sb._listed_or_stat(os.path.join(dest, status.replaces),
+                                           listings.get(os.path.dirname(status.dst)))
+                item = _Item("retire", "replaced_by_jxl", None, status.replaces,
+                             found[0] if found else 0, status.planned.src,
+                             "a TIFF copy that its JXL replaces", row=row)
+                self.items.append(item)
+                self.retire_items[status.replaces.casefold()] = item
+                if row is None:
+                    # a copy with the source TIFF's size and date (another
+                    # program's): what any run adopts as its own; ours, then
+                    self.adoptable[status.replaces.casefold()] = (status.planned.size,
+                                                                  status.planned.mtime_ns)
         freed = sum(run.nbytes for run in self.expired)
         if self.for_good and self.trash_problem is None:
-            freed += sum(item.size for item in self._items("remove", "replace"))
-        new = [status for status in statuses if status.status == sb.ST_NEW]
-        changed = [status for status in statuses if status.status == sb.ST_CHANGED]
+            freed += sum(item.size for item in self._items("remove", "replace", "retire"))
+        new = [status for status in statuses
+               if status.status == sb.ST_NEW and not status.planned.convert]
+        changed = [status for status in statuses
+                   if status.status == sb.ST_CHANGED and not status.planned.convert]
+        converts = [status for status in statuses if status.planned.convert
+                    and status.status in (sb.ST_NEW, sb.ST_CHANGED)]
         self.numbers = {"new": len(new), "changed": len(changed),
-                        "remove": len(self._items("remove"))}
+                        "remove": len(self._items("remove")), "convert": len(converts)}
         self._write_actions()
         return self._summary(statuses, possible), freed
 
     def _check_limit(self, rows):
-        """The lines that would remove more than MIRROR_MAX_DELETE_PERCENT of
-        their files in the backup (and at least MIRROR_MAX_DELETE_MIN)."""
+        """The lines that would remove or replace more than
+        MIRROR_MAX_DELETE_PERCENT of their files in the backup (and at least
+        MIRROR_MAX_DELETE_MIN). A replaced file of ours counts: its old copy
+        leaves through the trash too (finding 2 of the rc1 review); the small
+        edit files rewritten by every edit (AUTO_UPDATE_EXTENSIONS) do not."""
         self.over_limit = []
         removes = collections.Counter()
         nbytes = collections.Counter()
-        for item in self._items("remove"):
-            if item.line is not None:
-                removes[item.line] += 1
-                nbytes[item.line] += item.size
+        for item in self._items("remove", "replace"):
+            if item.line is None:
+                continue
+            if (item.action == "replace"
+                    and os.path.splitext(item.rel)[1].casefold() in sb.AUTO_UPDATE_EXTENSIONS):
+                continue
+            removes[item.line] += 1
+            nbytes[item.line] += item.size
         if MIRROR_MAX_DELETE_PERCENT <= 0 or not removes:
             return
         totals = collections.Counter()
@@ -949,8 +985,10 @@ class MirrorJob:
         needs attention. It is printed after the backup's summary, so it is
         what is on the screen when the question comes."""
         same = [s for s in statuses if s.status == sb.ST_UP_TO_DATE]
-        new = [s for s in statuses if s.status == sb.ST_NEW]
-        changed = [s for s in statuses if s.status == sb.ST_CHANGED]
+        new = [s for s in statuses if s.status == sb.ST_NEW and not s.planned.convert]
+        changed = [s for s in statuses if s.status == sb.ST_CHANGED and not s.planned.convert]
+        converts = [s for s in statuses if s.planned.convert
+                    and s.status in (sb.ST_NEW, sb.ST_CHANGED)]
         removes = self._items("remove")
         removed_bytes = sum(item.size for item in removes)
         mode = "total" if self.total else "scoped"
@@ -980,6 +1018,14 @@ class MirrorJob:
             if others:
                 lines.append(_table_line("old copy to versions\\ (not written by the backup)",
                                          len(others), sum(item.size for item in others), indent=4))
+        if converts:
+            lines.append(_table_line("convert TIFF to JXL (the TIFF's size)", len(converts),
+                                     sum(s.planned.size for s in converts)))
+        retires = self._items("retire")
+        if retires:
+            where = "deleted (no trash)" if self.for_good else "to the trash"
+            lines.append(_table_line(f"TIFF copy replaced by its JXL ({where})", len(retires),
+                                     sum(item.size for item in retires), indent=4))
         where = "delete for good" if self.for_good else "to the trash"
         lines.append(_table_line(f"remove from the backup ({where})", len(removes), removed_bytes))
         for label, reason in _REMOVE_REASONS:
@@ -1039,11 +1085,12 @@ class MirrorJob:
             lines += ["", "  !! READ ERRORS: these lines remove nothing in this run (see the log):"]
             lines += [f"     {_short(line.name, 74)}" for line in errored[:MIRROR_SUMMARY_LINES]]
         if self.over_limit:
-            lines += ["", f"  !! CHECK: these lines would remove more than "
+            lines += ["", f"  !! CHECK: these lines would remove or replace more than "
                           f"{MIRROR_MAX_DELETE_PERCENT}% of their files"]
             lines += self._limit_lines()
             lines += _wrap("Common causes: the folder was deleted or moved on the source, another "
-                           "disk got the source's drive letter, or the line's mode was lowered.",
+                           "disk got the source's drive letter, the line's mode was lowered, or a "
+                           "program rewrote the files (ransomware encrypts them in place).",
                            indent=5)
             if not self.allow_mass:
                 lines += _wrap("A real run asks you to type the number of files; unattended, it "
@@ -1069,7 +1116,7 @@ class MirrorJob:
         missing = needed - (free - margin)
         drive = os.path.splitdrive(self.dest)[0] or self.dest
         runs = [run for run in self.trash_runs if run not in self.expired]
-        this_run = self._items("remove", "replace") if not self.for_good else []
+        this_run = self._items("remove", "replace", "retire") if not self.for_good else []
         this_bytes = sum(item.size for item in this_run)
         options = []
         oldest, total = [], 0
@@ -1096,6 +1143,8 @@ class MirrorJob:
             files = sum(run.files for run in chosen) + (len(this_run) if with_run else 0)
             nbytes = sum(run.nbytes for run in chosen) + (this_bytes if with_run else 0)
             self.space_options.append((label, chosen, with_run, files, nbytes))
+        # the one that deletes the least first (finding 13 of the rc1 review)
+        self.space_options.sort(key=lambda option: (option[4], option[3]))
         lines = ["", f"  !! NOT ENOUGH SPACE on {drive} - {_size(missing)} missing."]
         if not self.space_options:
             lines += _wrap(f"Even deleting the whole trash and this run's removals for good would "
@@ -1142,7 +1191,8 @@ class MirrorJob:
         except (EOFError, KeyboardInterrupt):
             print()
             answer = ""
-        if not answer.isdigit() or not 1 <= int(answer) <= len(self.space_options):
+        if (not (answer.isascii() and answer.isdigit())
+                or not 1 <= int(answer) <= len(self.space_options)):
             self._stop("nothing was chosen to make room", "make room, then run the mirror again")
             return False
         index = int(answer)
@@ -1181,18 +1231,19 @@ class MirrorJob:
         if self.over_limit and not self.allow_mass:
             count = sum(item[1] for item in self.over_limit)
             if self.unattended:
-                self._stop(f"{len(self.over_limit)} line(s) would remove more than "
+                self._stop(f"{len(self.over_limit)} line(s) would remove or replace more than "
                            f"{MIRROR_MAX_DELETE_PERCENT}% of their files (see CHECK above)",
                            "run the mirror by hand (photo_backup.py -> [8] Mirror) and type the "
                            "number of files, or, if those files really must leave the backup, "
                            "run it once with --allow-mass-delete")
                 return False
-            lines = ["", f"!! CHECK BEFORE GOING ON: these lines would remove more than "
-                         f"{MIRROR_MAX_DELETE_PERCENT}% of their files"]
+            lines = ["", f"!! CHECK BEFORE GOING ON: these lines would remove or replace more "
+                         f"than {MIRROR_MAX_DELETE_PERCENT}% of their files"]
             lines += self._limit_lines(rows_indent=3)
             lines += _wrap("This usually means the folder was deleted or moved on the source, "
-                           "another disk got the source's drive letter, or the line's mode was "
-                           "lowered. If that is what you did, go on; if not, cancel and look at "
+                           "another disk got the source's drive letter, the line's mode was "
+                           "lowered, or a program rewrote the files (ransomware encrypts them in "
+                           "place). If that is what you did, go on; if not, cancel and look at "
                            "the source first.", indent=3)
             leaving = ("This file leaves" if count == 1
                        else f"These {_files(count)} leave")
@@ -1219,8 +1270,11 @@ class MirrorJob:
 
     def proceed_prompt(self):
         verb = "delete for good" if self.for_good else "remove"
+        convert = (f", convert {_n(self.numbers['convert'])} TIFF to JXL"
+                   if self.numbers.get("convert") else "")
         return (f"Mirror now? copy {_n(self.numbers['new'])}, replace "
-                f"{_n(self.numbers['changed'])}, {verb} {_n(self.numbers['remove'])} [y/N] ")
+                f"{_n(self.numbers['changed'])}{convert}, {verb} "
+                f"{_n(self.numbers['remove'])} [y/N] ")
 
     # -- before the copy ---------------------------------------------------------------------
     def remove(self, dest, stamp, catalog, orphans, log):
@@ -1228,16 +1282,22 @@ class MirrorJob:
         then what the review showed: only if it is still removed for the same
         reason, still ours, asked again right now."""
         seen = set()
-        for run in self.expired + self.purge_runs:
-            if run.name in seen:
-                continue
-            seen.add(run.name)
-            files, nbytes, problems = _purge_trash_run(run, dest, log)
-            self.purged[0] += files
-            self.purged[1] += nbytes
-            self.purged[2] += problems
-            if files:
-                self.changed_something = True
+        try:
+            for run in self.expired + self.purge_runs:
+                if run.name in seen:
+                    continue
+                seen.add(run.name)
+                files, nbytes, problems = _purge_trash_run(run, dest, log)
+                self.purged[0] += files
+                self.purged[1] += nbytes
+                self.purged[2] += problems
+                if files:
+                    self.changed_something = True
+        except KeyboardInterrupt:
+            self.interrupted = True
+            self.changed_something = True
+            log.log("INTERRUPTED while deleting the trash past its date")
+            return
         fresh = {row.key: reason for reason, row in orphans}
         if self.total:
             for row in catalog.all_rows():
@@ -1332,7 +1392,11 @@ class MirrorJob:
     def _to_trash_if_ours(self, row):
         def keep_old(dest, stamp, status, log):
             state, size, mtime_ns = _dest_stat(status.dst)
-            if state == "ok" and not _ours(row, size, mtime_ns):
+            if state == "unreadable":       # never moved blind (finding 12): the copy fails
+                raise OSError(f"the old copy cannot be read; it stays: {status.planned.rel}")
+            if state == "missing":
+                return
+            if not _ours(row, size, mtime_ns):
                 self._to_versions(dest, stamp, status, log)     # changed since the check
                 return
             target = os.path.join(_trash_root(dest), stamp, status.planned.rel)
@@ -1347,6 +1411,8 @@ class MirrorJob:
     def _replace_for_good(self, dest, stamp, status, log, row):
         def before_final(_new_sha256):
             state, size, mtime_ns = _dest_stat(status.dst)
+            if state == "unreadable":       # never replaced blind (finding 12): the copy fails
+                raise OSError(f"the old copy cannot be read; it stays: {status.planned.rel}")
             if state == "ok" and _ours(row, size, mtime_ns):
                 _make_writable(status.dst)          # Windows refuses to replace a read-only file
                 log.log(f"MIRROR REPLACED {status.planned.rel} (old copy deleted)")
@@ -1355,6 +1421,45 @@ class MirrorJob:
             elif state == "ok":                     # changed since the check: not ours any more
                 self._to_versions(dest, stamp, status, log)
         return before_final
+
+    def keep_old_file(self, dest, stamp, rel, log):
+        """Where a backup file goes when a TIFF's JXL takes over (an old JXL
+        group, or a TIFF copy the JXL replaces): ours to the trash -- deleted,
+        with no trash --, anything else to versions\\, as in a normal backup.
+        A TIFF copy without a row that still has the source TIFF's size and
+        date (made by another program) is what a run adopts: ours too."""
+        path = os.path.join(dest, rel)
+        row = self.rows_by_key.get(rel.casefold())
+        if row is None and rel.casefold() in self.adoptable:
+            source_size, source_mtime_ns = self.adoptable[rel.casefold()]
+            row = SimpleNamespace(size=source_size, mtime_ns=sb._db_ns(source_mtime_ns))
+        state, size, mtime_ns = _dest_stat(path)
+        if state == "unreadable":
+            raise OSError(f"cannot be read in the backup; it stays: {rel}")
+        if state == "ok" and row is not None and _ours(row, size, mtime_ns):
+            if self.for_good:
+                _delete_file(path)
+                log.log(f"MIRROR DELETED {rel} (replaced by its JXL)")
+                self.replaced["jxl_for_good"] += 1
+                result = "deleted for good (replaced by its JXL)"
+            else:
+                target = os.path.join(_trash_root(dest), stamp, rel)
+                os.makedirs(sb._io(os.path.dirname(target)), exist_ok=True)
+                used = sb._move_aside(path, target)
+                log.log(f"MIRROR TRASH {rel} (replaced by its JXL)"
+                        + ("" if used == target else f" (kept as {os.path.basename(used)})"))
+                self.replaced["jxl_trash"] += 1
+                result = "to the trash (replaced by its JXL)"
+            self.changed_something = True
+        elif state == "ok":
+            sb._move_file_to_versions(dest, stamp, rel, log)
+            self.replaced["jxl_versions"] += 1
+            result = "to versions\\ (not written by the backup)"
+        else:
+            result = "already missing"
+        item = self.retire_items.get(rel.casefold())
+        if item is not None:
+            item.result = result
 
     # -- after the copy ------------------------------------------------------------------------
     def finish(self, log, done, done_bytes, error_count, interrupted=False):
@@ -1398,10 +1503,24 @@ class MirrorJob:
         if not_now:
             lines.append(_table_line("not removed after all (changed since the plan)",
                                      len(not_now), sum(item.size for item in not_now)))
+        info = self.convert_info or {}
+        if info.get("converted") or info.get("failed") or info.get("retired"):
+            lines.append(_table_line("TIFF converted to JXL (the TIFF's size)",
+                                     info.get("converted", 0), info.get("bytes_in", 0)))
+            lines.append(_table_line("the JXL written", info.get("converted", 0),
+                                     info.get("bytes_out", 0), indent=4))
+            for key, label in (("jxl_trash", "old copies replaced: to the trash"),
+                               ("jxl_for_good", "old copies replaced: deleted (no trash)"),
+                               ("jxl_versions", "old copies replaced: to versions\\")):
+                if self.replaced[key]:
+                    lines.append(_table_line(label, self.replaced[key], indent=4))
+            if info.get("failed"):
+                lines.append(_table_line("TIFF copied as TIFF (the conversion failed)",
+                                         info["failed"]))
         if self.purged[0] or self.purged[2]:
             lines.append(_table_line("trash deleted for good", self.purged[0], self.purged[1]))
-        lines.append(_table_line("errors", errors + self.purged[2]))
-        if (removed or self.replaced["trash"]) and not self.for_good:
+        lines.append(_table_line("errors", errors + self.purged[2] + info.get("errors", 0)))
+        if (removed or self.replaced["trash"] or self.replaced["jxl_trash"]) and not self.for_good:
             lines += ["", f"  Removed and replaced files are in this folder until {_until()};",
                       "  to get one back, copy it from there (the folders are the same as in the backup):",
                       f"    {os.path.join(_trash_root(self.dest), self.stamp)}"]
@@ -1413,7 +1532,7 @@ class MirrorJob:
         lines.append(_RULE)
         for line in lines:
             log.out(line)
-        return bool(self.errors or self.purged[2])
+        return bool(self.errors or self.purged[2] or info.get("failed") or info.get("errors"))
 
     def release(self, log):
         if self.lock_text:
@@ -1453,7 +1572,7 @@ def _run_mirror(args, backend_args, rows, modes, stamp, argv):
             log.log("modes: " + os.path.abspath(args.modes))
             for row in rows:
                 log.log(f"row {row.folder} mode {row.mode} originals {row.originals} "
-                        f"mirror {row.mirror}")
+                        f"mirror {row.mirror} tiff {row.tiff}")
         rc = None
         if args.dry_run:
             why = _live_lock(dest)      # a dry-run takes no lock, but stops while a run holds one
@@ -1656,8 +1775,8 @@ def build_parser():
                         help="also remove what came from folders that are not in this run "
                              "(a person types the number of files)")
     parser.add_argument("--allow-mass-delete", action="store_true",
-                        help="let a line remove more than MIRROR_MAX_DELETE_PERCENT of its files "
-                             "without typing the number")
+                        help="let a line remove or replace more than MIRROR_MAX_DELETE_PERCENT "
+                             "of its files without typing the number")
     parser.add_argument("--unattended", action="store_true",
                         help="nobody at the console: never ask; what needs a typed number stops "
                              "the run (implies --yes)")
@@ -1676,6 +1795,9 @@ def build_parser():
                         help="verification of each copy (default: %(default)s)")
     parser.add_argument("--space-margin-gb", type=float, default=sb.SPACE_MARGIN_GB, metavar="N",
                         help="free space kept on the destination (default: %(default)s)")
+    parser.add_argument("--jxlphoto", default=sb.JXLPHOTO, metavar="PATH",
+                        help="jxl-photo's jxl_photo.py or jxl-photo.exe, for TIFFs kept as JXL "
+                             "(a manifest's Tiff column, or --tiff; default: JXLPHOTO)")
     parser.add_argument("--expect-backup-id", default=None, metavar="ID",
                         help="abort unless the destination holds this backup ID")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -1715,6 +1837,7 @@ def main(argv=None):
             return 2
         backend_args = _manifest_backend_args(args, rows)
         errors = mb._validate_rows(backend_args, rows)
+        errors += mb._tiff_rows_errors(rows, args.jxlphoto)
     else:
         rows = modes = None
         try:

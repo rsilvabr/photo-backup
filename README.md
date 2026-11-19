@@ -4,7 +4,7 @@ You shoot 400 frames, the RAWs land in one folder, and the 30 you keep are expor
 
 A backup from the menu also keeps **Capture One itself**: the ICC profiles, film curves and styles your `.cos` edits only name, with your presets, recipes, shortcuts and workspaces. A double-click restore (no Python needed) puts them back on a new computer, so your photos open with the same look. [Details](docs/captureone.md).
 
-**Current version: v0.13.2** (2026-11-12) · [What's new](#whats-new-in-v0132) · [All releases](docs/version_history.md) · Test version: [v0.14.0-rc1](https://github.com/rsilvabr/photo-backup/releases/tag/v0.14.0-rc1), the mirror ([what's new](docs/whats_new.md#v0140-rc1-test-version-not-released-yet))
+**Current version: v0.13.2** (2026-11-12) · [What's new](#whats-new-in-v0132) · [All releases](docs/version_history.md) · Test version: [v0.14.0-rc2](https://github.com/rsilvabr/photo-backup/releases/tag/v0.14.0-rc2), the mirror and TIFF kept as JXL ([what's new](docs/whats_new.md#v0140-rc2-test-version-not-released-yet))
 
 **Windows program, no Python needed:** [photo-backup-exe](https://github.com/rsilvabr/photo-backup-exe/releases/latest) — unzip and double-click.
 
@@ -74,6 +74,7 @@ A `--dry-run` on one of your folders shows what it would take before anything is
 - **Different rules per folder, in one run**: a manifest gives each folder its own mode, and `--analyze` shows how many TB each mode would take first ([modes](docs/per_folder_modes.md)).
 - **Never loses anything**: the source is read-only, nothing on the destination is deleted or overwritten in place (the mirror aside), and each copy goes to a temp file, is verified, then renamed ([safety](docs/safety.md)).
 - **A mirror when you want one**: `mirror_backup.py` makes the backup follow a manifest — what is gone from the source leaves the backup too, kept 30 days in a trash first ([mirror](docs/mirror.md)).
+- **TIFF on the computer, JPEG XL in the backup**: a developed TIFF or a film scan can be kept as JXL, made by [jxl-photo](https://github.com/rsilvabr/jxl-photo) and proven to come from that TIFF; the restore gives the TIFF back. A 218 MB NX Studio TIFF took 34 MB; scans, lossless, the same pixels ([TIFF as JXL](docs/tiff_to_jxl.md)).
 - **Checks the space before the first byte**: a run that does not fit stops before copying anything.
 - **Verify any day later**: the SHA-256 recorded at copy time tells a damaged backup copy from an original that changed without changing its date (bit rot); `--max-gb` checks a big backup over several nights ([verify](docs/verifying.md)).
 - **Renamed folders are moved, not copied again**, once SHA-256 confirms the content; files whose original is gone are listed as orphans ([moves](docs/reruns_and_moves.md#moved-and-renamed-folders)).
@@ -185,7 +186,7 @@ One line each; every rule in full: [docs/safety.md](docs/safety.md).
 
 - **The source is read-only.** Nothing under a `--source` is opened for writing, renamed, deleted, touched or changed.
 - **Nothing on the destination is ever deleted** — except by the mirror (`mirror_backup.py`): only what it wrote itself, and through a trash. A file whose source changed is reported; with `--update-changed` the old copy is moved to the versions folder first, never overwritten in place.
-- **Fail closed.** Not enough space, a missing drive, a damaged catalog, a destination inside a source (also through a junction or a `subst` letter): the run stops before the first byte is copied, exit 2.
+- **Fail closed.** Not enough space, a missing drive, a damaged catalog, a destination inside a source (also through a junction or a `subst` letter), a junction inside the backup: the run stops before the first byte is copied, exit 2.
 - **Nothing is skipped silently.** Every file under a source is in the plan or counted in the summary's `Not copied:`; a folder or file that cannot be read makes the run exit 1.
 - **A copy is never half a file.** It is written to a temp file, verified and put on the disk, and only then given its final name.
 - **A source that cannot be read is not a source that is gone.** Only proof that it does not exist makes a backup file an orphan.
@@ -201,6 +202,7 @@ One line each; the detail is behind each link.
 - **Orphans are only reported** (`_orphans.csv`); `--move-orphans` parks those whose original is proven gone in `_photo_backup\orphans\`. The versions and orphans folders only grow: delete them yourself when you need the space. [More](docs/reruns_and_moves.md#orphans)
 - **The check right after each copy reads from Windows' cache**, not from the disk: the real check of the media is a `--verify full` after the backup disk was reconnected or the computer restarted. [More](docs/verifying.md#the-check-right-after-each-copy)
 - **A damaged catalog** stops every run (exit 2): move `_photo_backup\catalog.sqlite` aside and run the backup again; nothing is copied twice. [More](docs/verifying.md#a-damaged-catalog)
+- **A TIFF kept as JXL needs jxl-photo to come back as a TIFF**; the backup keeps a copy of jxl-photo and of photo-backup in `_photo_backup\tools\`, and `--keep-jxl` gives the JXL as it is. [More](docs/tiff_to_jxl.md#restoring)
 - **Each backup knows which disk it is**: a preset finds it again when the drive letter changed, and `--expect-backup-id` refuses the wrong disk. [More](docs/verifying.md#which-disk-is-this-backup-id)
 - **The command-line scripts do not keep Capture One's own files**; the menu does. From the command line, also run `captureone_backup.py --dest`. [More](docs/captureone.md)
 - **A folder skipped by its name** (`$RECYCLE.BIN`, `System Volume Information`, `--exclude-folders`) is not read, so it is named in the summary, not counted file by file. [More](docs/safety.md)
@@ -217,6 +219,7 @@ One line each; the detail is behind each link.
 | [docs/how_it_selects.md](docs/how_it_selects.md) | How a session is read, how an export finds its originals, export formats, what happens to the rest |
 | [docs/per_folder_modes.md](docs/per_folder_modes.md) | `manifest_backup.py`: the manifest, the modes table column by column, the shipped modes, `--analyze` |
 | [docs/mirror.md](docs/mirror.md) | `mirror_backup.py`: getting a file back, the two modes, what leaves the backup and what never does, the trash, the locks |
+| [docs/tiff_to_jxl.md](docs/tiff_to_jxl.md) | A TIFF or a scan kept as JXL in the backup: profiles, the proof, the restore, moving from FreeFileSync, the programs kept in the backup |
 | [docs/menu.md](docs/menu.md) | The interactive menu item by item, unattended runs, running after jxl-photo, the menu's settings |
 | [docs/commands_and_settings.md](docs/commands_and_settings.md) | Every option and setting of `selective_backup.py`, the logs and CSVs, exit codes |
 | [docs/safety.md](docs/safety.md) | Every safety guarantee in full |

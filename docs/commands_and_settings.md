@@ -49,6 +49,8 @@ selective_backup.py --source PATH [--source PATH ...] --dest PATH [options]
 | `--no-auto-update` | do not update changed edit settings/sidecars (`AUTO_UPDATE_EXTENSIONS`) unless `--update-changed` is given |
 | `--no-detect-moves` | copy a moved/renamed file again instead of moving its backup copy |
 | `--move-orphans` | move backup files whose source is proven gone into `_photo_backup\orphans\<stamp>` (real copies only; nothing in a run with an error in its plan, or one the destination stopped; see [Orphans](reruns_and_moves.md#orphans)) |
+| `--tiff {copy,PROFILE}` | the TIFFs outside export folders: copied as they are (`copy`, default) or kept as JXL with a profile of `TIFF_JXL_PROFILES`, made by jxl-photo *(v0.14.0-rc2; [TIFF kept as JXL](tiff_to_jxl.md))* |
+| `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, for `--tiff` (default `JXLPHOTO`). A profile without jxl-photo is refused before anything is read, exit 2 |
 | `--expect-backup-id ID` | abort (exit 2) unless the destination holds this backup ID; also applies to `--verify` and `--dry-run` |
 | `--space-margin-gb N` | free space kept on the destination, in GB (default `20.0`) |
 | `--dry-run` | plan, print the summary and write the logs/CSVs; copy nothing |
@@ -117,6 +119,22 @@ default everywhere — the menu reads them from there too.
 | `SUMMARY_FOLDER_LINES` | `25` | lines of the per-folder table in the summary (the CSV has all) |
 | `SUMMARY_INSIDE_NAMES` | `5` | subfolder names shown under "inside sessions" in the summary (`_inside.csv` has all) |
 | `LOG_DIR` | `$PHOTOBACKUP_LOG_DIR` or `Logs\` next to the script | where the logs are written |
+
+TIFF kept as JXL in the backup, and the programs kept in it *(v0.14.0-rc2;
+every detail in [tiff_to_jxl.md](tiff_to_jxl.md#options-and-settings))*:
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `JXLPHOTO` | `""` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe` (default `--jxlphoto`); `""` = no conversion |
+| `TIFF_JXL_PROFILES` | `{"jxl": {"distance": 0.05, "scan_distance": 0, "eight_bit_distance": 0}}` | the profiles a manifest's `Tiff` column (or `--tiff`) names; jxl-photo picks the distance per TIFF (0 = lossless) |
+| `TIFF_EXTENSIONS` | `.tif`, `.tiff` | what a profile converts (never in an export folder) |
+| `TIFF_JXL_EFFORT` | `7` | jxl-photo's `--effort` |
+| `TIFF_JXL_WORKERS` | `4` | TIFFs converted at the same time |
+| `TIFF_JXL_TIMEOUT_MIN` | `30` | a conversion longer than this is given up: the TIFF is copied as it is |
+| `TIFF_JXL_FOLDER` | `converting` | under `CATALOG_FOLDER`: the conversions' own folders (emptied by each run) |
+| `KEEP_TOOLS_IN_BACKUP` | `True` | every real run keeps photo-backup and jxl-photo in the backup, one folder per version |
+| `KEEP_TOOLS_EXTRA` | `()` | more files or folders kept there (the `.zip` of photo-backup-exe, say) |
+| `TOOLS_FOLDER` | `tools` | under `CATALOG_FOLDER`: where they are kept, with `HOW TO RESTORE.txt` |
 
 The settings of the other scripts: the menu ([menu.md](menu.md#settings-of-the-menu)),
 `manifest_backup.py` ([per_folder_modes.md](per_folder_modes.md#settings)),

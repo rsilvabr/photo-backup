@@ -33,8 +33,14 @@ added the newer parts. The restore has its own guarantees
   it really is, through a junction, a symbolic link or a `subst` letter
   *(v0.13.2)* —, a plan that would write into the backup's own `_photo_backup`
   folder (a backup copied with its root as `--base`, *v0.13.1*), a
-  `--space-margin-gb` that is not a number or is negative *(v0.13.2)*: the
-  tool aborts BEFORE the first byte is copied, exit code 2.
+  `--space-margin-gb` that is not a number or is negative *(v0.13.2)*, a link,
+  a junction or another reparse point inside the backup on the way to one of
+  its files — it could lead into a source, and nothing is written, moved or
+  deleted through one *(v0.14.0-rc2)* —, a `Tiff` profile without jxl-photo
+  or with a distance that is not a number of 0 or more *(v0.14.0-rc2)*: the
+  tool aborts BEFORE the first byte is copied, exit code 2. Nothing to copy
+  needs no space: a full disk never stops a run with nothing new
+  *(v0.14.0-rc2)*.
 - **Nothing is skipped silently.** A folder or file that cannot be read is
   logged, counted on the console (`Errors: N ... NOT backed up`) and makes the
   run exit 1 — a dry-run too. Every file under a source is either in the plan
@@ -59,7 +65,24 @@ added the newer parts. The restore has its own guarantees
   listed. Access denied, a drive that is not connected, a share that does not
   answer: `source_unreadable`, never moved by `--move-orphans` or by the move
   detection. A file of another source (a second drive with the same folder
-  names) is `other_source`. A run with read errors moves no orphan at all.
+  names) is `other_source`. A run with read errors moves no orphan at all. The
+  folders above are asked about themselves, never where a link leads: behind a
+  junction whose target is not connected, a file is `source_unreadable`,
+  never "gone" *(v0.14.0-rc2)*.
+- **A folder left empty is removed; a link or a junction never is**
+  *(v0.14.0-rc2)*: Windows takes a junction away with `rmdir` even when what it
+  leads to is full, so a folder that is a link or a reparse point stops the
+  clean-up there.
+- **A TIFF kept as JXL is the one copy that is not byte for byte**
+  *(v0.14.0-rc2)*, and only in a line whose `Tiff` column (or `--tiff`) names
+  a profile. Each JXL is kept only with proof: jxl-photo checked its own
+  round trip, the JXL's `jxlphoto-srcsum` mark is the SHA-256 photo-backup
+  took of the TIFF, a multipage TIFF came back whole, and the TIFF did not
+  change meanwhile. Anything else copies the TIFF as it is (exit 1): nothing is
+  ever left without a copy. A TIFF copy already in the backup leaves only
+  after its JXL is in the backup and in the catalog, to `versions\` (the
+  mirror: its trash). An export is never converted
+  ([tiff_to_jxl.md](tiff_to_jxl.md)).
 - A copy is written to a temp file next to its final name, verified, then
   `os.replace`d — a crash never leaves a half file under the final name.
 - **A destination that stops taking writes stops the backup** *(v0.12.1)*.
@@ -103,6 +126,16 @@ exception to "nothing on the destination is ever deleted". Every rule in full:
 - **Typed numbers:** a line over `MIRROR_MAX_DELETE_PERCENT`, a total mirror,
   deleting for good to make room and emptying the trash need the number of
   files typed; anything else cancels and changes nothing. `--unattended`
-  never asks: those cases stop the run (exit 2), nothing changed.
+  never asks: those cases stop the run (exit 2), nothing changed. The limit
+  counts what a line removes **and** what of ours it replaces (a program that
+  rewrites every file in place — ransomware — sends every old copy to the
+  trash too), leaving out the edit files every edit rewrites
+  (`AUTO_UPDATE_EXTENSIONS`) *(v0.14.0-rc2)*.
+- **The question is the real run's** *(v0.14.0-rc2)*: the menu runs the
+  mirror once, without `--yes`, and the mirror asks right below its own box,
+  with the numbers of the run that changes the backup — never a dry-run's
+  answer carried over to a later run.
+- **An old copy that cannot be read is never replaced nor moved**
+  *(v0.14.0-rc2)*: the copy of the new one fails instead, and the old one stays.
 - **One run at a time** (`_photo_backup\mirror.lock`); a folder is removed only
   when its removal left it empty, never inside `_photo_backup`.

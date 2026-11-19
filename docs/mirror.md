@@ -114,7 +114,7 @@ The backup's usual summary comes first; the mirror's own box comes last, so it
 is on the screen when the question is asked. Its first lines say what matters:
 
 ```
-== mirror_backup 0.14.0-rc1 ====================================================
+== mirror_backup 0.14.0-rc2 ====================================================
  MIRROR (scoped) - what changes in H:\BACKUP
  1,204 files (34.1 GB) will be removed from the backup: to the trash until
  2026-12-19.
@@ -151,7 +151,7 @@ Anything that needs attention follows in its own lines marked `!!` (the trash
 cannot be used, read errors, a line over the limit, a total mirror). After the
 run, a box of the same shape says what **happened**, with the trash folder of
 the run again. Every box carries the program and its version in its top border
-(`== mirror_backup 0.14.0-rc1 ===`), as the summary's first line and the
+(`== mirror_backup 0.14.0-rc2 ===`), as the summary's first line and the
 console's title do. A run that stops says so in a box of its own:
 `MIRROR STOPPED - nothing changed in H:\BACKUP`, why, and what to do.
 
@@ -160,8 +160,9 @@ console's title do. A run that stops says so in a box of its own:
 - **Where:** `<backup>\_photo_backup\trash\<run>\`, one folder per run (its
   name is the time the run started, `YYMMDD_HHMMSS`), with the same folders
   as the backup inside.
-- **How long:** `MIRROR_KEEP_DAYS` (30) days. The next real mirror after that
-  date deletes the run's folder for good, also unattended. With
+- **How long:** `MIRROR_KEEP_DAYS` (30) days. The first real mirror on or
+  after that day — the day the screen shows, at any hour *(v0.14.0-rc2)* —
+  deletes the run's folder for good, also unattended. With
   `MIRROR_KEEP_DAYS = 0` nothing goes to the trash (what leaves is deleted at
   once), and the next run also empties the trash that is there.
 - **Look:** `--show-trash` (`[8]` → `[3]`): every run, newest first, with its
@@ -172,18 +173,27 @@ console's title do. A run that stops says so in a box of its own:
   type the number of files. Never with `--unattended`.
 - Only folders named like a run are ever deleted, each only by its real path:
   a folder of another name in the trash is listed and never touched, and a
-  link or junction inside is left where it is. If `_photo_backup` or the trash
-  is itself a link or junction, the mirror changes nothing (exit 2).
+  link or junction inside is left where it is (and is not an error of every
+  later run, *v0.14.0-rc2*). If `_photo_backup` or the trash is itself a link
+  or junction, the mirror changes nothing (exit 2), and so does any other link
+  or junction inside the backup on the way to its files *(v0.14.0-rc2)*.
+- **Ctrl+C** while files are removed or the trash is emptied still ends with
+  the box (`MIRROR INTERRUPTED`) and the list of what was done to each file
+  *(v0.14.0-rc2)*.
 
 ## Locks
 
-- **The limit per line:** a line that would remove more than
+- **The limit per line:** a line that would remove or replace more than
   `MIRROR_MAX_DELETE_PERCENT` (20) % of its files in the backup, and at least
   `MIRROR_MAX_DELETE_MIN` (5) files, changes nothing until a person types the
-  number of files. The usual causes: the folder was deleted or moved on the
-  source, another disk got the source's drive letter, or the line's mode was
-  lowered. `--allow-mass-delete` lets it through without the question (from
-  the command line only; a preset never saves it).
+  number of files. A replaced file counts when its old copy is ours (it goes
+  to the trash too); the edit files every edit rewrites
+  (`AUTO_UPDATE_EXTENSIONS`: `.xmp`, `.cos`, ...) do not *(v0.14.0-rc2)*. The
+  usual causes: the folder was deleted or moved on the source, another disk
+  got the source's drive letter, the line's mode was lowered, or a program
+  rewrote the files (ransomware encrypts them in place).
+  `--allow-mass-delete` lets it through without the question (from the
+  command line only; a preset never saves it).
 - **Typing the number** is the confirmation of everything that cannot be
   undone or is unusual: the number of files changes every time, so it cannot
   be typed from habit, and reading it is reading how much is at stake. Enter,
@@ -207,9 +217,12 @@ options that make it fit, the one that deletes the least first:
 ```
 
 The other options are *what this run removes, without the trash* and *the
-whole trash + this run, without the trash* (when nothing smaller fits). The
-oldest trash comes first: what left the backup today is the likeliest to be a
-mistake nobody has noticed yet. You choose a number (Enter cancels), then type
+whole trash + this run, without the trash* (when nothing smaller fits). They
+are in the order of what they delete, the least first *(v0.14.0-rc2: in rc1 the
+trash came first even when this run deleted less)*; between two of the same
+size, the oldest trash: what left the backup today is the likeliest to be a
+mistake nobody has noticed yet. A run with nothing to copy never asks: it
+needs no space *(v0.14.0-rc2)*. You choose a number (Enter cancels), then type
 the number of files. Unattended, the mirror stops instead and says how much
 each option would free. `_free_space.csv` lists every file of every option.
 
@@ -226,14 +239,15 @@ mirror of its manifest with `--unattended` ([menu.md](menu.md#unattended-runs-ta
 
 | Option | Description |
 |---|---|
-| `--manifest PATH` | the manifest (`Folder,Mode,Originals,Mirror`) |
+| `--manifest PATH` | the manifest (`Folder,Mode,Originals,Mirror,Tiff`; `Tiff` keeps that line's TIFFs as JXL, [tiff_to_jxl.md](tiff_to_jxl.md)) |
 | `--source PATH` | without a manifest: a folder to mirror (repeatable). Every selection option of `selective_backup.py` works too (`--unselected`, `--unexported`, `--c1-cache`, `--exclude-folders`, ...) |
 | `--dest PATH` | the backup; required |
 | `--modes PATH` | the modes table (default `backup_modes.csv` beside the scripts) |
 | `--base PATH` | with `--source`: the base of the layout (default: the drive root) |
 | `--mirror {disk,selection}` | with `--source`: what "gone" means for the whole run (default `disk`) |
 | `--total` | also remove what came from folders that are not in this run (typed confirmation) |
-| `--allow-mass-delete` | let a line remove more than `MIRROR_MAX_DELETE_PERCENT` of its files without typing the number |
+| `--allow-mass-delete` | let a line remove or replace more than `MIRROR_MAX_DELETE_PERCENT` of its files without typing the number |
+| `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, for the lines whose `Tiff` column names a profile (default `JXLPHOTO`) *(v0.14.0-rc2)* |
 | `--unattended` | nobody at the console: never ask; what needs a typed number stops the run (implies `--yes`) |
 | `--show-trash` | list what is in the trash of `--dest` and how to get it back; changes nothing |
 | `--empty-trash` | delete the trash of `--dest` for good, after the typed number of files |
