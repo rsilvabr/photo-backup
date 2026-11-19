@@ -19,7 +19,8 @@ import photo_backup as menu
 import restore_backup as rb
 import selective_backup as sb
 
-from conftest import argv_for, dest_files, latest_csv, latest_log, make_tree, parse_args
+from conftest import (argv_for, dest_files, latest_csv, latest_log, make_tree, parse_args,
+                      row_count)
 
 SHIPPED_MODES = Path(__file__).resolve().parents[1] / "backup_modes.csv"
 COPY_ALL = ("--unexported", "copy")
@@ -194,7 +195,7 @@ def test_n3_an_odd_date_does_not_stop_the_backup(tmp_path, capsys, photobackup_l
     assert copy.stat().st_mtime_ns == stamp
     capsys.readouterr()
     assert sb.main(argv_for(source, dest, tmp_path, "--yes")) == 0
-    assert "NEW 0 files" in capsys.readouterr().out
+    assert row_count(capsys.readouterr().out, "copy (new)") == "0"
     assert sb.main(argv_for(source, dest, tmp_path, "--verify", "full")) == 0
     assert sb.main(argv_for(source, dest, tmp_path, "--verify", "quick")) == 0
 
@@ -231,8 +232,8 @@ def test_n4_the_dry_run_counts_what_the_copy_replaces(tmp_path, capsys):
     capsys.readouterr()
     assert sb.main(menu.build_argv(session, "dry-run") + base) == 0
     dry = capsys.readouterr().out
-    assert "CHANGED 1" in dry and "(nothing to copy)" not in dry
-    assert "export 1 /" in dry
+    assert row_count(dry, "replace (changed; the old copy to versions\\)") == "1"
+    assert row_count(dry, "exports") == "1"
 
 
 # ---- N9: a plan that would write into the backup's own folder --------------------------------
@@ -335,7 +336,8 @@ def test_n24_going_on_after_a_damaged_catalog(tmp_path, capsys, photobackup_log_
     capsys.readouterr()
     assert sb.main(argv_for(source, dest, tmp_path, *COPY_ALL, "--yes")) == 0
     out = capsys.readouterr().out
-    assert "NEW 0 files" in out and "UP_TO_DATE 400" in out and "copied 0 files" in out
+    assert row_count(out, "copy (new)") == "0" and row_count(out, "already the same") == "400"
+    assert "copied 0 files" in out
     assert sb.read_backup_id(str(dest)) == backup_id
     rows = catalog_rows(dest)
     assert len(rows) == 400 and not any(row.sha256 for row in rows.values())

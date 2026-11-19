@@ -91,6 +91,19 @@ def dest_files(dest):
     return result
 
 
+def row_count(text, label):
+    """The count column of the summary's row that starts with `label` (the
+    tables of v0.14.0-rc4: label | files | size): '4', '2 folders', or None."""
+    import re
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(label):
+            match = re.match(r"\s+([\d,]+(?: folders)?)", stripped[len(label):])
+            if match:
+                return match.group(1)
+    return None
+
+
 def latest_log(log_dir):
     files = sorted(Path(log_dir).glob("*.log"), key=lambda path: path.stat().st_mtime_ns)
     assert files, f"no log file in {log_dir}"

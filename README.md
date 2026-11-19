@@ -200,7 +200,7 @@ One line each; every rule in full: [docs/safety.md](docs/safety.md).
 - **The source is read-only.** Nothing under a `--source` is opened for writing, renamed, deleted, touched or changed.
 - **Nothing on the destination is ever deleted** — except by the mirror (`mirror_backup.py`): only what it wrote itself, and through a trash. A file whose source changed is reported; with `--update-changed` the old copy is moved to the versions folder first, never overwritten in place.
 - **Fail closed.** Not enough space, a missing drive, a damaged catalog, a destination inside a source (also through a junction or a `subst` letter), a junction inside the backup: the run stops before the first byte is copied, exit 2.
-- **Nothing is skipped silently.** Every file under a source is in the plan or counted in the summary's `Not copied:`; a folder or file that cannot be read makes the run exit 1.
+- **Nothing is skipped silently.** Every file under a source is in the plan or counted in the summary's `Not copied` table; a folder or file that cannot be read makes the run exit 1.
 - **A copy is never half a file.** It is written to a temp file, verified and put on the disk, and only then given its final name.
 - **A source that cannot be read is not a source that is gone.** Only proof that it does not exist makes a backup file an orphan.
 - **The restore never writes to the backup**, and never replaces a file that is already there.

@@ -530,11 +530,29 @@ def _parse_formats(spec):
 
 
 def _gb(n):
-    return f"{n / 1e9:.1f} GB"
+    """'654.9 GB'; from 1,000 GB on '1.38 TB' (v0.14.0-rc4: easier to read)."""
+    return f"{n / 1e12:.2f} TB" if n >= 1e12 else f"{n / 1e9:.1f} GB"
 
 
 def _num(n):
-    return str(n)
+    """'419,711': a count a person reads (v0.14.0-rc4)."""
+    return f"{n:,}" if isinstance(n, int) else str(n)
+
+
+SUMMARY_LABEL_WIDTH = 53                # the label column of the summary's tables
+
+
+def _summary_row(label, files=None, size=None, rest=""):
+    """A line of a summary table: label | files | size, then `rest`. `files` is
+    a count or a short text ('2 folders')."""
+    count = "" if files is None else (_num(files) if isinstance(files, int) else str(files))
+    amount = "" if size is None else _gb(size)
+    line = f"  {label:<{SUMMARY_LABEL_WIDTH}} {count:>9} {amount:>10}".rstrip()
+    return f"{line}   {rest}" if rest else line
+
+
+def _summary_header(title):
+    return f"{title:<{SUMMARY_LABEL_WIDTH + 2}} {'files':>9} {'size':>10}"
 
 
 def _hms(seconds):
@@ -3029,9 +3047,7 @@ def _inside_name_lines(inside):
         entry[2] += nbytes
     biggest = sorted(groups.values(), key=lambda item: (-item[2], item[0].casefold()))
     biggest = biggest[:SUMMARY_INSIDE_NAMES]
-    width = min(40, max([12] + [len(name) for name, _count, _nbytes in biggest]))
-    return [f"      {name:<{width}} {_num(count):>8} files {_gb(nbytes):>12}"
-            for name, count, nbytes in biggest]
+    return [_summary_row(f"    {name}", count, nbytes) for name, count, nbytes in biggest]
 
 
 def _orphan_csv_rows(orphans):
@@ -4153,17 +4169,37 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_cop
     return done, done_bytes, error_count, False
 
 
+_CATEGORY_LABELS = {
+    CAT_EXPORT: "exports",
+    CAT_SOURCE: "originals of the exported photos",
+    CAT_ADDED: "files of added folders (AddFolders)",
+    CAT_WHOLE: "whole folders (AddWhole, Whole)",
+    CAT_CAPTURE_ONE: "Capture One settings",
+    CAT_NX_STUDIO: "NX Studio settings (NKSC_PARAM)",
+    CAT_UNSELECTED: "unselected originals (--unselected)",
+    CAT_UNEXPORTED: "folders not exported yet, copied whole",
+}
+
+
 def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_paths,
-                   dest_error=None, extra_lines=(), freed=0, catalog_note=""):
+                   dest_error=None, extra_lines=(), freed=0, catalog_note="", orphan_lines=(),
+                   lists=()):
+    """The summary a person reads before the question (v0.14.0-rc4, PENDENCIAS
+    of 16/11: tables of label | files | size, one fact per line, counts with
+    separators, TB from 1,000 GB on, the lists named once at the end, the space
+    last). `extra_lines`: more rows of "This run"; `orphan_lines`: rows of the
+    orphans' block; `lists`: (file name, what it holds) of the CSVs."""
     new = [status for status in statuses if status.status == ST_NEW]
     changed = [status for status in statuses if status.status == ST_CHANGED]
     auto = [status for status in changed if _auto_updated(status, args)]
-    auto_note = f" ({_num(len(auto))} edit settings/sidecars auto-updated)" if auto else ""
     up_to_date = [status for status in statuses if status.status == ST_UP_TO_DATE]
-    lines = [
-        _program_name(),
-        "Sources:      " + ", ".join(os.path.abspath(source) for source in args.source),
-    ]
+    sources = [os.path.abspath(source) for source in args.source]
+    if len(sources) <= 3:
+        source_text = ", ".join(sources)
+    else:
+        source_text = (f"{_num(len(sources))} folders: {sources[0]}, {sources[1]}, ... "
+                       f"{sources[-1]}")
+    lines = [_program_name()]
     bases = {base for _, base in planned.sources}
     suffix = f"   (base {', '.join(sorted(bases))})" if bases else ""
     dest = os.path.abspath(args.dest)
@@ -4177,69 +4213,88 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
     lines.append(f"Destination:  {dest}{suffix}{id_note}")
     if catalog_note:
         lines.append(f"              catalog {catalog_note}")
+    lines.append(f"Sources:      {source_text}")
     lines.append(f"Sessions: {_num(planned.stats.shoots)}   "
                  f"export folders: {_num(planned.stats.export_folders)}   "
                  f"export formats: {args.export_formats}")
-    lines.append(f"Plan:  NEW {_num(len(new))} files {_gb(sum(s.planned.size for s in new))} "
-                 f"| CHANGED {_num(len(changed))}{auto_note} | UP_TO_DATE {_num(len(up_to_date))}")
-    categories = [CAT_EXPORT, CAT_SOURCE, CAT_ADDED, CAT_WHOLE, CAT_CAPTURE_ONE,
-                  CAT_NX_STUDIO, CAT_UNSELECTED, CAT_UNEXPORTED]
+    lines.append("")
+    lines.append(_summary_header("This run"))
+    lines.append(_summary_row("copy (new)", len(new), sum(s.planned.size for s in new)))
     to_copy = [status for status in statuses if _will_copy(status, args)]
-    parts = []
-    for category in categories:
+    for category, label in _CATEGORY_LABELS.items():
         selected = [status for status in to_copy if status.planned.category == category]
         if selected:
-            parts.append(f"{category} {_num(len(selected))} / "
-                         f"{_gb(sum(s.planned.size for s in selected))}")
-    lines.append("  " + "   ".join(parts) if parts else "  (nothing to copy)")
+            lines.append(_summary_row(f"  {label}", len(selected),
+                                      sum(s.planned.size for s in selected)))
+    lines.append(_summary_row(
+        "replace (changed; the old copy to versions\\)", len(changed),
+        sum(s.planned.size for s in changed) if changed else None,
+        f"{_num(len(auto))} of them edit settings/sidecars, updated by themselves" if auto
+        else ""))
+    lines.append(_summary_row("already the same", len(up_to_date)))
     lines.extend(extra_lines)
-    lines.append("Not copied:")
-    lines.append(f"  export files filtered (formats / excluded subfolders): "
-                 f"{_num(planned.stats.export_filtered + planned.stats.export_excluded)} / "
-                 f"{_gb(planned.stats.export_filtered_bytes + planned.stats.export_excluded_bytes)}")
-    cache_links = (f" (+ {_num(len(planned.cache_links))} cache folders that are links to "
-                   f"another place, not followed)" if planned.cache_links else "")
-    lines.append(f"  unselected originals: {_num(planned.stats.unselected_skipped)} / "
-                 f"{_gb(planned.stats.unselected_skipped_bytes)}      "
-                 f"Capture One cache: {_gb(planned.stats.c1_cache_skipped_bytes)}{cache_links}")
+    if orphan_lines:
+        lines.append("")
+        lines.append(_summary_header("In the backup, not on the source (orphans)"))
+        lines.extend(orphan_lines)
+    lines.append("")
+    lines.append(_summary_header("Not copied"))
+    lines.append(_summary_row("export files filtered (formats / excluded subfolders)",
+                              planned.stats.export_filtered + planned.stats.export_excluded,
+                              planned.stats.export_filtered_bytes
+                              + planned.stats.export_excluded_bytes))
+    lines.append(_summary_row("unselected originals", planned.stats.unselected_skipped,
+                              planned.stats.unselected_skipped_bytes))
+    lines.append(_summary_row("Capture One cache", None, planned.stats.c1_cache_skipped_bytes))
+    if planned.cache_links:
+        lines.append(f"    + {_num(len(planned.cache_links))} cache folders that are links to "
+                     f"another place (not followed)")
     if planned.stats.add_filtered_skipped:
-        lines.append(f"  left out inside added folders (Originals filter): "
-                     f"{_num(planned.stats.add_filtered_skipped)} / "
-                     f"{_gb(planned.stats.add_filtered_skipped_bytes)}")
+        lines.append(_summary_row("left out inside added folders (Originals filter)",
+                                  planned.stats.add_filtered_skipped,
+                                  planned.stats.add_filtered_skipped_bytes))
     if planned.stats.mode_excluded:
-        lines.append(f"  excluded by the mode (Exclude): {_num(planned.stats.mode_excluded)} / "
-                     f"{_gb(planned.stats.mode_excluded_bytes)}")
+        lines.append(_summary_row("excluded by the mode (Exclude)", planned.stats.mode_excluded,
+                                  planned.stats.mode_excluded_bytes))
     if planned.stats.derivatives_skipped:
-        lines.append(f"  jxl-photo derivatives (their master is copied; --derivatives copies them): "
-                     f"{_num(planned.stats.derivatives_skipped)} / "
-                     f"{_gb(planned.stats.derivatives_skipped_bytes)}")
+        lines.append(_summary_row("jxl-photo derivatives (their master is copied)",
+                                  planned.stats.derivatives_skipped,
+                                  planned.stats.derivatives_skipped_bytes,
+                                  "--derivatives copies them"))
     if planned.stats.manifest_skip_folders:
-        lines.append(f"  folders the manifest leaves out (Skip): "
-                     f"{_num(planned.stats.manifest_skip_folders)} folders / "
-                     f"{_num(planned.stats.manifest_skip_files)} files / "
-                     f"{_gb(planned.stats.manifest_skip_bytes)}")
+        lines.append(_summary_row("folders the manifest leaves out (Skip)",
+                                  planned.stats.manifest_skip_files,
+                                  planned.stats.manifest_skip_bytes,
+                                  f"in {_num(planned.stats.manifest_skip_folders)} folders"))
     if planned.stats.only_filtered:
-        lines.append(f"  left out by a mode's Only filter: {_num(planned.stats.only_filtered)} / "
-                     f"{_gb(planned.stats.only_filtered_bytes)}")
-    inside_csv = f"   -> {log_paths['inside']}" if planned.inside else ""
-    lines.append(f"  inside sessions (subfolders the mode leaves out): "
-                 f"{_num(planned.stats.inside_shoot_skipped)} / "
-                 f"{_gb(planned.stats.inside_shoot_skipped_bytes)}{inside_csv}")
+        lines.append(_summary_row("left out by a mode's Only filter", planned.stats.only_filtered,
+                                  planned.stats.only_filtered_bytes))
+    lines.append(_summary_row("inside sessions (subfolders the mode leaves out)",
+                              planned.stats.inside_shoot_skipped,
+                              planned.stats.inside_shoot_skipped_bytes))
     lines.extend(_inside_name_lines(planned.inside))
     not_copied = [folder for folder in planned.unexported_folders if not folder.copied]
     unexported_bytes = sum(folder.nbytes + folder.c1_nbytes + folder.nx_nbytes
                            for folder in not_copied)
-    lines.append(f"  folders without export: {_num(len(not_copied))} folders / "
-                 f"{_gb(unexported_bytes)}   -> {log_paths['unexported']}")
+    lines.append(_summary_row("folders without export", f"{_num(len(not_copied))} folders",
+                              unexported_bytes))
     sessions = {session for session, _ in planned.unmatched}
-    lines.append(f"  exports without a matching original: {_num(len(planned.unmatched))} files "
-                 f"in {_num(len(sessions))} sessions -> {log_paths['unmatched']}")
+    lines.append(_summary_row("exports without a matching original", len(planned.unmatched),
+                              None, f"in {_num(len(sessions))} sessions"))
     if planned.links:
-        lines.append(f"  links/junctions not followed: {_num(len(planned.links))} "
-                     f"-> {log_paths['log']}")
+        lines.append(_summary_row("links/junctions not followed", len(planned.links), None,
+                                  "listed in the log"))
     if planned.skipped_folders:
-        lines.append(f"  folders skipped by name (system / --exclude-folders): "
-                     f"{_num(len(planned.skipped_folders))} -> {log_paths['log']}")
+        lines.append(_summary_row("folders skipped by name (system / --exclude-folders)",
+                                  f"{_num(len(planned.skipped_folders))} folders", None,
+                                  "listed in the log"))
+    if lists:
+        folder = os.path.normpath(os.path.dirname(log_paths["log"]))
+        lines.append("")
+        lines.append(f"The lists, in {folder}:")
+        width = max(len(name) for name, _what in lists)
+        lines.extend(f"  {name:<{width}}   {what}" for name, what in lists)
+    lines.append("")
     if planned.errors:
         lines.append(f"Errors: {_num(len(planned.errors))} folders/files could not be read "
                      f"(NOT backed up) -> {log_paths['log']}")
@@ -4364,20 +4419,13 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                                        orphan_states)
                          if rows else [])
     extra_lines = []
-    folder_rows = _folder_rows(to_copy)
-    if len(folder_rows) >= 2:
-        extra_lines.append("  to copy by folder (cumulative):")
-        folder_lines, more = _folder_summary_lines(folder_rows)
-        extra_lines.extend(folder_lines)
-        if more:
-            extra_lines.append(f"    ... {more} more -> {log_paths['by_folder_csv']}")
+    lists = [(os.path.basename(log_paths["plan"]), "every planned file and what happens to it")]
     possible = [status for status, _matches in candidates.values()]
     if possible:
-        extra_lines.append(
-            f"  possible moves: {_num(len(possible))} files / "
-            f"{_gb(sum(status.planned.size for status in possible))} "
-            f"(same name and size as backup files whose source is gone; "
-            f"confirmed by hash before moving)")
+        extra_lines.append(_summary_row(
+            "possible moves (each checked by its hash first)", len(possible),
+            sum(status.planned.size for status in possible),
+            "same name and size as a backup file whose source is gone"))
     converts = [status for status in statuses if status.planned.convert]
     for kind, label, matches in (
             ("TIFF", None, lambda status: status.planned.convert != JPEG_CONVERT),
@@ -4391,31 +4439,51 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                                                           for status in these}))
         to_make = [status for status in these if _will_copy(status, args)]
         same = [status for status in these if status.status == ST_UP_TO_DATE]
-        extra_lines.append(
-            f"  {kind} kept as JXL ({settings}): {_num(len(to_make))} to convert "
-            f"({_gb(sum(status.planned.size for status in to_make))} of {kind}), "
-            f"{_num(len(same))} up to date")
+        extra_lines.append(_summary_row(f"{kind} kept as JXL: to convert", len(to_make),
+                                        sum(status.planned.size for status in to_make),
+                                        settings))
+        extra_lines.append(_summary_row(f"{kind} kept as JXL: already in the backup", len(same)))
     retire = [status for status in converts if status.replaces]
     if retire:
         where = "the mirror's trash" if mirror is not None else "versions\\"
-        extra_lines.append(f"  copies in the backup that their JXL replaces: "
-                           f"{_num(len(retire))} (to {where})")
+        extra_lines.append(_summary_row(f"copies their JXL replaces (to {where})", len(retire)))
+    folder_rows = _folder_rows(to_copy)
+    if len(folder_rows) >= 2:
+        extra_lines.append("  to copy by folder (cumulative):")
+        folder_lines, more = _folder_summary_lines(folder_rows)
+        extra_lines.extend(folder_lines)
+        if more:
+            extra_lines.append(f"    ... {_num(more)} more folders (in the list below)")
+            lists.append((os.path.basename(log_paths["by_folder_csv"]),
+                          "what is copied, folder by folder"))
     gone = [row for reason, row in tentative_orphans if reason == "source_missing"]
     unselected = [row for reason, row in tentative_orphans if reason == "not_selected"]
     unreadable = [row for reason, row in tentative_orphans if reason == "source_unreadable"]
     elsewhere = [row for reason, row in tentative_orphans if reason == "other_source"]
-    not_proven = ""
-    if unreadable:
-        not_proven += (f", {_num(len(unreadable))} files / "
-                       f"{_gb(sum(row.size for row in unreadable))} source cannot be read")
-    if elsewhere:
-        not_proven += (f", {_num(len(elsewhere))} files / "
-                       f"{_gb(sum(row.size for row in elsewhere))} from another source")
-    extra_lines.append(
-        f"  orphans (in the backup, not in the source): "
-        f"{_num(len(gone))} files / {_gb(sum(row.size for row in gone))} source gone, "
-        f"{_num(len(unselected))} files / {_gb(sum(row.size for row in unselected))} "
-        f"no longer selected{not_proven} -> {log_paths['orphans_csv']}")
+    orphan_lines = []
+    if rows:
+        orphan_lines.append(_summary_row("source gone", len(gone), sum(row.size for row in gone)))
+        orphan_lines.append(_summary_row("no longer selected", len(unselected),
+                                         sum(row.size for row in unselected)))
+        if unreadable:
+            orphan_lines.append(_summary_row("source cannot be read (never counted as gone)",
+                                             len(unreadable),
+                                             sum(row.size for row in unreadable)))
+        if elsewhere:
+            orphan_lines.append(_summary_row("from a source this run does not name",
+                                             len(elsewhere), sum(row.size for row in elsewhere)))
+        if tentative_orphans:
+            lists.append((os.path.basename(log_paths["orphans_csv"]), "the orphans"))
+    if planned.inside:
+        lists.append((os.path.basename(log_paths["inside"]),
+                      "the subfolders left out inside sessions"))
+    if any(not folder.copied for folder in planned.unexported_folders):
+        lists.append((os.path.basename(log_paths["unexported"]), "the folders without export"))
+    if planned.unmatched:
+        lists.append((os.path.basename(log_paths["unmatched"]),
+                      "the exports without a matching original"))
+    lists.append((os.path.basename(log_paths["log"]),
+                  "the log: links, folders skipped by name, errors"))
     freed = 0
     mirror_lines = []
     if mirror is not None:
@@ -4426,13 +4494,14 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                        f"run (a source that cannot be read is not one that is gone)")
     if args.move_orphans and args.dry_run:
         if planned.errors:
-            extra_lines.append(f"  --move-orphans: {orphans_blocked}")
+            orphan_lines.append(f"  --move-orphans: {orphans_blocked}")
         else:
-            extra_lines.append(
+            orphan_lines.append(
                 f"  --move-orphans: {_num(len(gone))} files would be moved to "
                 f"{os.path.join(dest, CATALOG_FOLDER, ORPHANS_FOLDER, stamp)}")
     for line in _summary_lines(args, planned, statuses, needed, free, margin, fits, log_paths,
-                               dest_error, extra_lines, freed, catalog_note):
+                               dest_error, extra_lines, freed, catalog_note, orphan_lines,
+                               lists):
         log.out(line)
     # the mirror's own block comes last: it is what is on the screen when the
     # question is asked

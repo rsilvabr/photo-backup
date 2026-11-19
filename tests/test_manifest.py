@@ -11,7 +11,7 @@ import pytest
 import manifest_backup as mb
 import selective_backup as sb
 
-from conftest import dest_files, latest_csv, latest_log, make_tree, snapshot
+from conftest import dest_files, latest_csv, latest_log, make_tree, row_count, snapshot
 
 HOSTILE = "吾妻山公園_菜の花 [FINAL] 5% off"
 SHIPPED_MODES = Path(mb.__file__).resolve().parent / mb.MODES_FILE
@@ -744,7 +744,8 @@ def test_skip_leaves_only_that_folder_out(tmp_path, capsys):
     assert not any("not_edited" in rel for rel in files)
     assert has(files, f"{prefix}/edited/_DSC1.NEF")
     out = capsys.readouterr().out
-    assert "folders the manifest leaves out (Skip): 1 folders / 7 files" in out
+    assert row_count(out, "folders the manifest leaves out (Skip)") == "7"
+    assert "in 1 folders" in out
 
 
 def test_a_line_below_a_skip_line_is_still_copied(tmp_path):
@@ -790,7 +791,7 @@ def test_only_modes_keep_one_type_in_that_folder(tmp_path, capsys, mode, kept, g
     for rel in gone:
         assert not has(files, f"{prefix}/not_edited/{rel}"), rel
     assert has(files, f"{prefix}/edited/_DSC1.NEF")
-    assert "left out by a mode's Only filter:" in capsys.readouterr().out
+    assert row_count(capsys.readouterr().out, "left out by a mode's Only filter") is not None
 
 
 def test_analyze_of_skip_and_only_matches_the_dry_run(tmp_path, photobackup_log_dir):

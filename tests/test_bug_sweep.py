@@ -17,7 +17,7 @@ import pytest
 import manifest_backup as mb
 import selective_backup as sb
 
-from conftest import argv_for, latest_csv, latest_log, make_tree
+from conftest import argv_for, latest_csv, latest_log, make_tree, row_count
 
 SHIPPED_MODES = Path(mb.__file__).resolve().parent / mb.MODES_FILE
 HOSTILE = "吾妻山公園 [FINAL] 5% (x)"
@@ -204,7 +204,7 @@ def test_b1_summary_counts_what_add_folders_left_out(tmp_path, capsys):
     assert line, out
     # DSC_0011.JPG, DSC_0011_pano.tif, clip.mov and sub/DSC_0012.JPG (round 2: IMG_0001.HEIC,
     # edit.psd and the film session's 000099.tif have no RAW beside them and are copied)
-    assert "(Originals filter): 4 /" in line[0]
+    assert row_count(line[0], "left out inside added folders (Originals filter)") == "4"
 
 
 def export_in_added_tree(root):
@@ -327,7 +327,7 @@ def test_b9_exclude_is_never_walked_and_is_counted(tmp_path, capsys):
     manifest.write_text(f"Folder,Mode,Originals\n{folder},X+,raw\n", encoding="utf-8")
     assert mb.main(["--manifest", str(manifest), "--modes", str(table),
                     "--dest", str(tmp_path / "out"), "--dry-run"]) == 0
-    assert "excluded by the mode (Exclude): 4 /" in capsys.readouterr().out
+    assert row_count(capsys.readouterr().out, "excluded by the mode (Exclude)") == "4"
 
 
 # ---- B18 ----------------------------------------------------------------------------------
@@ -396,7 +396,7 @@ def test_b17_links_are_shown_and_logged(tmp_path, capsys, photobackup_log_dir):
     # v0.13.2 (O2 of the 261112 sweep): a Capture One cache folder that is a
     # junction (a cache moved to another disk) is named on the Capture One cache line, not as
     # a folder that is not backed up; with --c1-cache it is a plain link again
-    cache_line = "(+ 1 cache folders that are links to another place, not followed)"
+    cache_line = "+ 1 cache folders that are links to another place (not followed)"
     assert sb.main(argv_for(tmp_path / "G" / "2025", tmp_path / "out", tmp_path,
                             "--dry-run")) == 0
     out = capsys.readouterr().out
@@ -404,7 +404,7 @@ def test_b17_links_are_shown_and_logged(tmp_path, capsys, photobackup_log_dir):
     assert str(link) in latest_log(photobackup_log_dir)
     assert sb.main(argv_for(tmp_path / "G" / "2025", tmp_path / "out", tmp_path,
                             "--dry-run", "--c1-cache")) == 0
-    assert "links/junctions not followed: 1" in capsys.readouterr().out
+    assert row_count(capsys.readouterr().out, "links/junctions not followed") == "1"
     manifest = tmp_path / "manifest.csv"
     manifest.write_text(f"Folder,Mode,Originals\n{tmp_path / 'G' / '2025'},3+,raw\n",
                         encoding="utf-8")
@@ -455,9 +455,9 @@ def test_b2_inside_csv_and_the_biggest_names(tmp_path, capsys, photobackup_log_d
     assert by_sub[("Untitled folder", "_OUTTAKES")]["bytes"] == "300"
     assert by_sub[("shoot", "_OUTTAKES")]["bytes"] == "200"
     start = next(i for i, text in enumerate(out) if "inside sessions" in text)
-    assert "inside sessions (subfolders the mode leaves out): 2 /" in out[start]
+    assert row_count(out[start], "inside sessions (subfolders the mode leaves out)") == "2"
     names = out[start + 1:start + 3]
-    assert "_OUTTAKES" in names[0] and "2 files" in names[0]     # grouped by name
+    assert row_count(names[0], "_OUTTAKES") == "2"               # grouped by name
     assert "Birthday party" not in names[1]
 
 

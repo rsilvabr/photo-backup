@@ -44,7 +44,7 @@ added the newer parts. The restore has its own guarantees
 - **Nothing is skipped silently.** A folder or file that cannot be read is
   logged, counted on the console (`Errors: N ... NOT backed up`) and makes the
   run exit 1 — a dry-run too. Every file under a source is either in the plan
-  or in exactly one line of the summary's `Not copied:` *(v0.12.1)*, and the
+  or in exactly one row of the summary's `Not copied` table *(v0.12.1)*, and the
   links and junctions it does not follow are counted and logged. A Capture One
   cache folder that is itself a link or a junction (a cache moved to another
   disk that way) is named on the `Capture One cache` line —

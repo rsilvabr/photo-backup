@@ -6,6 +6,7 @@ import selective_backup
 
 from conftest import (
     argv_for,
+    row_count,
     build_base_tree,
     dest_files,
     latest_csv,
@@ -24,7 +25,7 @@ def test_rerun_is_up_to_date(tmp_path):
     assert selective_backup.main(argv_for(source, dest, tmp_path, "--yes")) == 0
     assert snapshot(dest) == before
     text = latest_log(tmp_path / "logs")
-    assert "NEW 0 files" in text
+    assert row_count(text, "copy (new)") == "0"
     assert "COPY " not in text
 
 

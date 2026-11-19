@@ -11,6 +11,7 @@ import selective_backup
 
 from conftest import (
     argv_for,
+    row_count,
     latest_csv,
     latest_log,
     make_tree,
@@ -115,7 +116,7 @@ def test_dry_run_reports_possible_moves_and_writes_nothing(tmp_path, capsys):
     catalog_stat = catalog.stat()
     assert selective_backup.main(argv_for(source, dest, tmp_path, "--dry-run")) == 0
     out = capsys.readouterr().out
-    assert "possible moves: 2 files" in out
+    assert row_count(out, "possible moves (each checked by its hash first)") == "2"
     assert snapshot(dest) == before
     assert catalog.stat().st_mtime_ns == catalog_stat.st_mtime_ns
 

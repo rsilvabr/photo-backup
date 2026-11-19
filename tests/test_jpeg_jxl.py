@@ -13,7 +13,7 @@ import manifest_backup as mb
 import mirror_backup as mir
 import selective_backup as sb
 
-from conftest import argv_for, latest_log, snapshot
+from conftest import argv_for, latest_log, row_count, snapshot
 from test_tiff_jxl import (JXL, OTHERS, TIFFS, VERSIONS, backed, backup,  # noqa: F401
                            closed_console, converted, db, env, mirror_rel, newest_csv, restore,
                            restore_statuses, restored, under, write_manifest)
@@ -82,15 +82,16 @@ def test_j17_jpegs_become_jxl_proven_by_their_rebuild(env, capsys, monkeypatch):
     assert all(call[3:] == ["--mode", "0", "--workers", "1", "--effort", str(sb.JPEG_JXL_EFFORT),
                             "--force-transcode"] for call in made)
     out = capsys.readouterr().out
-    assert "JPEG kept as JXL (lossless: the same bytes back): 4 to convert" in out
+    assert row_count(out, "JPEG kept as JXL: to convert") == "4"
+    assert "lossless: the same bytes back" in out
     assert "Kept as JXL: 4 converted (4 JPEG)" in out
     assert backup(env, "--jpeg", "jxl") == 0                # a second run: nothing to do
-    assert "0 to convert" in capsys.readouterr().out
+    assert row_count(capsys.readouterr().out, "JPEG kept as JXL: to convert") == "0"
     assert len(calls(env, command="transcode")) == len(transcodes)
     # every effort gives the same bytes back: another one is no reason to convert again (rc4)
     monkeypatch.setattr(sb, "JPEG_JXL_EFFORT", sb.JPEG_JXL_EFFORT + 2)
     assert backup(env, "--jpeg", "jxl") == 0
-    assert "0 to convert" in capsys.readouterr().out
+    assert row_count(capsys.readouterr().out, "JPEG kept as JXL: to convert") == "0"
     assert len(calls(env, command="transcode")) == len(transcodes)
 
 

@@ -16,7 +16,7 @@ import pytest
 import manifest_backup as mb
 import selective_backup as sb
 
-from conftest import latest_csv, make_tree
+from conftest import latest_csv, make_tree, row_count
 from test_bug_sweep import CHAINS, SHIPPED_MODES, listed, plan_rows, planned_set
 from test_bug_sweep_round2 import full_tree
 
@@ -119,8 +119,8 @@ def test_mode_without_plus_lists_it_as_a_folder_without_export(tmp_path, capsys,
     assert names["more"]["files"] == "1"
     inside = list(csv.DictReader(io.StringIO(latest_csv(photobackup_log_dir, "_inside.csv"))))
     assert [row["subfolder"] for row in inside] == ["_OUTTAKES"]
-    assert "inside sessions (subfolders the mode leaves out): 1 /" in out
-    assert "folders without export: 2 folders" in out
+    assert row_count(out, "inside sessions (subfolders the mode leaves out)") == "1"
+    assert row_count(out, "folders without export") == "2 folders"
 
 
 def test_analyze_and_dry_run_agree_on_it(tmp_path, photobackup_log_dir):

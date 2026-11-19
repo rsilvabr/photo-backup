@@ -226,7 +226,7 @@ actually selected for the backup (after format filtering and
 A folder with no export subfolder is listed in `_unexported.csv` (path, number
 of direct files, bytes, Capture One bytes without cache, NKSC_PARAM bytes, and
 `copied`: `yes` when this run copies it). The summary's `folders without
-export` line, under `Not copied:`, counts only those that are not copied
+export` row, in its `Not copied` table, counts only those that are not copied
 *(v0.12.1)*; the CSV lists all of them.
 With `--unexported copy` (or a `+` mode of the manifest) the direct files,
 Capture One and NKSC_PARAM folders are also copied — also for a folder that has no file of its own, only

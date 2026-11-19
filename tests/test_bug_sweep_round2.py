@@ -22,7 +22,7 @@ import photo_backup as menu
 import restore_backup as rb
 import selective_backup as sb
 
-from conftest import argv_for, latest_csv, latest_log, make_tree
+from conftest import argv_for, latest_csv, latest_log, make_tree, row_count
 from test_bug_sweep import (COUNTERS, SHIPPED_MODES, export_in_added_tree, listed, mirror,
                             mobile_tree, no_dates, plan_rows, planned_set, sweep_tree)
 from test_captureone import STYLE, backup, force, machine, revert  # noqa: F401 (fixture)
@@ -713,7 +713,7 @@ def test_s4_folders_skipped_by_name_are_in_the_summary_and_the_log(tmp_path, cap
     assert sb.main(argv_for(source, tmp_path / "out", tmp_path, "--dry-run",
                             "--exclude-folders", "Skipme")) == 0
     out = capsys.readouterr().out
-    assert "folders skipped by name (system / --exclude-folders): 2 -> " in out
+    assert row_count(out, "folders skipped by name (system / --exclude-folders)") == "2 folders"
     log = latest_log(photobackup_log_dir)
     assert f"SKIPPED FOLDER {source / '$RECYCLE.BIN'}" in log
     assert f"SKIPPED FOLDER {source / 'shoot' / 'Skipme'}" in log
@@ -742,12 +742,13 @@ def test_s4_whole_mode_names_them_too(tmp_path, capsys):
                         encoding="utf-8")
     assert mb.main(["--manifest", str(manifest), "--modes", str(SHIPPED_MODES),
                     "--dest", str(tmp_path / "out"), "--dry-run"]) == 0
-    assert "folders skipped by name (system / --exclude-folders): 1 -> " in capsys.readouterr().out
+    assert row_count(capsys.readouterr().out,
+                     "folders skipped by name (system / --exclude-folders)") == "1 folders"
 
 
 # ---- "folders without export" counts only those not copied ----------------------------------
-@pytest.mark.parametrize("mode, line, copied", [("3+", "folders without export: 0 folders", "yes"),
-                                                ("3", "folders without export: 2 folders", "no")])
+@pytest.mark.parametrize("mode, line, copied", [("3+", "0 folders", "yes"),
+                                                ("3", "2 folders", "no")])
 def test_folders_without_export_counts_only_what_is_not_copied(tmp_path, capsys,
                                                                 photobackup_log_dir,
                                                                 mode, line, copied):
@@ -760,7 +761,7 @@ def test_folders_without_export_counts_only_what_is_not_copied(tmp_path, capsys,
                         encoding="utf-8")
     assert mb.main(["--manifest", str(manifest), "--modes", str(SHIPPED_MODES),
                     "--dest", str(tmp_path / "out"), "--dry-run"]) == 0
-    assert line in capsys.readouterr().out
+    assert row_count(capsys.readouterr().out, "folders without export") == line
     rows = list(csv.DictReader(io.StringIO(latest_csv(photobackup_log_dir, "_unexported.csv"))))
     assert len(rows) == 2
     assert {row.get("copied") for row in rows} == {copied}

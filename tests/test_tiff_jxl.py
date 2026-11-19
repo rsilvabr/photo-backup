@@ -20,7 +20,7 @@ import mirror_backup as mir
 import restore_backup as rb
 import selective_backup as sb
 
-from conftest import argv_for, latest_csv, latest_log, make_tree, snapshot
+from conftest import argv_for, latest_csv, latest_log, make_tree, row_count, snapshot
 
 HOSTILE = "吾妻山公園_菜の花 [FINAL] 5% off"
 FAKE = Path(__file__).with_name("fake_jxlphoto.py")
@@ -207,7 +207,8 @@ def test_j2_new_tiffs_become_jxl(env, capsys):
             "--eight-bit-distance", "0", "--effort", "7", "--workers", "1",
             "--verify-roundtrip"]
     out = capsys.readouterr().out
-    assert "TIFF kept as JXL (jxl: d=0.05 scan=0 8bit=0 e=7): 3 to convert" in out
+    assert row_count(out, "TIFF kept as JXL: to convert") == "3"
+    assert "jxl: d=0.05 scan=0 8bit=0 e=7" in out
     assert "Kept as JXL: 3 converted (3 TIFF)" in out
     assert no_work_left(env)
 
@@ -218,7 +219,8 @@ def test_j3_rerun_changed_tiff_and_profile(env, monkeypatch, capsys, photobackup
     capsys.readouterr()
     assert backup(env, "--tiff", "jxl") == 0
     out = capsys.readouterr().out
-    assert "0 to convert" in out and "3 up to date" in out
+    assert row_count(out, "TIFF kept as JXL: to convert") == "0"
+    assert row_count(out, "TIFF kept as JXL: already in the backup") == "3"
     assert len(encodes(env)) == 3
     orphans = list(csv.DictReader(io.StringIO(latest_csv(photobackup_log_dir, "_orphans.csv"))))
     assert orphans == []                                # no page of a group is an orphan
@@ -254,7 +256,7 @@ def test_j4_our_tiff_copies_become_jxl(env, capsys):
     assert not {rel for (rel,) in db(env.dest, "SELECT rel FROM files")} & {
         rel.replace("/", "\\") for rel in TIFFS}
     out = capsys.readouterr().out
-    assert "copies in the backup that their JXL replaces: 3 (to versions\\)" in out
+    assert row_count(out, "copies their JXL replaces (to versions\\)") == "3"
     assert "3 copies in the backup replaced by their JXL (to versions)" in out
 
 
