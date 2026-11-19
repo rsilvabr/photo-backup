@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc3"
+__version__ = "0.14.0-rc4"
 
 # ---- Settings -------------------------------------------------------------------
 BACKUP_SUBFOLDER = "_captureone"            # under --dest: this script's own backup root
@@ -388,8 +388,9 @@ def _write_map(backup, roots, version, plan, rows=None):
               "  3. Open Capture One and activate it.",
               "Nothing that already exists is overwritten.",
               "",
-              "With Python, the same restore checks every file against the catalog:",
-              "  python captureone_backup.py --restore-from <the backup folder> --dry-run",
+              "With photo-backup, the same restore checks every file against the catalog:",
+              f"  {sb._run_command('captureone_backup.py')} --restore-from <the backup folder> "
+              "--dry-run",
               ""]
     _write_ours(os.path.join(backup, MAP_FILE), "\n".join(lines))
 
@@ -588,7 +589,7 @@ def run_backup(args, log, stamp):
     if args.dry_run:
         log.log("dry run: nothing copied")
         return 1 if plan.errors or not fits else 0
-    if not args.yes and to_copy and not _confirm(f"Copy {sb._num(len(to_copy))} files? [y/N] ", log):
+    if not args.yes and to_copy and not _confirm(f"Copy {sb._num(len(to_copy))} files? [y/N, Enter = no] ", log):
         return 2
     try:
         os.makedirs(sb._io(backup), exist_ok=True)
@@ -1091,7 +1092,7 @@ def run_restore(args, log):
         log.log("dry run: nothing restored")
         return 1 if any(item[0] in BAD_RESTORE for item in items) else 0
     if restores and not args.yes and not _confirm(
-            f"Restore {sb._num(len(restores))} files? [y/N] ", log):
+            f"Restore {sb._num(len(restores))} files? [y/N, Enter = no] ", log):
         return 2
     results = []
     snapshot = _Snapshot(OLD_PREFIX) if args.force else None
@@ -1375,7 +1376,7 @@ def run_revert(args, log):
         return 1 if any(item[0] in BAD_REVERT for item in items) else 0
     changes = [item for item in items if item[0] in ("PUT_BACK", "TAKE_OUT")]
     if changes and not args.yes and not _confirm(
-            f"Change {sb._num(len(changes))} files? [y/N] ", log):
+            f"Change {sb._num(len(changes))} files? [y/N, Enter = no] ", log):
         return 2
     snapshot = _Snapshot(REVERT_PREFIX)
     results = []

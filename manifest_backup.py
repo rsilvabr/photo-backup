@@ -36,7 +36,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc3"
+__version__ = "0.14.0-rc4"
 
 # ---- Settings -------------------------------------------------------------------
 MODES_FILE = "backup_modes.csv"     # next to this script; --modes reads another
@@ -283,8 +283,10 @@ def _row_rules(mode, originals, tiff="copy", jpeg="copy"):
                           tiff=tiff, jpeg=jpeg)
 
 
-def _tiff_rows_errors(rows, jxlphoto):
-    """Why the manifest's TIFFs or JPEGs kept as JXL cannot be made, or []."""
+def _tiff_rows_errors(rows, jxlphoto, dest=None):
+    """Why the manifest's TIFFs or JPEGs kept as JXL cannot be made, or []:
+    jxl-photo, djxl for a TIFF (JP-20), JXL_WORK_DIR outside every line and
+    the destination."""
     using = [row for row in rows if row.tiff != "copy" or row.jpeg != "copy"]
     if not using:
         return []
@@ -293,6 +295,14 @@ def _tiff_rows_errors(rows, jxlphoto):
     if problem:
         errors.append(f"{len(using)} manifest line(s) keep TIFF or JPEG as JXL (Tiff, Jpeg "
                       f"columns): {problem}")
+    else:
+        tiffs = [row for row in rows if row.tiff != "copy"]
+        if tiffs and sb._djxl_on_path() is None:
+            errors.append(f"{len(tiffs)} manifest line(s) keep TIFF as JXL (Tiff column): "
+                          f"{sb.DJXL_MISSING}")
+    if dest is not None:
+        errors += sb._work_dir_errors([os.path.abspath(row.folder) for row in rows],
+                                      os.path.abspath(dest))
     return errors
 
 
@@ -347,7 +357,9 @@ def _plan_rows(rows, modes, args, list_cache, on_row=None):
     skipped_folders = []
     cache_links = []
     stats = sb.Stats()
-    for row in rows:
+    sb._READING.reset()
+    for index, row in enumerate(rows, 1):
+        sb._READING.line(index, len(rows), row.folder)
         planner = _plan_row(row, rows, modes, args, list_cache)
         if on_row is not None:
             on_row(row, planner)
@@ -650,7 +662,7 @@ def main(argv=None):
     backend_args = _backend_args(args, rows, os.path.abspath(args.dest))
     errors = _validate_rows(backend_args, rows)
     if not args.verify:
-        errors += _tiff_rows_errors(rows, args.jxlphoto)
+        errors += _tiff_rows_errors(rows, args.jxlphoto, args.dest)
     if errors:
         for error in errors:
             print(error, file=sys.stderr)

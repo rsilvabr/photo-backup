@@ -8,7 +8,7 @@ work: change anything else in jxl-photo freely; change one of these items and
 photo-backup breaks — safely (it stops, or keeps the TIFF as it is), but it
 breaks.
 
-Each item has a number, **JP-1** to **JP-17**, used in three places:
+Each item has a number, **JP-1** to **JP-21**, used in three places:
 
 - here: the rule, where it lives in each program, what breaks;
 - in photo-backup's messages: `CONVERT FAILED <file>: ... (JP-5)`, a restore's
@@ -18,28 +18,40 @@ Each item has a number, **JP-1** to **JP-17**, used in three places:
 
 ## The minimum version
 
-photo-backup refuses a jxl-photo older than **`JXLPHOTO_MIN_VERSION` = 2.30.0**
-(top of `selective_backup.py`): a backup with a `Tiff` profile stops before
-reading anything (exit 2), and the restore does not use it. A test version of
-the minimum (`2.30.0_beta1`, `2.30.0-rc1`) counts as older than it. Measured on
-2026-11-19 by running the contract test on each version, extracted from
-jxl-photo's git tags:
+A backup refuses a jxl-photo older than **`JXLPHOTO_MIN_VERSION` = 2.31.0-rc1**
+(top of `selective_backup.py`): a backup with a `Tiff` or `Jpeg` profile stops
+before reading anything (exit 2). It is the first jxl-photo that checks every
+page it converts (JP-20). A test version counts as older than its release
+(`2.31.0` without a suffix would refuse `2.31.0-rc1`), but every test version
+of the minimum's own number counts as the minimum (`2.31.0-rc2` passes).
+
+The restore has a minimum of its own, **`JXLPHOTO_RESTORE_MIN_VERSION` =
+2.30.0**: making a file back (JP-10, JP-11, JP-13, JP-16, JP-18) did not change
+since, and a backup made with an older jxl-photo must come back with the copy
+of jxl-photo it keeps (JP-13).
+
+Measured by running the contract test on each version, extracted from
+jxl-photo's git tags (`set PHOTOBACKUP_JXLPHOTO=...`, below):
 
 | jxl-photo | Items that hold | Why |
 |---|---|---|
-| v2.29.1 (`jxl_photo.py`) | 3 of 17 | `jxl_photo.py encode` / `decode` / `transcode` did not exist yet: exit 2, `usage: ...` |
-| v2.30.0_beta1 | 16 of 17 | everything works; JP-1 refuses a test version of 2.30.0 |
-| **v2.30.0**, v2.30.1, v2.30.2 | **17 of 17** | the first release whose `jxl_photo.py` runs its backends by name |
-| `jxl-photo.exe` 2.29.0_beta1 | 16 of 17 | the exe had its backends by name before the script did; JP-1 refuses it (one minimum for both: use v2.30.0-exe1 or newer) |
+| v2.29.1 (`jxl_photo.py`) | 3 of 17 | `jxl_photo.py encode` / `decode` / `transcode` did not exist yet: exit 2, `usage: ...` (2026-11-19) |
+| v2.30.0_beta1 | 16 of 17 | everything worked; JP-1 refused a test version of 2.30.0 (2026-11-19) |
+| v2.30.0, v2.30.1, v2.30.2 | 17 of 17 (2026-11-19); v2.30.2 with rc4's test: 19 of 21 (2026-11-20) | the first release whose `jxl_photo.py` runs its backends by name, and still the restore's minimum; for a backup JP-1 refuses it, and JP-20 fails: no page is checked, and without djxl it still writes the JXL |
+| **v2.31.0-rc1** | **21 of 21** (2026-11-20) | the first that checks every page of an encode (JP-20) |
+| `jxl-photo.exe` 2.29.0_beta1 | 16 of 17 | the exe had its backends by name before the script did; JP-1 refused it (one minimum for both) |
 
 (JP-15 to JP-17 were added with photo-backup v0.14.0-rc3 and measured the same
-day: the minimum did not move.)
+day: the minimum did not move. JP-18 and JP-19, v0.14.0-rc4, are faster routes
+photo-backup takes when it can — without djxl it uses JP-16, without a
+command's own script it goes through `jxl_photo.py` — so they move nothing
+either. JP-20 and JP-21, also v0.14.0-rc4, moved it to 2.31.0-rc1.)
 
 ## When you change jxl-photo
 
 1. Run the contract test against your copy of jxl-photo, from photo-backup's
-   folder (it needs numpy and tifffile, as jxl-photo does; about 30 s, small
-   synthetic TIFFs in a temp folder):
+   folder (it needs numpy and tifffile, as jxl-photo does, and djxl on PATH:
+   JP-20; about 30 s, small synthetic TIFFs in a temp folder):
 
    ```console
    set PHOTOBACKUP_JXLPHOTO=C:\path\to\jxl-photo\jxl_photo.py
@@ -49,7 +61,9 @@ day: the minimum did not move.)
    Without `PHOTOBACKUP_JXLPHOTO` the test is skipped, so photo-backup's own
    suite never needs jxl-photo. On a version older than
    `JXLPHOTO_MIN_VERSION`, JP-1 fails by definition: read the others.
-2. **14 passed**: photo-backup keeps working with that version.
+2. **21 passed**: photo-backup keeps working with that version. (Without djxl
+   on PATH every encode fails: since 2.31.0-rc1 jxl-photo needs it to check
+   the pages, JP-20.)
 3. **A failure names its item** (`AssertionError: JP-6: multi.jxl: ...`): read
    that item below — what photo-backup needs, where it lives in jxl-photo,
    what happens when it breaks.
@@ -73,12 +87,16 @@ day: the minimum did not move.)
 
 It fails closed; nothing is ever left without a copy:
 
-- **At the start** (JP-1): a jxl-photo that does not say its version, or an
-  older one, is refused — exit 2, nothing read, nothing written.
-- **During a backup** (JP-2 to JP-9, JP-15, JP-16): a conversion whose result fails a check is
-  `CONVERT FAILED <file>: <why> (JP-n)` in the log; that TIFF is copied as it
-  is, the run exits 1, and the next run tries again. Only space is lost.
-- **During a restore** (JP-10 to JP-13, JP-16): `ERROR <file>: <why> (JP-10)`;
+- **At the start** (JP-1, JP-20): a jxl-photo that does not say its version,
+  or an older one, is refused — exit 2, nothing read, nothing written; so is a
+  backup with a `Tiff` profile when djxl is not on PATH (jxl-photo needs it to
+  check the pages).
+- **During a backup** (JP-2 to JP-9, JP-15, JP-16, JP-18, JP-20): a conversion whose result fails a check is
+  `CONVERT FAILED <file>: <why> (JP-n)` in the log — for a jxl-photo error,
+  its own ERROR line, and the path of its log of that conversion, kept in
+  `Logs\jxl-photo` —; that TIFF is copied as it is, the run exits 1, and the
+  next run tries again. Only space is lost.
+- **During a restore** (JP-10 to JP-13, JP-16, JP-18): `ERROR <file>: <why> (JP-10)`;
   nothing is written at the target, the JXL stays in the backup, and
   `--convert-back none` still gives it as it is. Any jxl-photo that keeps the
   contract can decode it later.
@@ -90,9 +108,11 @@ It fails closed; nothing is ever left without a copy:
 - **In the selection** (JP-14): a derivative whose marks cannot be read is
   copied (more space), never left out.
 
-Three items cannot be seen at run time — only the contract test sees them:
+Four items cannot be seen at run time — only the contract test sees them:
 **JP-7** (a lossless class that became lossy), **JP-9** (a bad JXL that claims
-its TIFF) and **JP-17** (a class mark that changed). Run the test after
+its TIFF), **JP-17** (a class mark that changed) and **JP-21** (a settings
+overlay that a backup no longer turns off). Since JP-20 a JXL that decodes to
+something else than its TIFF page is seen when it is made. Run the test after
 changing the encoder.
 
 ## The items
@@ -121,11 +141,15 @@ changing the encoder.
   ```
 
   (`jxl-photo.exe encode ...` the same.) The arguments are photo-backup's
-  `_jxlphoto_encode_args`, run with `python -B` and the environment of JP-12.
+  `_jxlphoto_encode_args`, run as JP-19 says (or `python -B jxl_photo.py`) with
+  the environment of JP-12. `--verify-roundtrip`: since jxl-photo 2.31.0-rc1
+  every page is checked before it takes its name (JP-20); up to 2.30.x it
+  compared pixels only in front of a deletion (`--delete-source`), so in this
+  command it checked nothing (found on 2026-11-19).
 - **jxl-photo:** `jxl_photo.py` `_BACKEND_COMMANDS` (`encode` →
   `jxl_tiff_encoder.py`), its argparse (`--mode 0` = one file into the output
   folder), `--scan-distance` (since 2.17.0), `--eight-bit-distance` (since
-  2.24.0), `--verify-roundtrip`.
+  2.24.0), `--verify-roundtrip` (the page check of JP-20 since 2.31.0-rc1).
 - **If it breaks:** every TIFF is `CONVERT FAILED ... (JP-2)` and copied as it
   is.
 
@@ -213,10 +237,13 @@ changing the encoder.
 
 ### JP-9 — A failure never claims the TIFF
 
-- **Rule:** a TIFF jxl-photo cannot encode ends with a non-zero exit, or with
-  no JXL that carries that TIFF's mark. `--verify-roundtrip` keeps a JXL that
-  does not decode back from being written.
-- **photo-backup:** trusts a JXL with the right mark (JP-5) and an exit 0.
+- **Rule:** a TIFF jxl-photo cannot encode — or a page that fails its check
+  (JP-20) — ends with a non-zero exit, or with no JXL that carries that TIFF's
+  mark. With several pages, the JXL of a page that passed may already be in the
+  folder when a later page fails: the exit is what counts.
+- **photo-backup:** trusts a JXL with the right mark (JP-5) and an exit 0. A
+  conversion that failed leaves nothing: its folder (outside the backup) is
+  removed with every JXL in it, and the TIFF is copied as it is.
 - **If it breaks:** a bad JXL could replace the TIFF copy in the backup — the
   one silent loss this page guards against. Only the contract test sees it (a
   corrupt TIFF).
@@ -254,10 +281,15 @@ changing the encoder.
 - **Rule:** with `JXLPHOTO_LOG_DIR` set, `--version`, encode and decode write
   nothing into jxl-photo's own folder: no `Logs\`, no settings file, no cache.
   `JXLPHOTO_NO_UPDATE_CHECK=1` means no network.
-- **photo-backup:** `_run_jxlphoto` sets `JXLPHOTO_LOG_DIR` (its own
-  `Logs\jxl-photo`), `JXLPHOTO_NO_UPDATE_CHECK=1`, `PYTHONIOENCODING=utf-8`,
-  and runs the script with `python -B` (no `__pycache__`). The restore may run
-  the copy kept in the backup, and the restore never writes to the backup.
+- **photo-backup:** `_run_jxlphoto` (`_jxlphoto_env`) sets `JXLPHOTO_LOG_DIR`
+  (a conversion's own folder, whose log is kept in its own `Logs\jxl-photo`
+  only when the conversion failed; the restore's calls log there directly),
+  `JXLPHOTO_SETTINGS` empty (JP-21), `JXLPHOTO_NO_UPDATE_CHECK=1`,
+  `PYTHONIOENCODING=utf-8` and `PYTHONPYCACHEPREFIX` (its own `Logs\pycache`:
+  every Python started with it keeps its bytecode there, never in a
+  `__pycache__` beside a script; `jxl_photo.py` itself runs with
+  `python -B`). The restore may run the copy kept in the backup, and the
+  restore never writes to the backup.
 - **jxl-photo:** `LOG_DIR` (`jxl_tiff_encoder.py`, `jxl_tiff_decoder.py`) and
   `WRAPPER_LOG_DIR` (`jxl_photo.py`), since 2.6.1; the update check, since
   2.22.0.
@@ -321,8 +353,9 @@ changing the encoder.
   ```
 
   The arguments are `_jxlphoto_rebuild_args`.
-- **photo-backup:** `_transcode_one` runs it right after JP-15 and keeps the
-  JXL only when the rebuilt JPEG has the SHA-256 it took of the original; the
+- **photo-backup:** when djxl is not there (JP-18; `DJXL = "none"`),
+  `_rebuild_jpeg` runs it right after JP-15 and `_transcode_one` keeps the JXL
+  only when the rebuilt JPEG has the SHA-256 it took of the original; the
   restore runs it again and checks the same SHA-256 (from the catalog) before
   the JPEG takes the target's name.
 - **jxl-photo:** the JXL → JPEG lossless path of `jxl_jpeg_transcoder.py`
@@ -345,10 +378,95 @@ changing the encoder.
   2.10.0), written by `jxl_tiff_encoder.py`.
 - **If it breaks:** the wrong format in a `lossless` restore (see above).
 
+### JP-18 — djxl gives the JPEG back from its JXL
+
+- **Rule:** the JXL of JP-15, read by libjxl's own djxl on its input, writes
+  the original JPEG's bytes (the same SHA-256) on its output:
+
+  ```
+  djxl - - --output_format jpeg --num_threads=1   < the JXL   > the JPEG
+  ```
+
+  That is, the JXL holds what rebuilds the JPEG (cjxl's `--lossless_jpeg=1`),
+  and nothing a plain djxl would rebuild differently.
+- **photo-backup:** `_rebuild_jpeg`, with the djxl of `DJXL` (`""`: the one on
+  PATH), is the proof right after JP-15 (0.17 s for a 10 MB JPEG, against a
+  second jxl-photo run) and the restore of a JPEG
+  (`_rebuild_jpeg_with_djxl`: the JXL is read once from the backup and checked
+  against its catalog SHA-256, the JPEG is rebuilt in memory and written next
+  to the target). No djxl, or `DJXL = "none"`: JP-16 instead.
+- **jxl-photo:** `encode_one_transcode` in `jxl_jpeg_transcoder.py` (`cjxl
+  --lossless_jpeg=1`; `--jpeg_reconstruction_lfs=0` with a cjxl of 0.13 or
+  newer, so that djxl 0.11 to 0.13 all rebuild the same bytes).
+- **If it breaks:** in a backup, `CONVERT FAILED ... (JP-18)`, the JPEG copied
+  as it is; in a restore, `ERROR ... (JP-18)` and nothing at the target.
+
+### JP-19 — Each command is a script beside `jxl_photo.py`
+
+- **Rule:** `jxl_photo.py encode|decode|transcode ARGS` is
+  `jxl_tiff_encoder.py|jxl_tiff_decoder.py|jxl_jpeg_transcoder.py ARGS` run as
+  the main program (`_BACKEND_COMMANDS`, `_run_backend`), and each of those
+  scripts does the same when Python's import system runs it as `__main__`
+  from its folder (`runpy.run_module`).
+- **photo-backup:** `_jxlphoto_argv` runs a command's own script that way
+  (`_JXLPHOTO_BACKENDS`, `_JXLPHOTO_BOOT`): Python reads its bytecode from
+  photo-backup's cache (JP-12) instead of compiling `jxl_photo.py` and the
+  script again — 19,000 lines, 0.4 s of CPU at every start, and photo-backup
+  starts jxl-photo once per photo. A start takes 0.08 s instead of 0.3 to
+  0.5 s. A command whose script is not there (another layout, the exe) goes
+  through `jxl_photo.py` as before.
+- **jxl-photo:** `_BACKEND_COMMANDS` and `_run_backend` in `jxl_photo.py`
+  (since 2.30.0).
+- **If it breaks:** a renamed script makes photo-backup go through
+  `jxl_photo.py`: slower, nothing else. A script that does something else when
+  run as a module breaks the items above, and the contract test shows which
+  (every item runs this way).
+
+### JP-20 — Every page is checked before it takes its name
+
+- **Rule:** the encode of JP-2 (`--verify-roundtrip`, no `--delete-source`)
+  decodes every page it writes and compares it with that page of the TIFF
+  before the page takes its final name: a lossless page must decode to the
+  same pixels, a lossy one must hold the same image (mean brightness within
+  0.7× to 1/0.7× of the TIFF's, PSNR at least 20 dB). A page that fails, or
+  that cannot be checked (djxl failed or timed out, a 12-bit or float page
+  without imagecodecs), is an error: no JXL for it, and a non-zero exit (JP-9).
+  The check needs djxl on PATH: without it the run stops before any file, with
+  a non-zero exit. Each page checked says so in jxl-photo's log
+  (`>Round-trip verified page N (...)`).
+- **photo-backup:** passes `--verify-roundtrip` in `_jxlphoto_encode_args`;
+  `_validate_usage` and `manifest_backup._tiff_rows_errors` refuse a `Tiff`
+  profile before reading anything when `_djxl_on_path()` finds no djxl (exit 2,
+  `DJXL_MISSING`); `_encode_one` names a failed check `(JP-20)` with
+  jxl-photo's own ERROR line (`_jxlphoto_said`).
+- **jxl-photo:** `_VERIFY_EACH_PAGE` in `jxl_tiff_encoder.py`'s `convert_one`,
+  with `_verify_roundtrip_page` (the same check as the delete gate's), and the
+  djxl check in `_configure_run` (since 2.31.0-rc1).
+- **If it breaks:** a JXL that decodes to something else than its TIFF page
+  goes unseen again (JP-9) — only the contract test sees it: it counts the
+  `Round-trip verified page` lines of each encode against its JXL files, and
+  runs an encode with djxl taken off PATH, which must give no JXL and a
+  non-zero exit.
+
+### JP-21 — An empty `JXLPHOTO_SETTINGS` turns the settings overlay off
+
+- **Rule:** with `JXLPHOTO_SETTINGS` set and empty, jxl-photo reads no settings
+  overlay (`.jxl_script_settings.json` beside its scripts or in the user's
+  folder): a run has the settings written in its scripts, and nothing else.
+- **photo-backup:** `_jxlphoto_env` sets it, so a backup or a restore never
+  depends on an overlay made for jxl-photo's own presets (a `TEMP_DIR` on
+  another disk, a tag mode, an ICC strategy that JP-20 cannot check) — it runs
+  the defaults the contract test checks.
+- **jxl-photo:** `_settings_overlay_path` in `jxl_photo_common.py` (None when
+  the variable is set but empty), read by every backend.
+- **If it breaks:** a backup made with an overlay's settings, unnoticed. The
+  contract test puts an overlay beside a copy of the scripts and checks that it
+  is read without the variable and not with it.
+
 ## What jxl-photo may change freely
 
 Everything else: the menu and presets, the other modes and backends
-(`recompress`, `transcode`), its own defaults for anything photo-backup does
+(`recompress`), its own defaults for anything photo-backup does
 not pass (the compression of a decoded TIFF, workers, buffering), its speed,
 its logs' content, the names of pages after page 0, more marks in the XMP,
 files in the output folder that do not end in `.jxl`, which non-zero exit code
@@ -359,7 +477,9 @@ a failure has.
 - **photo-backup asks jxl-photo something new:** add an item here, a test in
   `tests/test_jxlphoto_contract.py`, the item's number in the message that
   reports it, and raise `JXLPHOTO_MIN_VERSION` to the first jxl-photo that
-  passes (run the test on its tags).
+  passes (run the test on its tags). Raise `JXLPHOTO_RESTORE_MIN_VERSION` only
+  for an item the restore needs (JP-10, JP-11, JP-13, JP-16, JP-18): a backup
+  must always come back with the jxl-photo it keeps.
 - **jxl-photo needs to change an item:** change photo-backup first (accepting
   the old and the new when it can) and release it, then jxl-photo. JP-5 never
   changes.

@@ -16,8 +16,12 @@ jxlphoto-page and jxlphoto-mpg, each holding a slice of the bytes. decode puts
 the slices back together as <stem>.tif. transcode keeps a JPEG's bytes in a
 JXL without marks, and gives them back with --format jpeg. The environment
 (set by the tests):
-    FAKE_JXLPHOTO_FAIL   exit | none | srcsum | short | changed (encode),
-                         exit | none | mismatch (transcode): how it fails
+    FAKE_JXLPHOTO_FAIL   exit | none | srcsum | short | changed | verify (encode),
+                         exit | none | mismatch (transcode): how it fails; verify:
+                         page 1 fails the page check (JP-20) and the run ends the
+                         way jxl-photo's does (ERROR line, then a summary), exit 1
+    FAKE_JXLPHOTO_ENVS   a folder: each call writes the JXLPHOTO_* variables it got
+Like jxl-photo, every command writes a log in JXLPHOTO_LOG_DIR\\<backend>\\.
     FAKE_JXLPHOTO_ONLY   fail only for a file whose name holds this text
     FAKE_JXLPHOTO_DECODE_FAIL   any value: decode (and the JPEG rebuild) stop with exit 1
     FAKE_JXLPHOTO_REBUILD_WRONG  any value: a rebuilt JPEG is not the original's bytes
@@ -71,6 +75,18 @@ def encode(tiff, folder):
         srcsum = "0" * 16
     match = re.search(rb"PAGES=(\d+)", data)
     pages = int(match.group(1)) if match else 1
+    if fail == "verify":            # page 0 written, page 1 fails its check: jxl-photo's output
+        name = os.path.basename(tiff)
+        stem = os.path.splitext(name)[0]
+        with open(os.path.join(folder, stem + ".jxl"), "wb") as handle:
+            handle.write(SIGNATURE + box(b"xml ", xmp([f"jxlphoto-srcsum:{srcsum}"])))
+        say(f"12:00:01 | ERROR | [2/2] ERROR page1 | {name} | round-trip verification FAILED "
+            f"on page 1: mean ratio 0.412, PSNR 14.2 dB — brightness is not the source's")
+        say("--------------------------------------------------")
+        say("12:00:01 | INFO | Done: 1 OK | 0 overwrites | 0 skipped | 1 errors")
+        say("12:00:01 | INFO | D50 patch: 0 applied | 2 skipped (already correct)")
+        say("12:00:01 | INFO | Log: (the fake's log)")
+        return 1
     stem = os.path.splitext(os.path.basename(tiff))[0]
     step = -(-len(data) // pages)
     written = pages - 1 if fail == "short" and pages > 1 else pages
@@ -161,6 +177,31 @@ def transcode(source, folder, argv):
     return 0
 
 
+LOG = []
+
+
+def say(line):
+    """A line of jxl-photo's output: to the console and to this call's log."""
+    print(line)
+    LOG.append(line)
+
+
+BACKENDS = {"encode": "jxl_tiff_encoder", "decode": "jxl_tiff_decoder",
+            "transcode": "jxl_jpeg_transcoder"}
+
+
+def write_log(argv, code):
+    folder = os.environ.get("JXLPHOTO_LOG_DIR")
+    if not folder or not argv or argv[0] not in BACKENDS or "--version" in argv:
+        return
+    folder = os.path.join(folder, BACKENDS[argv[0]])
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, f"{time.time_ns():020d}_{os.getpid()}.log"), "w",
+              encoding="utf-8") as handle:
+        handle.write("\n".join([f"fake jxl-photo {' '.join(argv)}"] + LOG
+                               + [f"exit {code}"]) + "\n")
+
+
 def main(argv):
     calls = os.environ.get("FAKE_JXLPHOTO_CALLS")
     if calls:                           # a folder: one file per call (calls run at once)
@@ -168,6 +209,19 @@ def main(argv):
         name = f"{time.time_ns():020d}_{os.getpid()}.json"
         with open(os.path.join(calls, name), "w", encoding="utf-8") as handle:
             json.dump(argv, handle)
+    envs = os.environ.get("FAKE_JXLPHOTO_ENVS")
+    if envs:
+        os.makedirs(envs, exist_ok=True)
+        name = f"{time.time_ns():020d}_{os.getpid()}.json"
+        with open(os.path.join(envs, name), "w", encoding="utf-8") as handle:
+            json.dump({"argv": argv, **{key: value for key, value in os.environ.items()
+                                        if key.startswith("JXLPHOTO_")}}, handle)
+    code = run(argv)
+    write_log(argv, code)
+    return code
+
+
+def run(argv):
     if len(argv) >= 2 and argv[1] == "--version":
         print("jxl-photo" if VERSION == "none" else f"jxl-photo {VERSION}")
         return 0

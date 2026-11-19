@@ -25,6 +25,7 @@ JXL; --convert-back none (or --keep-jxl) keeps every one as JXL.
 
 import argparse
 import collections
+import hashlib
 import math
 import os
 import re
@@ -33,11 +34,12 @@ import sqlite3
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc3"
+__version__ = "0.14.0-rc4"
 
 # ---- Settings -------------------------------------------------------------------
 SPACE_MARGIN_GB = 5.0     # free space kept on each restore target drive (default --space-margin-gb)
@@ -110,8 +112,11 @@ def _target_for(row, args, kept_jxl=False):
 def _find_jxlphoto(given, backup):
     """(path, where) of the jxl-photo that turns a JXL back into its TIFF:
     --jxlphoto / JXLPHOTO when it is there, else the newest one the backup
-    keeps in its tools folder (KEEP_TOOLS_IN_BACKUP); (None, why) when none."""
-    if given and sb._jxlphoto_problem(given) is None:
+    keeps in its tools folder (KEEP_TOOLS_IN_BACKUP); (None, why) when none.
+    The restore's own minimum (JXLPHOTO_RESTORE_MIN_VERSION, v0.14.0-rc4): a
+    backup made with an older jxl-photo comes back with the copy it keeps."""
+    minimum = sb.JXLPHOTO_RESTORE_MIN_VERSION
+    if given and sb._jxlphoto_problem(given, minimum) is None:
         return given, "JXLPHOTO" if given == sb.JXLPHOTO else "--jxlphoto"
     tools = os.path.join(backup, sb.CATALOG_FOLDER, sb.TOOLS_FOLDER)
     found = []
@@ -128,9 +133,9 @@ def _find_jxlphoto(given, backup):
                         found.append((numbers, name == "jxl_photo.py", candidate))
     except OSError:
         pass
-    why = sb._jxlphoto_problem(given) or "jxl-photo not found"
+    why = sb._jxlphoto_problem(given, minimum) or "jxl-photo not found"
     for _numbers, _is_py, candidate in sorted(found, reverse=True):
-        problem = sb._jxlphoto_problem(candidate)   # the contract holds for it too (JP-1)
+        problem = sb._jxlphoto_problem(candidate, minimum)  # the contract holds for it too (JP-1)
         if problem is None:
             return candidate, "kept in the backup"
         why = f"{why}; the one kept in the backup: {problem}"
@@ -163,6 +168,8 @@ def _restore_group(group, backup, target, jxlphoto, work):
     os.makedirs(sb._io(work_out))
     ext = os.path.splitext(group.rel)[1]
     try:
+        if group.kind == "jpeg" and sb._djxl_path() is not None:
+            return _rebuild_jpeg_with_djxl(group, backup, target, work_out)
         for row, _conv in group.members:
             src = os.path.join(backup, row.rel)
             size = os.stat(sb._io(src)).st_size
@@ -193,7 +200,7 @@ def _restore_group(group, backup, target, jxlphoto, work):
             run = sb._run_jxlphoto(jxlphoto, arguments, max(sb.JXL_TIMEOUT_MIN, 1) * 60)
         except subprocess.TimeoutExpired:
             return "ERROR", f"jxl-photo took more than {sb.JXL_TIMEOUT_MIN} min"
-        said = sb._tail((run.stdout or "") + "\n" + (run.stderr or ""))
+        said = sb._jxlphoto_said(run)
         if run.returncode != 0:
             return "ERROR", f"jxl-photo stopped with exit {run.returncode} ({item}): {said}"
         with os.scandir(sb._io(work_out)) as listing:
@@ -221,6 +228,48 @@ def _restore_group(group, backup, target, jxlphoto, work):
                 f"({group.conv.settings}); not the original TIFF's bytes")
     finally:
         sb._remove_own_folder(work)
+
+
+def _rebuild_jpeg_with_djxl(group, backup, target, work_out):
+    """A JPEG kept as JXL, the fast way (v0.14.0-rc4): its JXL is read once from
+    the backup (never written there) and checked against its catalog SHA-256;
+    libjxl's djxl rebuilds the JPEG in memory (JP-18), which must have the
+    original's SHA-256; it is written next to the target and takes its name,
+    never replacing a file. (status, detail)."""
+    row, _conv = group.members[0]
+    with open(sb._io(os.path.join(backup, row.rel)), "rb") as handle:
+        data = handle.read()
+    if len(data) != row.size or (row.sha256 and hashlib.sha256(data).hexdigest() != row.sha256):
+        return ("CORRUPT_IN_BACKUP", f"{row.rel}: the backup copy is not the one the catalog "
+                                     f"recorded (size or SHA-256)")
+    try:
+        jpeg = sb._rebuild_jpeg(None, None, work_out, max(sb.JXL_TIMEOUT_MIN, 1) * 60, data=data)
+    except sb._ConvertFailed as exc:
+        return "ERROR", f"{exc}; nothing was written at the target"
+    if hashlib.sha256(jpeg).hexdigest() != group.sha256:
+        return "ERROR", ("the JPEG rebuilt from its JXL is not the original's bytes (JP-18); "
+                         "nothing was written at the target")
+    result = os.path.join(work_out, "rebuilt.jpg")
+    with open(sb._io(result), "wb") as handle:
+        handle.write(jpeg)
+        handle.flush()
+        os.fsync(handle.fileno())
+    mtime_ns = group.conv.source_mtime_ns
+    os.utime(sb._io(result), ns=(mtime_ns, mtime_ns))       # the original's date
+    try:
+        sb._rename_no_clobber(result, target)
+    except FileExistsError:
+        return "CONFLICT", "the target appeared during the restore; left as it was"
+    return ("RESTORED", "rebuilt from its JXL by djxl: the original JPEG's bytes "
+                        "(SHA-256 checked)")
+
+
+def _run_group(group, backup, target, jxlphoto, work):
+    """_restore_group on a worker thread: every error becomes a status."""
+    try:
+        return _restore_group(group, backup, target, jxlphoto, work)
+    except Exception as exc:
+        return "ERROR", str(exc)
 
 
 def _resolve_exists(row, src, target):
@@ -372,9 +421,10 @@ def _main(argv):
                     if isinstance(entry, _JxlGroup) and entry.conv.source_key in kept_as_jxl
                     else [entry])]
         groups = {key: group for key, group in groups.items() if key not in kept_as_jxl}
-    jxlphoto = jxlphoto_where = None
+    jxlphoto = jxlphoto_where = djxl = None
     if groups:
         jxlphoto, jxlphoto_where = _find_jxlphoto(args.jxlphoto, backup)
+        djxl = sb._djxl_path()          # a JPEG needs only djxl (JP-18), a TIFF jxl-photo
     patterns = args.only
     matched = set()
     items = []
@@ -400,7 +450,7 @@ def _main(argv):
             status = "MISSING_IN_BACKUP"
         elif sb._exists(target):
             status = "EXISTS"
-        elif is_group and jxlphoto is None:
+        elif is_group and jxlphoto is None and not (row.kind == "jpeg" and djxl):
             status = "NEEDS_JXLPHOTO"
         else:
             status = "RESTORE"
@@ -445,10 +495,13 @@ def _main(argv):
     from_jxl = [item[1] for item in items if isinstance(item[1], _JxlGroup)]
     if from_jxl:
         kinds = collections.Counter(group.kind.upper() for group in from_jxl)
+        how = [f"JPEG by djxl ({djxl})"] if djxl and kinds.get("JPEG") else []
+        if kinds.get("TIFF") or not djxl:
+            how.append(f"by {sb._jxlphoto_version(jxlphoto)}, {jxlphoto_where}: {jxlphoto}"
+                       if jxlphoto else "jxl-photo is needed")
         lines.append(f"Kept as JXL, back to their format ({convert_back}): "
                      f"{', '.join(f'{sb._num(count)} {kind}' for kind, count in sorted(kinds.items()))}"
-                     + (f" -- by {sb._jxlphoto_version(jxlphoto)}, {jxlphoto_where}: {jxlphoto}"
-                        if jxlphoto else " -- jxl-photo is needed"))
+                     + "".join(f" -- {text}" for text in how))
     as_jxl = [row for _status, row, _src, _target in items
               if not isinstance(row, _JxlGroup) and row.key in converted]
     if as_jxl:
@@ -458,8 +511,9 @@ def _main(argv):
                      f"TIFF or JPEG)")
     if counts.get("NEEDS_JXLPHOTO"):
         lines.append(f"NEEDS_JXLPHOTO: {sb._num(counts['NEEDS_JXLPHOTO'])} TIFF or JPEG kept as "
-                     f"JXL cannot be made without jxl-photo ({jxlphoto_where}). Set JXLPHOTO or "
-                     f"--jxlphoto, or restore them as JXL with --convert-back none.")
+                     f"JXL cannot be made without jxl-photo ({jxlphoto_where}; a JPEG needs only "
+                     f"libjxl's djxl). Set JXLPHOTO or --jxlphoto, or restore them as JXL with "
+                     f"--convert-back none.")
     # B21: an --only that matches nothing is named, and the run ends with exit 1
     unmatched = [pattern for pattern in (patterns or []) if pattern not in matched]
     for pattern in unmatched:
@@ -488,7 +542,7 @@ def _main(argv):
             return 1 if bad or unmatched else 0
         if not args.yes:
             try:
-                answer = input(f"Restore {sb._num(len(restores))} files? [y/N] ")
+                answer = input(f"Restore {sb._num(len(restores))} files? [y/N, Enter = no] ")
             except EOFError:
                 print("Aborted.")
                 log.log("Aborted (no answer)")
@@ -501,6 +555,10 @@ def _main(argv):
                 print("Aborted.")
                 log.log("Aborted by the user")
                 return 2
+        # The files kept as JXL come back on worker threads (JXL_WORKERS JPEGs,
+        # fewer TIFFs at a time: JXL_TIFF_WORKERS) while the plain copies go on in
+        # order; each result keeps its place in the list.
+        results = [None] * len(items)
         result_rows = []
         bad = False
         total_bytes = sum(row.size for _status, row, _src, _target in restores)
@@ -508,30 +566,53 @@ def _main(argv):
         started = time.monotonic()
         last_report = started
         tolerance = int(sb.MTIME_TOLERANCE_S * 1_000_000_000)
+        workers = sb._jxl_workers()
+        jpeg_pool = ThreadPoolExecutor(max_workers=workers)
+        tiff_pool = ThreadPoolExecutor(max_workers=min(workers, sb._jxl_tiff_workers()))
+        pending = {}
+
+        def report(force=False):
+            nonlocal last_report
+            now = time.monotonic()
+            if force or now - last_report >= sb.PROGRESS_EVERY_S:
+                speed = done_bytes / max(now - started, 1e-6)
+                eta = (total_bytes - done_bytes) / speed if speed > 0 else 0
+                finished = sum(1 for item in results if item is not None)
+                print(f"[{finished}/{len(items)}] {sb._gb(done_bytes)}/"
+                      f"{sb._gb(total_bytes)}  {speed / 1e6:.0f} MB/s  ETA {sb._hms(eta)}")
+                last_report = now
+
+        def collect(future):
+            """A file kept as JXL is back (or not): its result, on the main thread."""
+            nonlocal bad, done_bytes
+            index, row, target = pending.pop(future)
+            status, detail = future.result()
+            if status in ("RESTORED_FROM_JXL", "RESTORED"):
+                done_bytes += row.size
+            else:
+                bad = True
+            results[index] = (status, row.rel, target, detail)
+            log.log(f"{status} {row.rel}" + (f": {detail}" if detail else ""))
+
         try:
             for index, (status, row, src, target) in enumerate(items):
-                now = time.monotonic()
-                if now - last_report >= sb.PROGRESS_EVERY_S:
-                    speed = done_bytes / max(now - started, 1e-6)
-                    eta = (total_bytes - done_bytes) / speed if speed > 0 else 0
-                    print(f"[{len(result_rows)}/{len(items)}] {sb._gb(done_bytes)}/"
-                          f"{sb._gb(total_bytes)}  {speed / 1e6:.0f} MB/s  ETA {sb._hms(eta)}")
-                    last_report = now
+                for future in [future for future in pending if future.done()]:
+                    collect(future)
+                report()
                 if status == "MISSING_IN_BACKUP":
-                    result_rows.append((status, row.rel, target, "backup file missing"))
+                    results[index] = (status, row.rel, target, "backup file missing")
                     bad = True
                     log.log(f"MISSING_IN_BACKUP {row.rel}")
                     continue
                 if status == "REFUSED":
-                    result_rows.append((status, row.rel, target,
-                                        "the target is inside the backup"))
+                    results[index] = (status, row.rel, target, "the target is inside the backup")
                     bad = True
                     log.log(f"REFUSED {row.rel}: the target is inside the backup")
                     continue
                 is_group = isinstance(row, _JxlGroup)
                 if status == "NEEDS_JXLPHOTO":
-                    result_rows.append((status, row.rel, target,
-                                        f"kept as JXL; jxl-photo not found ({jxlphoto_where})"))
+                    results[index] = (status, row.rel, target,
+                                      f"kept as JXL; jxl-photo not found ({jxlphoto_where})")
                     bad = True
                     log.log(f"NEEDS_JXLPHOTO {row.rel}")
                     continue
@@ -540,11 +621,11 @@ def _main(argv):
                         outcome, detail = (_resolve_group_exists(row, target) if is_group
                                            else _resolve_exists(row, src, target))
                     except OSError as exc:
-                        result_rows.append(("ERROR", row.rel, target, str(exc)))
+                        results[index] = ("ERROR", row.rel, target, str(exc))
                         bad = True
                         log.log(f"ERROR {row.rel}: {exc}")
                         continue
-                    result_rows.append((outcome, row.rel, target, detail))
+                    results[index] = (outcome, row.rel, target, detail)
                     if outcome == "CONFLICT":
                         bad = True
                     log.log(f"{outcome} {row.rel}")
@@ -553,16 +634,9 @@ def _main(argv):
                     work = os.path.join(os.path.dirname(os.path.abspath(target)),
                                         f"{os.path.basename(target)}.restoring_{stamp}_{index}"
                                         f"{sb.TEMP_SUFFIX}")
-                    try:
-                        status, detail = _restore_group(row, backup, target, jxlphoto, work)
-                    except Exception as exc:
-                        status, detail = "ERROR", str(exc)
-                    if status in ("RESTORED_FROM_JXL", "RESTORED"):
-                        done_bytes += row.size
-                    else:
-                        bad = True
-                    result_rows.append((status, row.rel, target, detail))
-                    log.log(f"{status} {row.rel}" + (f": {detail}" if detail else ""))
+                    pool = jpeg_pool if row.kind == "jpeg" else tiff_pool
+                    pending[pool.submit(_run_group, row, backup, target, jxlphoto, work)] = (
+                        index, row, target)
                     continue
                 try:
                     backup_stat = os.stat(sb._io(src))
@@ -601,13 +675,26 @@ def _main(argv):
                     status = "ERROR"
                     detail = str(exc)
                     bad = True
-                result_rows.append((status, row.rel, target, detail))
+                results[index] = (status, row.rel, target, detail)
                 log.log(f"{status} {row.rel}" + (f": {detail}" if detail else ""))
+            for future in as_completed(list(pending)):
+                collect(future)
+                report()
         except KeyboardInterrupt:
+            for pool in (jpeg_pool, tiff_pool):
+                pool.shutdown(wait=True, cancel_futures=True)
+            for future in [future for future in pending if future.done()
+                           and not future.cancelled()]:
+                collect(future)
             print("Interrupted.", file=sys.stderr)
             log.log("Interrupted.")
-            log.csv(".csv", ["status", "rel", "target", "detail"], result_rows)
+            log.csv(".csv", ["status", "rel", "target", "detail"],
+                    [item for item in results if item is not None])
             return 130
+        finally:
+            for pool in (jpeg_pool, tiff_pool):
+                pool.shutdown(wait=True, cancel_futures=True)
+        result_rows = [item for item in results if item is not None]
         log.csv(".csv", ["status", "rel", "target", "detail"], result_rows)
         result_counts = {}
         for status, _rel, _target, _detail in result_rows:

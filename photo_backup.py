@@ -28,7 +28,7 @@ import string
 import subprocess
 import sys
 
-__version__ = "0.14.0-rc3"
+__version__ = "0.14.0-rc4"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
@@ -120,9 +120,26 @@ def _menu_title():
         pass
 
 
+def _remembered_jxlphoto():
+    """The jxl-photo the menu remembers ([4] Settings, v0.14.0-rc4), or ""."""
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as handle:
+            value = json.load(handle).get("jxlphoto", "")
+        return value if isinstance(value, str) else ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
 def _run_child(script, argv):
     """Run one of the scripts with `argv`; its output (and its questions) go
-    straight to the console."""
+    straight to the console. A script that converts or restores files kept as
+    JXL gets the jxl-photo the menu remembers (`--jxlphoto`), unless `argv`
+    names one: the path of your jxl-photo stays out of the scripts."""
+    argv = list(argv)
+    remembered = _remembered_jxlphoto()
+    if (remembered and "--jxlphoto" not in argv
+            and script in (BACKEND, RESTORE, MANIFEST_BACKEND, MIRROR_BACKEND)):
+        argv += ["--jxlphoto", remembered]
     try:
         return subprocess.run([sys.executable, script, *argv]).returncode
     except KeyboardInterrupt:
@@ -195,7 +212,7 @@ def ask(prompt, default=None):
 
 
 def yes_no(prompt, default):
-    hint = "Y/n" if default else "y/N"
+    hint = "Y/n, Enter = yes" if default else "y/N, Enter = no"
     while True:
         answer = ask(f"{prompt} ({hint})").casefold()
         if not answer:
@@ -594,7 +611,8 @@ def offer_preset(config, session, kind):
     config["presets"][name] = dict(
         session, kind=kind, backup_id=_backend().read_backup_id(session["dest"]))
     save_config(config)
-    say(f"Saved. Unattended: python photo_backup.py --run-preset \"{name}\"", "green")
+    say(f"Saved. Unattended: {_backend()._run_command('photo_backup.py')} --run-preset "
+        f"\"{name}\"", "green")
 
 
 def _locate_backup(preset):
@@ -1026,7 +1044,8 @@ def offer_mirror_preset(config, manifest, dest, captureone):
                                "dest": dest, "captureone": bool(captureone),
                                "backup_id": _backend().read_backup_id(dest)}
     save_config(config)
-    say(f"Saved. Unattended: python photo_backup.py --run-preset \"{name}\"", "green")
+    say(f"Saved. Unattended: {_backend()._run_command('photo_backup.py')} --run-preset "
+        f"\"{name}\"", "green")
     say("  Unattended, the mirror never deletes for good before the trash's date and stops "
         "(changing nothing) when something needs a typed number.")
 
@@ -1116,8 +1135,21 @@ def settings_menu(config):
         say(f"    {name:<26} {_setting(name)!r}")
     say("  TIFF and JPEG kept as JXL in the backup (a manifest's Tiff and Jpeg columns):")
     for name in ("JXLPHOTO", "JXLPHOTO_MIN_VERSION", "TIFF_JXL_PROFILES", "JPEG_JXL_EXTENSIONS",
-                 "KEEP_TOOLS_IN_BACKUP", "KEEP_TOOLS_EXTRA"):
+                 "JXL_WORK_DIR", "KEEP_TOOLS_IN_BACKUP", "KEEP_TOOLS_EXTRA"):
         say(f"    {name:<26} {_setting(name)!r}")
+    remembered = config.get("jxlphoto") or ""
+    say(f"  jxl-photo the menu gives the scripts: {remembered or '(none: JXLPHOTO above)'}")
+    if yes_no("Set where jxl-photo is (to keep TIFF and JPEG as JXL, and to restore them)?",
+              False):
+        path = ask("Its jxl_photo.py or jxl-photo.exe (type - for none)", remembered)
+        path = "" if path.strip() == "-" else path.strip().strip('"')
+        problem = _backend()._jxlphoto_problem(path) if path else None
+        if problem:
+            say(f"  Not saved: {problem}", "yellow")
+        else:
+            config["jxlphoto"] = path
+            save_config(config)
+            say(f"  Saved: {path}" if path else "  Forgotten: the scripts use JXLPHOTO.")
     say("  Defaults of mirror_backup.py (edit the top of that file to change them):")
     for name in ("MIRROR_KEEP_DAYS", "MIRROR_MAX_DELETE_PERCENT", "MIRROR_MAX_DELETE_MIN"):
         say(f"    {name:<26} {_mirror_setting(name)!r}")

@@ -5,8 +5,11 @@ import csv
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -51,8 +54,11 @@ def closed_console(monkeypatch):
     monkeypatch.setattr("builtins.input", closed)
 
 
-@pytest.fixture
-def env(tmp_path, monkeypatch):
+@pytest.fixture(params=["copy", "rename"])
+def env(request, tmp_path, monkeypatch):
+    """A source, a fake jxl-photo, and how a finished JXL reaches the backup:
+    `copy` (the work folder on another drive, as the system's temp folder is on
+    a real computer; conftest's default) or `rename` (the same drive)."""
     root = tmp_path / HOSTILE
     src = make_tree(root / "SRC", TREE)
     tool_dir = tmp_path / "jxl-photo"
@@ -64,11 +70,20 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(sb, "JXL_WORKERS", 2)
     monkeypatch.setenv("FAKE_JXLPHOTO_CALLS", str(calls))
     for name in ("FAKE_JXLPHOTO_FAIL", "FAKE_JXLPHOTO_ONLY", "FAKE_JXLPHOTO_DECODE_FAIL",
-                 "FAKE_JXLPHOTO_VERSION"):
+                 "FAKE_JXLPHOTO_VERSION", "FAKE_JXLPHOTO_ENVS"):
         monkeypatch.delenv(name, raising=False)
+    if request.param == "rename":
+        monkeypatch.setattr(sb, "_jxl_copy_needed", lambda work_root, dest: False)
     sb._JXLPHOTO_VERSIONS.clear()
     return SimpleNamespace(root=root, src=src, dest=root / "dest", tool=tool, calls=calls,
-                           out=root / "restored")
+                           out=root / "restored", mode=request.param)
+
+
+def no_work_left(env):
+    """Nothing of the conversions is left: this run's work folder is gone, and
+    the backup holds no work folder (before v0.14.0-rc4 it was there)."""
+    work = Path(sb.JXL_WORK_DIR, sb.JXL_WORK_FOLDER, str(os.getpid()))
+    return not work.exists() and not Path(env.dest, sb.CATALOG_FOLDER, "converting").exists()
 
 
 def backup(env, *extra):
@@ -194,7 +209,7 @@ def test_j2_new_tiffs_become_jxl(env, capsys):
     out = capsys.readouterr().out
     assert "TIFF kept as JXL (jxl: d=0.05 scan=0 8bit=0 e=7): 3 to convert" in out
     assert "Kept as JXL: 3 converted (3 TIFF)" in out
-    assert not Path(env.dest, sb.CATALOG_FOLDER, sb.JXL_WORK_FOLDER).exists()
+    assert no_work_left(env)
 
 
 # ---- J3 a second run, a changed TIFF, another profile --------------------------------------
@@ -270,7 +285,7 @@ def test_j5_a_failed_conversion_copies_the_tiff(env, monkeypatch, how, photoback
     assert (env.dest / "2025/scans/000038.tif").read_bytes() == (
         env.src / "2025/scans/000038.tif").read_bytes()
     assert {"2025/shoot/DSC_0001.tif.jxl", "2025/scans/000037.tiff.jxl"} <= have
-    assert not Path(env.dest, sb.CATALOG_FOLDER, sb.JXL_WORK_FOLDER).exists()
+    assert no_work_left(env)
     # the next run converts it, and the TIFF copy goes to versions
     monkeypatch.delenv("FAKE_JXLPHOTO_FAIL")
     assert backup(env, "--tiff", "jxl") == 0
@@ -595,7 +610,7 @@ def test_j14_ctrl_c_while_converting(env, monkeypatch):
         placed.append(real(*args, **kwargs))
     monkeypatch.setattr(sb, "_place_group", place_then_stop)
     assert backup(env, "--tiff", "jxl") == 130
-    assert not Path(env.dest, sb.CATALOG_FOLDER, sb.JXL_WORK_FOLDER).exists()
+    assert no_work_left(env)
     groups = {source for source, *_rest in converted(env.dest).values()}
     assert len(groups) == 1                             # the one placed is whole and recorded
     have = backed(env.dest)
@@ -648,3 +663,269 @@ def test_j15_the_restore_never_runs_an_old_kept_jxlphoto(env, monkeypatch, capsy
     out = capsys.readouterr().out
     assert "NEEDS_JXLPHOTO: 3 TIFF or JPEG kept as JXL" in out and "older than" in out
     assert restored(env) == OTHERS
+
+
+# ---- J27-J35 the conversions outside the backup, jxl-photo 2.31 (v0.14.0-rc4) --------------------
+def test_j27_conversions_run_outside_the_backup_with_their_own_logs(env, monkeypatch,
+                                                                    photobackup_log_dir):
+    envs = env.root / "envs"
+    monkeypatch.setenv("FAKE_JXLPHOTO_ENVS", str(envs))
+    assert backup(env, "--tiff", "jxl") == 0
+    assert backed(env.dest) == OTHERS | JXL
+    assert no_work_left(env)
+    work_root = Path(sb.JXL_WORK_DIR, sb.JXL_WORK_FOLDER, str(os.getpid()))
+    calls = [json.loads(path.read_text(encoding="utf-8")) for path in envs.glob("*.json")]
+    encode_calls = [call for call in calls
+                    if call["argv"][0] == "encode" and "--version" not in call["argv"]]
+    assert len(encode_calls) == 3
+    for call in encode_calls:
+        folder = Path(call["argv"][2])                  # this conversion's own folder
+        assert folder.parent == work_root               # outside the backup
+        assert Path(call["JXLPHOTO_LOG_DIR"]) == folder / "log"
+        assert call["JXLPHOTO_SETTINGS"] == ""          # jxl-photo's own defaults (JP-21)
+    # a conversion that worked leaves no log
+    assert not list(Path(photobackup_log_dir, "jxl-photo").rglob("*.log"))
+
+
+def test_j28_a_page_that_fails_its_check_is_named_and_its_log_kept(env, monkeypatch,
+                                                                   photobackup_log_dir):
+    monkeypatch.setenv("FAKE_JXLPHOTO_FAIL", "verify")
+    monkeypatch.setenv("FAKE_JXLPHOTO_ONLY", "000038")
+    assert backup(env, "--tiff", "jxl") == 1
+    line = next(line for line in latest_log(photobackup_log_dir).splitlines()
+                if "CONVERT FAILED" in line)
+    assert "(JP-20)" in line and "round-trip verification FAILED on page 1" in line
+    assert "12:00:01" not in line                       # jxl-photo's time is left out
+    kept = Path(re.search(r"jxl-photo's log: (.+\.log)", line).group(1))
+    assert kept.parent == Path(photobackup_log_dir, "jxl-photo")
+    assert "round-trip verification FAILED" in kept.read_text(encoding="utf-8")
+    assert [path.name for path in kept.parent.rglob("*.log")] == [kept.name]   # only its log
+    have = backed(env.dest)
+    assert "2025/scans/000038.tif" in have and not {rel for rel in have if "000038" in rel
+                                                     and rel.endswith(".jxl")}
+    assert {"2025/shoot/DSC_0001.tif.jxl", "2025/scans/000037.tiff.jxl"} <= have
+    assert no_work_left(env)
+
+
+def test_j29_without_djxl_a_tiff_profile_is_refused_before_reading(env, monkeypatch, capsys):
+    monkeypatch.setattr(sb, "_djxl_on_path", lambda: None)
+    assert backup(env, "--tiff", "jxl") == 2
+    assert "djxl is not on PATH" in capsys.readouterr().err
+    man = write_manifest(env.root / "m.csv", (env.src / "2025", "6", "", "", "jxl"))
+    assert mb.main(["--manifest", str(man), "--dest", str(env.dest), "--yes"]) == 2
+    assert mir.main(["--manifest", str(man), "--dest", str(env.dest), "--yes"]) == 2
+    assert "JP-20" in capsys.readouterr().err
+    assert not env.dest.exists()
+    assert backup(env, "--jpeg", "jxl") == 0            # a JPEG does not need it from jxl-photo
+
+
+def test_j30_the_work_folder_is_never_in_a_source_or_the_backup(env, monkeypatch, capsys):
+    for inside in (env.src / "2025" / "work", env.dest / "work"):
+        monkeypatch.setattr(sb, "JXL_WORK_DIR", str(inside))
+        assert backup(env, "--tiff", "jxl") == 2
+        assert "JXL_WORK_DIR overlaps" in capsys.readouterr().err
+        man = write_manifest(env.root / "m.csv", (env.src / "2025", "6", "", "", "jxl"))
+        assert mir.main(["--manifest", str(man), "--dest", str(env.dest), "--yes"]) == 2
+        assert "JXL_WORK_DIR overlaps" in capsys.readouterr().err
+    assert not (env.src / "2025" / "work").exists() and not env.dest.exists()
+
+
+def test_j31_the_work_folders_of_backups_that_died_are_removed(env):
+    """Only a folder named by a process number that no longer runs AND that
+    holds a run's mark (rc4 review, finding 1)."""
+    parent = Path(sb.JXL_WORK_DIR, sb.JXL_WORK_FOLDER)
+    dead, unmarked = parent / "999999", parent / "999998"
+    alive, other = parent / str(os.getppid()), parent / "not a number"
+    for folder in (dead, unmarked, alive, other):
+        (folder / "7").mkdir(parents=True)
+        (folder / "7" / "x.jxl").write_bytes(b"left")
+    for folder in (dead, alive, other):
+        (folder / sb._WORK_MARK).write_text("mark", encoding="utf-8")
+    assert not sb._pid_alive(999999) and not sb._pid_alive(999998)
+    assert sb._pid_alive(os.getppid()) and sb._pid_alive(os.getpid())
+    assert backup(env, "--tiff", "jxl") == 0
+    assert not dead.exists()
+    assert unmarked.exists() and alive.exists() and other.exists()
+    assert no_work_left(env)
+
+
+def test_j32_the_converters_never_run_far_ahead_of_the_writer(env, monkeypatch):
+    make_tree(env.src, {f"2025/many/IMG_{number:03d}.tif": f"TIFF16 IMG_{number:03d} " * 20
+                        for number in range(12)})
+    monkeypatch.setattr(sb, "JXL_TIFF_WORKERS", 1)
+    counts = {"started": 0, "placed": 0, "ahead": 0}
+    lock = threading.Lock()
+    real_convert, real_place = sb._convert_one, sb._place_group
+
+    def convert(*args, **kwargs):
+        with lock:
+            counts["started"] += 1
+            counts["ahead"] = max(counts["ahead"], counts["started"] - counts["placed"])
+        return real_convert(*args, **kwargs)
+
+    def place(*args, **kwargs):
+        time.sleep(0.05)                                # a slow backup disk
+        result = real_place(*args, **kwargs)
+        with lock:
+            counts["placed"] += 1
+        return result
+    monkeypatch.setattr(sb, "_convert_one", convert)
+    monkeypatch.setattr(sb, "_place_group", place)
+    assert backup(env, "--tiff", "jxl") == 0
+    assert counts["placed"] == 15
+    assert counts["ahead"] <= 2                         # twice the TIFF pool (1)
+
+
+def test_j33_a_group_that_cannot_be_written_whole_leaves_nothing(env, monkeypatch,
+                                                                 photobackup_log_dir):
+    if env.mode != "copy":
+        pytest.skip("the copy to the backup's drive")
+    real = sb._write_jxl_temp
+
+    def fail_on_page_1(path, target, *args):
+        if target.endswith("000038_page1.tif.jxl"):
+            raise OSError("the disk is full (test)")
+        return real(path, target, *args)
+    monkeypatch.setattr(sb, "_write_jxl_temp", fail_on_page_1)
+    assert backup(env, "--tiff", "jxl") == 1
+    assert "the JXL could not be put in place" in latest_log(photobackup_log_dir)
+    have = backed(env.dest)
+    assert "2025/scans/000038.tif" in have                  # copied as it is
+    assert not {rel for rel in have if "000038" in rel
+                and rel.endswith((".jxl", sb.TEMP_SUFFIX))}
+    assert {"2025/shoot/DSC_0001.tif.jxl", "2025/scans/000037.tiff.jxl"} <= have
+    assert no_work_left(env)
+
+
+def test_j34_what_jxlphoto_said():
+    run = SimpleNamespace(stdout=(
+        "12:00:00 | INFO | Round-trip verification of every page written\n"
+        "12:00:01 | ERROR | [1/1] ERROR | a.tif | round-trip verification FAILED on page 0: "
+        "lossless encode did not decode back pixel-identical\n"
+        "--------------------------------------------------\n"
+        "12:00:01 | INFO | Done: 0 OK | 0 overwrites | 0 skipped | 1 errors\n"), stderr="")
+    assert sb._jxlphoto_said(run) == ("[1/1] ERROR | a.tif | round-trip verification FAILED "
+                                      "on page 0: lossless encode did not decode back "
+                                      "pixel-identical")
+    assert sb._jxlphoto_said(SimpleNamespace(stdout="", stderr="ERROR: EncodeImageJXL() failed\n")
+                             ) == "EncodeImageJXL() failed"
+    assert sb._jxlphoto_said(SimpleNamespace(stdout="a\nb\nc\nd\ne\n", stderr=None)
+                             ) == "b | c | d | e"
+
+
+def test_j35_the_minimum_is_a_jxlphoto_that_checks_every_page():
+    key = sb._version_key
+    assert key("jxl-photo 2.31.0-rc1") >= key(sb.JXLPHOTO_MIN_VERSION)
+    assert key("jxl-photo 2.31.0") >= key(sb.JXLPHOTO_MIN_VERSION)
+    assert key("jxl-photo 2.30.2") < key(sb.JXLPHOTO_MIN_VERSION)
+    assert key("jxl-photo 2.30.2") >= key(sb.JXLPHOTO_RESTORE_MIN_VERSION)
+
+
+REAL_COPY_NEEDED = sb._jxl_copy_needed         # conftest puts a stand-in for every test
+REAL_DJXL_ON_PATH = sb._djxl_on_path
+
+
+# ---- J37-J44 the findings of the rc4 review ------------------------------------------------------
+def test_j37_a_work_folder_name_that_is_not_one_name_is_refused(env, monkeypatch, capsys):
+    for name in ("", " ", "..", ".", "a\\b", "a/b", "C:"):
+        monkeypatch.setattr(sb, "JXL_WORK_FOLDER", name)
+        assert backup(env, "--tiff", "jxl") == 2, name
+        assert "JXL_WORK_FOLDER must be one plain folder name" in capsys.readouterr().err
+    assert not env.dest.exists()
+    monkeypatch.setattr(sb, "JXL_WORK_FOLDER", "")
+    with pytest.raises(OSError):
+        sb._work_root()                         # never a sweep of JXL_WORK_DIR itself
+
+
+def test_j38_the_default_work_folder_is_checked_too(env, monkeypatch, capsys):
+    monkeypatch.setattr(sb, "JXL_WORK_DIR", "")
+    monkeypatch.setattr(sb.tempfile, "gettempdir", lambda: str(env.src / "2025" / "Temp"))
+    (env.src / "2025" / "Temp").mkdir()
+    assert backup(env, "--tiff", "jxl") == 2
+    err = capsys.readouterr().err
+    assert "JXL_WORK_DIR overlaps a source" in err and "system's temp folder" in err
+    monkeypatch.setattr(sb, "JXL_WORK_DIR", str(env.root / "missing"))
+    assert backup(env, "--tiff", "jxl") == 2
+    assert "JXL_WORK_DIR does not exist" in capsys.readouterr().err
+    assert not env.dest.exists()
+
+
+def test_j39_a_work_folder_that_cannot_be_made_copies_every_file(env, monkeypatch,
+                                                                photobackup_log_dir):
+    def cannot():
+        raise OSError("the disk of the work folder is gone (test)")
+    monkeypatch.setattr(sb, "_work_root", cannot)
+    assert backup(env, "--tiff", "jxl") == 1                # no traceback, nothing left out
+    assert backed(env.dest) == OTHERS | TIFFS
+    assert "work folder cannot be made" in latest_log(photobackup_log_dir)
+
+
+def test_j40_the_work_folder_of_rc2_and_rc3_leaves_the_backup(env):
+    old = Path(env.dest, sb.CATALOG_FOLDER, "converting", "261119_101010_3")
+    old.mkdir(parents=True)
+    (old / "half.jxl").write_bytes(b"an interrupted run's")
+    assert backup(env, "--tiff", "jxl") == 0
+    assert not old.parent.exists()
+    assert backed(env.dest) == OTHERS | JXL
+
+
+def test_j41_a_name_that_fails_to_change_is_set_right_next_run(env, monkeypatch,
+                                                               photobackup_log_dir):
+    real, calls = sb._rename_no_clobber, []
+
+    def fail_on_page_2(src, dst):
+        calls.append(dst)
+        if str(dst).endswith("000038_page2.tif.jxl"):
+            raise PermissionError("held open by a viewer (test)")
+        return real(src, dst)
+    monkeypatch.setattr(sb, "_rename_no_clobber", fail_on_page_2)
+    assert backup(env, "--tiff", "jxl") == 1
+    assert "the JXL could not be put in place" in latest_log(photobackup_log_dir)
+    assert "2025/scans/000038.tif" in backed(env.dest)        # copied as it is
+    assert not {rel for rel in backed(env.dest) if rel.endswith(sb.TEMP_SUFFIX)}
+    monkeypatch.setattr(sb, "_rename_no_clobber", real)
+    assert backup(env, "--tiff", "jxl") == 0
+    assert backed(env.dest) == OTHERS | JXL
+    assert "2025/scans/000038.tif" in under(env.dest, VERSIONS)   # nothing lost
+
+
+def test_j42_the_route_follows_the_volume_not_the_letter(tmp_path, monkeypatch):
+    one, two = tmp_path / "work_here", tmp_path / "dest"
+    one.mkdir()
+    two.mkdir()
+    assert REAL_COPY_NEEDED(str(one), str(two)) is False      # one volume: a rename
+    real_stat = os.stat
+
+    def mounted(path, *args, **kwargs):                       # a disk mounted in a folder
+        result = real_stat(path, *args, **kwargs)
+        if str(path).endswith("dest"):
+            return os.stat_result((result.st_mode, result.st_ino, result.st_dev + 1)
+                                  + tuple(result)[3:])
+        return result
+    monkeypatch.setattr(sb.os, "stat", mounted)
+    assert REAL_COPY_NEEDED(str(one), str(two)) is True
+
+
+def test_j43_djxl_is_looked_for_on_path(tmp_path, monkeypatch):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    assert REAL_DJXL_ON_PATH() is None
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / ("djxl.exe" if os.name == "nt" else "djxl")).write_bytes(b"")
+    if os.name != "nt":
+        os.chmod(tools / "djxl", 0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(empty), str(tools)]))
+    assert REAL_DJXL_ON_PATH() is not None
+
+
+def test_j36_the_restore_runs_a_kept_jxlphoto_older_than_a_backup_needs(env, monkeypatch,
+                                                                        photobackup_log_dir):
+    monkeypatch.setattr(sb, "KEEP_TOOLS_IN_BACKUP", True)
+    assert backup(env, "--tiff", "jxl") == 0
+    monkeypatch.setattr(sb, "JXLPHOTO", "")
+    monkeypatch.setattr(sb, "JXLPHOTO_MIN_VERSION", "99.0.0")   # a backup now needs a newer one
+    sb._JXLPHOTO_VERSIONS.clear()
+    assert restore(env, "--to", env.out) == 0
+    assert restored(env) == OTHERS | TIFFS

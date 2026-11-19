@@ -18,6 +18,18 @@ def photobackup_log_dir(tmp_path, monkeypatch):
     # the tools kept in a backup (v0.14.0-rc2) would add files to every
     # destination a test compares; the tests of that feature turn it on
     monkeypatch.setattr(selective_backup, "KEEP_TOOLS_IN_BACKUP", False)
+    # the fake jxl-photo's files are no JXL a real djxl can read: the JPEG
+    # rebuild goes through the fake jxl-photo unless a test names a fake djxl
+    monkeypatch.setattr(selective_backup, "DJXL", "none")
+    # jxl-photo 2.31 needs djxl on PATH for a TIFF (JP-20): the fake does not,
+    # and no test depends on what this computer has installed
+    monkeypatch.setattr(selective_backup, "_djxl_on_path", lambda: "djxl")
+    # the conversions run in a temp folder of the test, and reach the backup by
+    # a copy, as they do on a real computer (the system's temp folder on another
+    # drive); tests of the rename route say so
+    (tmp_path / "work").mkdir(exist_ok=True)
+    monkeypatch.setattr(selective_backup, "JXL_WORK_DIR", str(tmp_path / "work"))
+    monkeypatch.setattr(selective_backup, "_jxl_copy_needed", lambda work_root, dest: True)
     log_dir.mkdir(parents=True, exist_ok=True)
     # No test may ever read the real Capture One folders of this computer.
     empty = tmp_path / "no_capture_one"

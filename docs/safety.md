@@ -75,19 +75,36 @@ added the newer parts. The restore has its own guarantees
   clean-up there.
 - **A TIFF kept as JXL is the one copy that is not byte for byte**
   *(v0.14.0-rc2)*, and only in a line whose `Tiff` column (or `--tiff`) names
-  a profile. Each JXL is kept only with proof: jxl-photo checked its own
-  round trip, the JXL's `jxlphoto-srcsum` mark is the SHA-256 photo-backup
-  took of the TIFF, a multipage TIFF came back whole, and the TIFF did not
-  change meanwhile. Anything else copies the TIFF as it is (exit 1): nothing is
-  ever left without a copy. A TIFF copy already in the backup leaves only
-  after its JXL is in the backup and in the catalog, to `versions\` (the
-  mirror: its trash). A TIFF export is never converted
-  ([tiff_to_jxl.md](tiff_to_jxl.md)).
+  a profile. Each JXL is kept only with proof: jxl-photo ended without an
+  error, **jxl-photo decoded every page and compared it with the TIFF's before
+  the page took its name** *(v0.14.0-rc4, jxl-photo 2.31.0-rc1:
+  [JP-20](jxlphoto_contract.md#jp-20--every-page-is-checked-before-it-takes-its-name);
+  up to jxl-photo 2.30.x no pixel was compared)*, the JXL's `jxlphoto-srcsum`
+  mark is the SHA-256 photo-backup took of the TIFF, a multipage TIFF came
+  back whole, and the TIFF did not change meanwhile. Anything else copies the
+  TIFF as it is (exit 1): nothing is ever left without a copy. A TIFF copy
+  already in the backup leaves only after its JXL is in the backup and in the
+  catalog, to `versions\` (the mirror: its trash). A TIFF export is never
+  converted ([tiff_to_jxl.md](tiff_to_jxl.md)).
+- **The conversions never run inside the backup or a source** *(v0.14.0-rc4)*:
+  each one has a folder of its own in `JXL_WORK_DIR` + `JXL_WORK_FOLDER` (the
+  system's temp folder by default; a work folder inside or above a source or
+  the backup is refused, exit 2 — the default one too), and one writer copies
+  each finished group into the backup: every file of the group is written next
+  to its final name and checked by its SHA-256 before an old file leaves or any
+  name changes. Should a name then fail to change (a file in the way that
+  another program holds open, Ctrl+C), the pages already renamed stay without a
+  catalog row; the next run moves them aside to `versions\` and makes the group
+  again — nothing is lost. The only folders removed there are this tool's own:
+  this run's `pbconv\<process number>` at its end, and the one of a backup that
+  no longer runs — only a folder that carries the run's mark file, never a link.
+  A work folder that cannot be made copies every file as it is (exit 1).
 - **A JPEG kept as JXL comes back byte for byte** *(v0.14.0-rc3)*: jxl-photo's
   lossless transcode only (`--force-transcode`), and the JXL is kept only after
-  jxl-photo rebuilt the JPEG from it and the rebuilt file had the SHA-256
-  photo-backup took of the JPEG; anything else copies the JPEG as it is. The
-  restore checks that SHA-256 again before the JPEG takes its name.
+  the JPEG rebuilt from it (by libjxl's djxl, *rc4*; without it by jxl-photo)
+  had the SHA-256 photo-backup took of the JPEG; anything else copies the JPEG
+  as it is. The restore checks that SHA-256 again before the JPEG takes its
+  name.
 - A copy is written to a temp file next to its final name, verified, then
   `os.replace`d — a crash never leaves a half file under the final name.
 - **A destination that stops taking writes stops the backup** *(v0.12.1)*.

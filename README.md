@@ -4,7 +4,7 @@ You shoot 400 frames, the RAWs land in one folder, and the 30 you keep are expor
 
 A backup from the menu also keeps **Capture One itself**: the ICC profiles, film curves and styles your `.cos` edits only name, with your presets, recipes, shortcuts and workspaces. A double-click restore (no Python needed) puts them back on a new computer, so your photos open with the same look. [Details](docs/captureone.md).
 
-**Current version: v0.13.2** (2026-11-12) · [What's new](#whats-new-in-v0132) · [All releases](docs/version_history.md) · Test version: [v0.14.0-rc3](https://github.com/rsilvabr/photo-backup/releases/tag/v0.14.0-rc3), the mirror, TIFF and JPEG kept as JXL ([what's new](docs/whats_new.md#v0140-rc3-test-version-not-released-yet))
+**Current version: v0.13.2** (2026-11-12) · [What's new](#whats-new-in-v0132) · [All releases](docs/version_history.md) · Test version: [v0.14.0-rc4](https://github.com/rsilvabr/photo-backup/releases/tag/v0.14.0-rc4), the mirror, TIFF and JPEG kept as JXL ([what's new](docs/whats_new.md#v0140-rc4-test-version-not-released-yet))
 
 **Windows program, no Python needed:** [photo-backup-exe](https://github.com/rsilvabr/photo-backup-exe/releases/latest) — unzip and double-click.
 
@@ -93,7 +93,7 @@ photo-backup and [jxl-photo](https://github.com/rsilvabr/jxl-photo) are made to 
 | 3 | **TIFF kept as JXL** (`Tiff` column): a developed TIFF or a film scan stays TIFF on your disk, JXL in the backup | NX Studio 45 MP: 218 MB → 34 MB; scans, lossless: 59–71%, the same pixels |
 | 4 | **JPEG kept as JXL** (`Jpeg` column): every JPEG, exports too, by a lossless transcode | 146 real JPEGs: 81% of their size, every one back byte for byte |
 
-Each JXL counts only after photo-backup proves it (the TIFF's mark, the JPEG rebuilt byte for byte); anything else is copied as it is. The restore gives the original formats back — all of them, only the lossless ones, or none — and the backup keeps the jxl-photo that does it. In detail: [TIFF and JPEG as JXL](docs/tiff_to_jxl.md); what jxl-photo must keep doing for all this: [the contract](docs/jxlphoto_contract.md).
+Each JXL counts only after it is proven (every TIFF page decoded and compared with the TIFF's, the TIFF's mark, the JPEG rebuilt byte for byte); anything else is copied as it is. The restore gives the original formats back — all of them, only the lossless ones, or none — and the backup keeps the jxl-photo that does it. In detail: [TIFF and JPEG as JXL](docs/tiff_to_jxl.md); what jxl-photo must keep doing for all this: [the contract](docs/jxlphoto_contract.md).
 
 | Script | What it does |
 |---|---|
@@ -233,7 +233,7 @@ One line each; the detail is behind each link.
 | [docs/per_folder_modes.md](docs/per_folder_modes.md) | `manifest_backup.py`: the manifest, the modes table column by column, the shipped modes, `--analyze` |
 | [docs/mirror.md](docs/mirror.md) | `mirror_backup.py`: getting a file back, the two modes, what leaves the backup and what never does, the trash, the locks |
 | [docs/tiff_to_jxl.md](docs/tiff_to_jxl.md) | A TIFF, a scan or a JPEG kept as JXL in the backup: profiles, the proof, the restore's choice of formats, moving from FreeFileSync, the programs kept in the backup |
-| [docs/jxlphoto_contract.md](docs/jxlphoto_contract.md) | What jxl-photo must keep doing for photo-backup (仕様書, JP-1 to JP-14), the minimum version, the contract test |
+| [docs/jxlphoto_contract.md](docs/jxlphoto_contract.md) | What jxl-photo must keep doing for photo-backup (仕様書, JP-1 to JP-21), the minimum version, the contract test |
 | [docs/menu.md](docs/menu.md) | The interactive menu item by item, unattended runs, running after jxl-photo, the menu's settings |
 | [docs/commands_and_settings.md](docs/commands_and_settings.md) | Every option and setting of `selective_backup.py`, the logs and CSVs, exit codes |
 | [docs/safety.md](docs/safety.md) | Every safety guarantee in full |

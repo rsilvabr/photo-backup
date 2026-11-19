@@ -311,3 +311,56 @@ def test_menu_trash_items(tmp_path, monkeypatch, menu_config):
 def test_menu_mirror_settings_come_from_the_script(monkeypatch):
     import mirror_backup
     assert menu._mirror_setting("MIRROR_KEEP_DAYS") == mirror_backup.MIRROR_KEEP_DAYS
+
+
+# ---- v0.14.0-rc4: the menu remembers jxl-photo ---------------------------------------------------
+def test_settings_remember_jxlphoto_after_checking_it(tmp_path, monkeypatch, menu_config):
+    import shutil
+    tool = tmp_path / "jxl-photo" / "jxl_photo.py"
+    tool.parent.mkdir()
+    shutil.copy2(Path(__file__).with_name("fake_jxlphoto.py"), tool)
+    monkeypatch.delenv("FAKE_JXLPHOTO_VERSION", raising=False)
+    script(monkeypatch, ["y", str(tmp_path / "missing.py"), "n"])
+    menu.settings_menu(menu.load_config())
+    assert "jxlphoto" not in menu.load_config()                 # not found: not saved
+    script(monkeypatch, ["y", f'"{tool}"', "n"])
+    menu.settings_menu(menu.load_config())
+    assert menu.load_config()["jxlphoto"] == str(tool)
+    script(monkeypatch, ["y", "-", "n"])
+    menu.settings_menu(menu.load_config())
+    assert menu.load_config()["jxlphoto"] == ""
+
+
+def test_the_scripts_get_the_remembered_jxlphoto(monkeypatch, menu_config):
+    commands = []
+
+    class Done:
+        returncode = 0
+    monkeypatch.setattr(menu.subprocess, "run", lambda command, **kwargs: commands.append(
+        command) or Done())
+    monkeypatch.setattr(menu, "_menu_title", lambda: None)
+    menu.run_manifest(["--manifest", "m.csv"])                  # nothing remembered
+    menu_config.write_text(json.dumps({"jxlphoto": r"C:\jxl\jxl_photo.py"}), encoding="utf-8")
+    menu.run_manifest(["--manifest", "m.csv"])
+    menu.run_mirror(["--dest", "D"])
+    menu.run_backend(["--source", "S"])
+    menu.run_restore(["--backup", "B", "--jxlphoto", r"C:\other.py"])   # named: kept
+    menu.run_captureone(["--dest", "D"])                        # needs no jxl-photo
+    tails = [command[2:] for command in commands]
+    assert tails[0] == ["--manifest", "m.csv"]
+    assert tails[1] == ["--manifest", "m.csv", "--jxlphoto", r"C:\jxl\jxl_photo.py"]
+    assert tails[2][-2:] == tails[3][-2:] == ["--jxlphoto", r"C:\jxl\jxl_photo.py"]
+    assert tails[4] == ["--backup", "B", "--jxlphoto", r"C:\other.py"]
+    assert tails[5] == ["--dest", "D"]
+
+
+def test_the_hints_name_the_program_that_runs(monkeypatch):
+    """A hint says how to start a script here: `python ...`, or in the Windows
+    program its own name and command (PENDENCIAS 109)."""
+    backend = menu._backend()
+    assert backend._run_command("photo_backup.py") == "python photo_backup.py"
+    monkeypatch.setattr(menu.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(menu.sys, "executable", r"D:\Programs\photo-backup\photo-backup.exe")
+    assert backend._run_command("photo_backup.py") == "photo-backup.exe"
+    assert backend._run_command("captureone_backup.py") == "photo-backup.exe captureone"
+    assert backend._run_command("restore_backup.py") == "photo-backup.exe restore"

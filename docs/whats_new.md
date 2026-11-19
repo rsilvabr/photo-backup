@@ -3,6 +3,23 @@
 The short notes of each recent release, newest first; the README keeps the
 current one. Every release in detail: [version_history.md](version_history.md).
 
+## v0.14.0-rc4 (test version, not released yet)
+
+2026-11-20. Faster, every TIFF page checked, and the conversions out of the
+backup. Needs jxl-photo 2.31.0-rc1. Everything of rc3, rc2 and rc1 below holds.
+
+- **Every page of a TIFF is checked**: jxl-photo 2.31.0-rc1 decodes each page it converts and compares it with the TIFF's before the page counts — the same pixels for a lossless page, the same image for a lossy one ([JP-20](jxlphoto_contract.md#jp-20--every-page-is-checked-before-it-takes-its-name)). Up to jxl-photo 2.30.x photo-backup asked for that check and nothing was checked. It is now the minimum (`JXLPHOTO_MIN_VERSION`), and a `Tiff` profile needs libjxl's `djxl` on PATH (refused before reading without it, exit 2).
+- **Twice as fast, and the restore nine times**: 146 JPEG and 10 TIFF were kept as JXL in 32 s (rc3: 71 s) and came back in 13 s (rc3: 116 s). JPEGs and TIFFs convert in two pools at once; a JPEG is proven and restored by libjxl's djxl straight from memory (`DJXL`, [JP-18](jxlphoto_contract.md#jp-18--djxl-gives-the-jpeg-back-from-its-jxl)); jxl-photo starts from its kept bytecode in 0.08 s instead of 0.3–0.5 s ([JP-19](jxlphoto_contract.md#jp-19--each-command-is-a-script-beside-jxl_photopy)); a JPEG is transcoded at effort 5 (`JPEG_JXL_EFFORT`: as small as 7, 30% faster).
+- **The conversions run outside the backup**: in the system's temp folder (`JXL_WORK_DIR`; never in a source or the backup), and one writer copies each finished JXL into the backup, read back and checked before it takes its name — a slow or SMR disk gets one file at a time instead of dozens. The temp folder holds a few GB at most, however slow the disk.
+- **One conversion per physical core** (`JXL_WORKERS = 0`): as fast as one per logical CPU on a 16-core CPU, with a third of the CPU left free.
+- **A failed conversion says why**: `CONVERT FAILED` shows jxl-photo's own error line (a page that failed its check: `(JP-20)`) and keeps jxl-photo's log of that conversion in `Logs\jxl-photo\`; a conversion that worked keeps none (one per photo was 140,000 files in a backup of a whole archive).
+- **jxl-photo's own defaults**: a backup and a restore turn jxl-photo's settings overlay off (the one made for its presets: another temp disk, its tags), [JP-21](jxlphoto_contract.md#jp-21--an-empty-jxlphoto_settings-turns-the-settings-overlay-off).
+- **An older backup still comes back**: the restore runs any jxl-photo from 2.30.0 on (`JXLPHOTO_RESTORE_MIN_VERSION`), so the copy an older backup keeps still restores it.
+- **The menu remembers jxl-photo**: `[4] Settings` → "Set where jxl-photo is" (checked first, kept in the menu's own file) and every backup, mirror and restore it runs gets it — no path of yours inside the scripts.
+- **Easier to follow**: every yes/no question says what Enter does (`[y/N, Enter = no]`); a dry-run says which manifest line it reads and, every few seconds, how many folders and files it has read (on a console); the copy's and the full verify's progress line shows the speed of the last 2 minutes beside the average, its ETA follows the recent one (`PROGRESS_RECENT_S`), and it says when a batch of small files is being written instead of repeating itself.
+- **Scheduled runs**: the Task Scheduler line is now `cmd /c` ([menu.md](menu.md#unattended-runs-task-scheduler)): with `cmd /k` the window stayed open, the task stayed "Running" and the next night's backup did not run. In the Windows program the hints say `photo-backup.exe ...`.
+- The contract with jxl-photo has 21 items; settings: `JXL_WORK_DIR`, `JXL_TIFF_WORKERS`, `DJXL` and `JXLPHOTO_RESTORE_MIN_VERSION` are new, `JXL_WORK_FOLDER` is now photo-backup's folder inside `JXL_WORK_DIR` (`pbconv`).
+
 ## v0.14.0-rc3 (test version, not released yet)
 
 2026-11-19. JPEG kept as JXL, the restore's choice of formats, and the contract

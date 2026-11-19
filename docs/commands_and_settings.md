@@ -105,7 +105,8 @@ default everywhere — the menu reads them from there too.
 | `TEMP_SUFFIX` | `.pbtmp` | in-progress copy suffix |
 | `DEST_CHECK_AFTER_ERRORS` | `20` | backup: after this many failed copies in a row, the destination is tested (a file of its own, `*.pbtmp` in `CATALOG_FOLDER`, written and removed); when the test fails the backup stops (`0` = never test) *(v0.12.1)* |
 | `CATALOG_FOLDER` | `_photo_backup` | catalog and versions folder under the destination |
-| `PROGRESS_EVERY_S` | `5.0` | console progress interval |
+| `PROGRESS_EVERY_S` | `5.0` | console progress interval: the copy's and the full verify's line, and while a plan reads the sources (a dry-run of a whole archive takes minutes), the folders and files read so far — that last one on a console only, never in a log *(v0.14.0-rc4)* |
+| `PROGRESS_RECENT_S` | `120.0` | the progress line shows the speed since the start and over these last seconds (`85 MB/s, last 2 min 40 MB/s`), and its ETA follows the recent one; while a batch of small files goes to the disk it says so instead of repeating itself *(v0.14.0-rc4)* |
 | `AUTO_UPDATE` | `True` | changed edit settings/sidecars are updated without `--update-changed` (`--no-auto-update` turns it off) |
 | `AUTO_UPDATE_EXTENSIONS` | `.xmp`, `.dop`, `.pp3`, `.cos`, `.comask`, `.nksc` | extensions treated that way |
 | `DETECT_MOVES` | `True` | detect moved/renamed catalogued files and move their backup copy (`--no-detect-moves`) |
@@ -128,15 +129,19 @@ TIFF and JPEG kept as JXL in the backup, and the programs kept in it
 | Constant | Default | Meaning |
 |---|---|---|
 | `JXLPHOTO` | `""` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe` (default `--jxlphoto`); `""` = no conversion |
-| `JXLPHOTO_MIN_VERSION` | `2.30.0` | the oldest jxl-photo accepted: [the contract](jxlphoto_contract.md) between the two programs |
+| `JXLPHOTO_MIN_VERSION` | `2.31.0-rc1` | the oldest jxl-photo a backup runs: [the contract](jxlphoto_contract.md) between the two programs (2.31.0-rc1 checks every page it converts) |
+| `JXLPHOTO_RESTORE_MIN_VERSION` | `2.30.0` | the oldest jxl-photo the restore runs (the one an older backup keeps still brings its files back) |
 | `TIFF_JXL_PROFILES` | `{"jxl": {"distance": 0.05, "scan_distance": 0, "eight_bit_distance": 0}}` | the profiles a manifest's `Tiff` column (or `--tiff`) names; jxl-photo picks the distance per TIFF (0 = lossless) |
 | `TIFF_EXTENSIONS` | `.tif`, `.tiff` | what a profile converts (never in an export folder) |
 | `TIFF_JXL_EFFORT` | `7` | jxl-photo's `--effort` for a TIFF |
 | `JPEG_JXL_EXTENSIONS` | `.jpg`, `.jpeg` | what `--jpeg jxl` keeps as JXL, exports too |
-| `JPEG_JXL_EFFORT` | `7` | jxl-photo's `--effort` for a JPEG (lossless at any effort) |
-| `JXL_WORKERS` | `4` | files converted at the same time |
+| `JPEG_JXL_EFFORT` | `5` | jxl-photo's `--effort` for a JPEG (lossless at any effort; 3, 5 and 7 give the same size; 16 at a time, 5 was 30% faster than 7) |
+| `JXL_WORKERS` | `0` | files converted (and restored from JXL) at the same time; `0` = one per physical core |
+| `JXL_TIFF_WORKERS` | `0` | of those, TIFFs at the same time; `0` = a quarter of the logical CPUs, at most one per 4 GB of free memory |
+| `DJXL` | `""` | libjxl's `djxl` for the proof and the restore of a JPEG; `""` = PATH; `"none"` = through jxl-photo |
 | `JXL_TIMEOUT_MIN` | `30` | a conversion longer than this is given up: the file is copied as it is |
-| `JXL_WORK_FOLDER` | `converting` | under `CATALOG_FOLDER`: the conversions' own folders (emptied by each run) |
+| `JXL_WORK_DIR` | `""` | where the conversions run; `""` = the system's temp folder. One writer then copies each finished JXL into the backup |
+| `JXL_WORK_FOLDER` | `pbconv` | photo-backup's folder inside `JXL_WORK_DIR`: one per running backup (its process number), removed at the end |
 | `KEEP_TOOLS_IN_BACKUP` | `True` | every real run keeps photo-backup and jxl-photo in the backup, one folder per version |
 | `KEEP_TOOLS_EXTRA` | `()` | more files or folders kept there (the `.zip` of photo-backup-exe, say) |
 | `TOOLS_FOLDER` | `tools` | under `CATALOG_FOLDER`: where they are kept, with `HOW TO RESTORE.txt` |

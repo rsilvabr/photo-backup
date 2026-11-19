@@ -5,12 +5,17 @@ one (its jxl_photo.py or jxl-photo.exe):
     set PHOTOBACKUP_JXLPHOTO=C:\\path\\to\\jxl-photo\\jxl_photo.py
     python -m pytest tests/test_jxlphoto_contract.py -v
 
-Each test is one item of the contract (JP-1 ... JP-14): a failure names the
+Each test is one item of the contract (JP-1 ... JP-21): a failure names the
 item, and the document says where that item lives in both programs. Needs
-numpy and tifffile (jxl-photo needs them too). About a minute: every call is
+numpy and tifffile (jxl-photo needs them too), and djxl on PATH (jxl-photo
+checks every page of an encode with it: JP-20). About a minute: every call is
 a real jxl-photo, on small synthetic TIFFs; nothing outside a temp folder."""
+import ast
+import json
 import os
+import re
 import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -72,6 +77,11 @@ def _snapshot(folder):
             for path in Path(folder).rglob("*") if path.is_file()}
 
 
+def _sha256(data):
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
 def _tail(run):
     return sb._tail((run.stdout or "") + "\n" + (run.stderr or ""), 8)
 
@@ -90,10 +100,12 @@ def check(tmp_path_factory):
         for name, tiff in tiffs.items():
             out = root / f"enc_{name}"
             out.mkdir()
+            log_dir = root / f"enc_log_{name}"          # this call's log, as a backup gives it
             run = sb._run_jxlphoto(JXLPHOTO, sb._jxlphoto_encode_args(str(tiff), str(out),
-                                                                     PROFILE), TIMEOUT_S)
+                                                                     PROFILE), TIMEOUT_S,
+                                   str(log_dir))
             jxl = sorted(path.name for path in out.iterdir() if path.suffix.casefold() == ".jxl")
-            encoded[name] = SimpleNamespace(run=run, out=out, jxl=jxl)
+            encoded[name] = SimpleNamespace(run=run, out=out, jxl=jxl, log_dir=log_dir)
         decoded = {}
         for name in ("photo16", "scan16", "photo8", "multi"):
             source = encoded[name].out
@@ -139,7 +151,8 @@ def check(tmp_path_factory):
             run = sb._run_jxlphoto(JXLPHOTO, sb._jxlphoto_transcode_args(str(jpeg), str(out)),
                                    TIMEOUT_S)
             jxl = sorted(path.name for path in out.iterdir() if path.suffix.casefold() == ".jxl")
-            result = SimpleNamespace(run=run, jxl=jxl, rebuild=None, rebuilt=[], inputs=None)
+            result = SimpleNamespace(run=run, jxl=jxl, rebuild=None, rebuilt=[], inputs=None,
+                                     djxl=None)
             if run.returncode == 0 and len(jxl) == 1:
                 alone = root / f"jpg_alone_{name}"         # as the restore copies it
                 alone.mkdir()
@@ -152,6 +165,15 @@ def check(tmp_path_factory):
                 result.rebuilt = [path for path in back.iterdir()
                                   if path.suffix.casefold() in (".jpg", ".jpeg")]
                 result.inputs_after = _snapshot(alone)
+                patch.setattr(sb, "DJXL", "")             # libjxl's djxl from PATH (JP-18)
+                sb._DJXL_FOUND.clear()
+                if sb._djxl_path() is not None:
+                    try:
+                        result.djxl = sb._rebuild_jpeg(str(alone / jxl[0]), None,
+                                                       str(root / f"djxl_{name}"), TIMEOUT_S)
+                    except sb._ConvertFailed as exc:
+                        result.djxl = str(exc)
+                sb._DJXL_FOUND.clear()
             transcoded[name] = result
         yield SimpleNamespace(
             root=root, tiffs=tiffs, before=before, encoded=encoded, decoded=decoded,
@@ -350,3 +372,120 @@ def test_jp17_the_class_marks_say_which_distance(check):
             f"JP-17: {name}: the marks {sorted(tokens)} do not give its class")
     assert sb._jxl_tokens(str(_jxl_of(check, "scan16", "JP-17")[0])).get("jxlphoto-scan"), (
         "JP-17: a scan carries jxlphoto-scan")
+
+
+# ---- the fast routes (v0.14.0-rc4) ------------------------------------------------------------
+def test_jp18_djxl_rebuilds_the_jpeg_from_stdin(check):
+    results = {name: check.transcoded[name].djxl for name in ("camera", "progressive")}
+    if all(value is None for value in results.values()):
+        pytest.skip("JP-18: no djxl on PATH (photo-backup then uses JP-16)")
+    for name, rebuilt in results.items():
+        assert isinstance(rebuilt, bytes), f"JP-18: {name}: {rebuilt}"
+        assert len(rebuilt) == check.before[name][0] and \
+            _sha256(rebuilt) == check.before[name][2], (
+                f"JP-18: {name}: djxl did not give the original JPEG's bytes back")
+
+
+def test_jp19_each_command_is_a_script_beside_jxl_photo(check):
+    if not JXLPHOTO.casefold().endswith(".py"):
+        pytest.skip("JP-19: jxl-photo.exe runs its commands itself")
+    folder = Path(JXLPHOTO).resolve().parent
+    backends = None
+    for node in ast.parse((folder / "jxl_photo.py").read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "_BACKEND_COMMANDS"
+                for target in node.targets):
+            backends = ast.literal_eval(node.value)
+    assert backends is not None, "JP-19: jxl_photo.py has no _BACKEND_COMMANDS"
+    for command, module in sb._JXLPHOTO_BACKENDS.items():
+        assert backends.get(command) == f"{module}.py", f"JP-19: {command}: {backends.get(command)}"
+        argv = sb._jxlphoto_argv(JXLPHOTO, [command, "--version"])
+        assert argv[1] == "-c" and argv[4] == module, f"JP-19: {command} not run as a module"
+        as_module = sb._run_jxlphoto(JXLPHOTO, [command, "--version"], TIMEOUT_S)
+        as_command = subprocess.run(sb._jxlphoto_command(JXLPHOTO) + [command, "--version"],
+                                    capture_output=True, text=True, encoding="utf-8",
+                                    errors="replace", env=sb._jxlphoto_env(), timeout=TIMEOUT_S)
+        assert as_module.returncode == as_command.returncode == 0, f"JP-19: {command} --version"
+        assert as_module.stdout.split() == as_command.stdout.split(), (
+            f"JP-19: {command}: {as_module.stdout!r} != {as_command.stdout!r}")
+    # every item above ran this way: their bytecode is in photo-backup's own cache
+    cached = {path.name.split(".")[0] for path in (check.root / "logs" / "pycache").rglob("*.pyc")}
+    assert set(sb._JXLPHOTO_BACKENDS.values()) <= cached, f"JP-19: not cached: {sorted(cached)}"
+
+
+# ---- the page check and the defaults (v0.14.0-rc4, jxl-photo 2.31.0-rc1) ------------------------
+def _log_text(folder):
+    return "".join(path.read_text(encoding="utf-8", errors="replace")
+                   for path in sorted(Path(folder).rglob("*.log")))
+
+
+def test_jp20_every_page_is_checked_before_it_takes_its_name(check):
+    for name in ("photo16", "scan16", "photo8", "multi"):
+        jxl = _jxl_of(check, name, "JP-20")
+        checked = re.findall(r">Round-trip verified page (\d+) \(", _log_text(
+            check.encoded[name].log_dir))
+        assert sorted(int(page) for page in checked) == list(range(len(jxl))), (
+            f"JP-20: {name}: {len(jxl)} JXL, pages checked against the TIFF: "
+            f"{checked or 'none'} (the encode's --verify-roundtrip must decode every page "
+            f"it writes and compare it with its TIFF page)")
+
+
+def test_jp20_without_djxl_nothing_is_kept_unchecked(check, tmp_path):
+    """A page that cannot be checked is an error with no JXL: without djxl on
+    PATH (cjxl and everything else still there) the encode gives none."""
+    djxl = shutil.which("djxl")
+    if djxl is None:
+        pytest.skip("JP-20: no djxl on PATH to take away")
+    bin_dir = Path(djxl).parent
+    copy = tmp_path / "libjxl without djxl"
+    copy.mkdir()
+    for path in bin_dir.iterdir():
+        if path.is_file() and not path.name.casefold().startswith("djxl"):
+            shutil.copy2(path, copy / path.name)
+    env = sb._jxlphoto_env(str(tmp_path / "log"))
+    env["PATH"] = os.pathsep.join([str(copy)] + [
+        part for part in env.get("PATH", "").split(os.pathsep)
+        if part and os.path.normcase(os.path.normpath(part)) != os.path.normcase(str(bin_dir))])
+    out = tmp_path / "out"
+    out.mkdir()
+    run = subprocess.run(sb._jxlphoto_argv(JXLPHOTO, sb._jxlphoto_encode_args(
+        str(check.tiffs["photo16"]), str(out), PROFILE)), stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
+        timeout=TIMEOUT_S)
+    made = [path.name for path in out.iterdir() if path.suffix.casefold() == ".jxl"]
+    assert run.returncode != 0 and not made, (
+        f"JP-20: without djxl the encode gave exit {run.returncode} and {made}: "
+        f"{_tail(run)}")
+
+
+def test_jp21_an_empty_jxlphoto_settings_turns_the_overlay_off(check, tmp_path):
+    if not JXLPHOTO.casefold().endswith(".py"):
+        pytest.skip("JP-21: checked with the scripts (the exe's overlay sits beside the exe)")
+    copy = tmp_path / "jxl-photo with an overlay"
+    copy.mkdir()
+    for path in Path(JXLPHOTO).resolve().parent.glob("*.py"):
+        shutil.copy2(path, copy / path.name)
+    (copy / ".jxl_script_settings.json").write_text(json.dumps(
+        {"jxl_tiff_encoder": {"WORKER_MEMORY_FRACTION": 1.2}}), encoding="utf-8")
+    script = str(copy / os.path.basename(JXLPHOTO))
+
+    def encode(label, without_setting):
+        out, logs = tmp_path / f"out_{label}", tmp_path / f"log_{label}"
+        out.mkdir()
+        env = sb._jxlphoto_env(str(logs))
+        if without_setting:
+            env.pop("JXLPHOTO_SETTINGS", None)
+        run = subprocess.run(sb._jxlphoto_argv(script, sb._jxlphoto_encode_args(
+            str(check.tiffs["photo8"]), str(out), PROFILE)), stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
+            timeout=TIMEOUT_S)
+        return run, (run.stdout or "") + (run.stderr or "") + _log_text(logs)
+
+    run, said = encode("ours", False)
+    assert run.returncode == 0, f"JP-21: {_tail(run)}"
+    assert "settings overlay" not in said.casefold() and "WORKER_MEMORY_FRACTION" not in said, (
+        "JP-21: JXLPHOTO_SETTINGS set empty did not turn jxl-photo's settings overlay off")
+    run, said = encode("control", True)
+    assert "WORKER_MEMORY_FRACTION" in said, (
+        "JP-21: the test's overlay was not read even without JXLPHOTO_SETTINGS "
+        "(is it still .jxl_script_settings.json beside the scripts?)")

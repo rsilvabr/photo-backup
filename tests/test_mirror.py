@@ -440,7 +440,7 @@ def test_t16b_the_question_without_yes(env, monkeypatch, capsys):
         return "y"
     monkeypatch.setattr("builtins.input", reply)
     assert mirror("--manifest", env.man, "--dest", env.dest) == 0
-    assert seen == ["Mirror now? copy 0, replace 0, remove 1 [y/N] "]
+    assert seen == ["Mirror now? copy 0, replace 0, remove 1 [y/N, Enter = no] "]
 
 
 # ---- T17-T19: space and the trash on demand ----------------------------------------------------

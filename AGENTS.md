@@ -21,23 +21,53 @@ from the command line. A future job (e.g. a full mirror) is a new
   group (catalog schema 2, table `converted`: one row per JXL, with the
   TIFF's size/date/SHA-256, page, pages, tool, settings); `_copy_all` leaves
   it out of the copy loop and `_convert_all` runs jxl-photo
-  (`_convert_one`, a thread each, `JXL_WORKERS`), puts each proven group
-  in place on the main thread (`_place_group`), then retires a TIFF copy it
-  replaces (`replaces` → `keep_old_file`: versions, or the mirror's own);
-  a failure is `_copy_as_is`. `_keep_tools` keeps photo-backup, jxl-photo
+  (`_convert_one`, a thread each: a JPEG pool of `_jxl_workers()` — one per
+  physical core, `_physical_cores` — and a TIFF pool of `_jxl_tiff_workers()`,
+  v0.14.0-rc4; a JPEG's proof is libjxl's djxl from stdin, `_rebuild_jpeg`,
+  JP-18, jxl-photo when `DJXL` finds none). Since rc4 the conversions run in
+  `_work_root()` — `JXL_WORK_DIR` (default the system's temp folder) +
+  `JXL_WORK_FOLDER\<pid>` with `_WORK_MARK` in it; never inside or above a
+  source or the backup, the default too (`_work_dir_errors`, which also
+  refuses a `JXL_WORK_FOLDER` that is not one plain name); a dead run's folder
+  removed only when it carries the mark (`_ours_to_sweep`, `_pid_alive`); a
+  work folder that cannot be made is a `problem` (every file copied as it is);
+  rc2/rc3's `_photo_backup\converting` is removed (`_OLD_WORK_FOLDER`) — and
+  each pool runs at most twice its size ahead of the writer (`submit_more`).
+  The main thread is the one writer of the backup's disk: `_place_group` puts
+  each proven group in place — by a copy when the work folder is on another
+  volume (`_jxl_copy_needed`: `st_dev`, not the letter; every file to
+  `<final>.pbtmp`, fsync, read back against its SHA-256 by `_write_jxl_temp`,
+  THEN the old group leaves and the names change; a rename that fails midway
+  leaves the pages already renamed without a row, which the next run moves
+  aside), else by a rename —, then a TIFF copy it replaces is retired
+  (`replaces` → `keep_old_file`: versions, or the mirror's own); a failure is
+  `_copy_as_is`. `_keep_tools` keeps photo-backup, jxl-photo
   and `KEEP_TOOLS_EXTRA` in `_photo_backup\tools` on every real run. jxl-photo
-  always runs through `_run_jxlphoto` (`-B`, `JXLPHOTO_LOG_DIR` = our
-  `Logs\jxl-photo`, `JXLPHOTO_NO_UPDATE_CHECK`). **What photo-backup needs from
-  jxl-photo is a contract, `docs/jxlphoto_contract.md` (仕様書, JP-1 to JP-17):**
+  always runs through `_run_jxlphoto` (`_jxlphoto_env`: `JXLPHOTO_LOG_DIR` =
+  the conversion's own folder, its log copied to our `Logs\jxl-photo` by
+  `_keep_jxlphoto_log` only when it failed, the restore's straight there;
+  `JXLPHOTO_SETTINGS` empty = no settings overlay, JP-21;
+  `JXLPHOTO_NO_UPDATE_CHECK`; `PYTHONPYCACHEPREFIX` = our `Logs\pycache`:
+  never a `__pycache__` beside jxl-photo, JP-12); `_jxlphoto_said` puts
+  jxl-photo's ERROR lines (else its last lines) in `CONVERT FAILED`; since rc4
+  `_jxlphoto_argv` runs a command's own script as a module (`_JXLPHOTO_BOOT`,
+  JP-19: its bytecode is kept, a start is 0.08 s instead of 0.3-0.5 s) and
+  `jxl_photo.py` with `-B` only when that script is not there. **What
+  photo-backup needs from jxl-photo is a contract,
+  `docs/jxlphoto_contract.md` (仕様書, JP-1 to JP-21):**
   the two command lines live once, in `_jxlphoto_encode_args` and
   `_jxlphoto_decode_args`; `_jxlphoto_problem` refuses a jxl-photo older than
-  `JXLPHOTO_MIN_VERSION` (2.30.0: measured by running
-  `tests/test_jxlphoto_contract.py` on jxl-photo's tags) or one that does not
-  say its version; each failure message names its item (`(JP-5)`). Asking
-  jxl-photo something new = a new item in that page, a test in the contract
-  test, its number in the message, and `JXLPHOTO_MIN_VERSION` raised to the
-  first jxl-photo that passes. The contract test runs only with
-  `PHOTOBACKUP_JXLPHOTO` set (a real jxl-photo; numpy + tifffile).
+  `JXLPHOTO_MIN_VERSION` (2.31.0-rc1, the first that checks every page it
+  encodes, JP-20; the restore passes its own `JXLPHOTO_RESTORE_MIN_VERSION`,
+  2.30.0, so a backup comes back with the jxl-photo it keeps) or one that
+  does not say its version; a `Tiff` profile without djxl on PATH
+  (`_djxl_on_path`) is refused before reading, exit 2; each failure message
+  names its item (`(JP-5)`). Asking jxl-photo something new = a new item in
+  that page, a test in the contract test, its number in the message, and
+  `JXLPHOTO_MIN_VERSION` raised to the first jxl-photo that passes (measured
+  by running `tests/test_jxlphoto_contract.py` on jxl-photo's tags). The
+  contract test runs only with `PHOTOBACKUP_JXLPHOTO` set (a real jxl-photo;
+  numpy + tifffile; djxl on PATH).
 - `manifest_backup.py` — per-folder modes, read from `backup_manifest.csv`
   (gitignored; `backup_manifest.example.csv` is versioned) and
   `backup_modes.csv` (versioned, UTF-8; `--modes` reads another). The code
@@ -95,7 +125,14 @@ from the command line. A future job (e.g. a full mirror) is a new
   TARGET, decoded there (TIFF: `_jxlphoto_decode_args`, `RESTORED_FROM_JXL`;
   JPEG: `_jxlphoto_rebuild_args`, and the rebuilt file must have the catalog's
   `source_sha256` → `RESTORED`, else `ERROR (JP-16)`), and the one file takes the
-  target's name with `_rename_no_clobber`. `--convert-back all|lossless|none`
+  target's name with `_rename_no_clobber`. Since rc4 a JPEG with djxl skips the
+  copy: `_rebuild_jpeg_with_djxl` reads its JXL once from the backup (size and
+  catalog SHA-256 checked), rebuilds it in memory (JP-18) and writes it next to
+  the target; a JPEG needs no jxl-photo then (`NEEDS_JXLPHOTO` only without
+  both). The groups run on two pools (`_run_group`: every error a status;
+  JPEG `_jxl_workers()`, TIFF `_jxl_tiff_workers()`), their results kept by
+  index, while the plain copies go on in order on the main thread; Ctrl+C
+  cancels what has not started and writes the CSV. `--convert-back all|lossless|none`
   (v0.14.0-rc3; `--keep-jxl` = none): `lossless` brings back a group only when
   its `lossless` flag is 1 (every JPEG; a TIFF per JP-17), the others are
   restored as their JXL (`RESTORED_AS_JXL`). `_find_jxlphoto` falls back to
@@ -233,7 +270,10 @@ from the command line. A future job (e.g. a full mirror) is a new
   unreadable, never missing.
 - **A TIFF or JPEG kept as JXL needs proof, and a failure copies the file
   (v0.14.0-rc2; JPEG rc3).** A TIFF's JXL group is kept only when jxl-photo
-  exited 0 with `--verify-roundtrip`, every file's `jxlphoto-srcsum` is
+  exited 0 (given `--verify-roundtrip`: since jxl-photo 2.31.0-rc1 every page
+  is decoded and compared with the TIFF's before it takes its name, JP-20,
+  rc4; up to 2.30.x it compared pixels only with `--delete-source`),
+  every file's `jxlphoto-srcsum` is
   `_jxlphoto_srcsum(SHA-256 photo-backup took before)`, `jxlphoto-pages` = the
   number of files, and the TIFF's size/date did not change (`_encode_one`). A
   JPEG's JXL (no marks: they break the rebuilding) is kept only when the JPEG
@@ -243,12 +283,16 @@ from the command line. A future job (e.g. a full mirror) is a new
   and `lossless` (schema 3; `_tiff_lossless` from the class marks, JP-17); a
   schema 2 catalog reads with kind from the extension and lossless unknown,
   and is upgraded with `ALTER TABLE` when opened to write. JPEG exports ARE
-  converted (byte for byte); TIFF exports never. Order: the group gets its
-  final names (`_rename_no_clobber`) and rows, THEN the old group / the TIFF
-  copy it replaces leaves (never before). Our own folders under
-  `_photo_backup\converting` and `.pbtmp` folders under `tools` are the only
-  folders this removes (`_remove_own_folder`, never a link). Nothing in
-  `tools` is replaced or deleted otherwise.
+  converted (byte for byte); TIFF exports never. Order: the new group's bytes
+  are on the backup's disk next to their final names (copy route, rc4) before
+  the old group moves aside; then the group gets its final names
+  (`_rename_no_clobber`) and rows, THEN the TIFF copy it replaces leaves (never
+  before). This run's work folder (`JXL_WORK_DIR\JXL_WORK_FOLDER\<pid>`), a
+  conversion's folder in it, the folder there of a backup whose process no
+  longer runs (`_pid_alive`; only a name that is digits AND holds
+  `_WORK_MARK`), rc2/rc3's `_photo_backup\converting`, and `.pbtmp` folders
+  under `tools` are the only folders this removes (`_remove_own_folder`,
+  never a link). Nothing in `tools` is replaced or deleted otherwise.
 - **The restore never writes to the backup.** `restore_backup.py` opens the
   catalog read-only, never writes, moves or deletes anything under `--backup`,
   and never overwrites a target file that already exists. An empty `--to` or
@@ -553,7 +597,7 @@ Same as the sibling repo `jxl-photo`. Documents live in `AI_tools/`
 - `docs/captureone.md` — `captureone_backup.py`: what is kept, the restore,
   force and undo, its options and settings.
 - `docs/jxlphoto_contract.md` — the contract with jxl-photo (仕様書): every
-  item JP-1 to JP-17 with its rule, where it lives in both programs and what
+  item JP-1 to JP-21 with its rule, where it lives in both programs and what
   breaks; the minimum version and how it was measured; how to run the
   contract test against any jxl-photo or an old tag.
 - `docs/tiff_to_jxl.md` — a TIFF or JPEG kept as JXL in the backup (the file

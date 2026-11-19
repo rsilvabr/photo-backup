@@ -53,7 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 import manifest_backup as mb
 
-__version__ = "0.14.0-rc3"
+__version__ = "0.14.0-rc4"
 
 # ---- Settings -------------------------------------------------------------------
 MIRROR_KEEP_DAYS = 30               # days a file the mirror removed or replaced stays in the trash
@@ -1279,7 +1279,7 @@ class MirrorJob:
                    if self.numbers.get("convert") else "")
         return (f"Mirror now? copy {_n(self.numbers['new'])}, replace "
                 f"{_n(self.numbers['changed'])}{convert}, {verb} "
-                f"{_n(self.numbers['remove'])} [y/N] ")
+                f"{_n(self.numbers['remove'])} [y/N, Enter = no] ")
 
     # -- before the copy ---------------------------------------------------------------------
     def remove(self, dest, stamp, catalog, orphans, log):
@@ -1844,7 +1844,7 @@ def main(argv=None):
             return 2
         backend_args = _manifest_backend_args(args, rows)
         errors = mb._validate_rows(backend_args, rows)
-        errors += mb._tiff_rows_errors(rows, args.jxlphoto)
+        errors += mb._tiff_rows_errors(rows, args.jxlphoto, args.dest)
     else:
         rows = modes = None
         try:

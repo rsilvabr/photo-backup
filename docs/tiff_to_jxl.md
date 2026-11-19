@@ -29,9 +29,13 @@ profile `jxl` below, 4 conversions at a time):
 | TIFF film scan, 16-bit, 41 MP | distance 0 (lossless) | 71% | the same pixels |
 | TIFF film scan, 8-bit (SilverFast) | distance 0 (lossless) | 59% | the same pixels |
 
-Speed: 146 JPEG and 10 TIFF (1.8 GB) in 74 s; 16 TIFF (1.8 GB) in 54 s. A
-JPEG costs two short jxl-photo runs (the transcode and its proof), about 2 s
-for each of the `JXL_WORKERS`.
+Speed *(v0.14.0-rc4; a 16-core Ryzen 9 5950X, NVMe)*: those 146 JPEG and 10
+TIFF (1.8 GB) are kept as JXL in 32 s (rc3: 71 s) and come back in 13 s (rc3:
+116 s). A JPEG costs one jxl-photo run (the transcode, about 0.5 s) and its
+proof by djxl (0.17 s); one runs per physical core (`JXL_WORKERS`). The
+conversions run in the system's temp folder (an SSD on most computers), and
+one writer gives the backup's disk each finished JXL in turn — an SMR disk
+takes that far better than many files written at once.
 
 **A JPEG comes back byte for byte**: the JXL keeps what rebuilds the JPEG file
 exactly, metadata included, and photo-backup checks that before it keeps the
@@ -44,9 +48,11 @@ the original's), and close to them at a distance above 0.
 1. Tell photo-backup where jxl-photo is: `JXLPHOTO` at the top of
    `selective_backup.py` (`jxl_photo.py` of a jxl-photo folder, or
    `jxl-photo.exe`), or `--jxlphoto PATH` on the command line. It must be
-   jxl-photo 2.30.0 or newer (`JXLPHOTO_MIN_VERSION`): what photo-backup needs
-   from it is [its contract](jxlphoto_contract.md), checked by a test you can
-   run against any jxl-photo.
+   jxl-photo 2.31.0-rc1 or newer (`JXLPHOTO_MIN_VERSION`: the first that checks
+   every page it converts), and a TIFF needs libjxl's `djxl` on PATH (jxl-photo
+   checks the pages with it; without it a `Tiff` profile is refused, exit 2).
+   What photo-backup needs from jxl-photo is [its contract](jxlphoto_contract.md),
+   checked by a test you can run against any jxl-photo.
 2. Choose per manifest line, in the optional columns `Tiff` and `Jpeg`
    ([per_folder_modes.md](per_folder_modes.md)). `Tiff`: `copy` (empty: the
    TIFF as it is) or the name of a profile of `TIFF_JXL_PROFILES`. `Jpeg`:
@@ -92,13 +98,22 @@ settings (`photo.tif.cos`) still say which photo it is.
 
 ## How a JXL is trusted
 
-jxl-photo converts each file in a folder of its own inside
-`_photo_backup\converting` (`JXL_WORK_FOLDER`). photo-backup keeps the result
-only with proof.
+jxl-photo converts each file in a folder of its own, outside the backup: in
+`JXL_WORK_DIR` (by default the system's temp folder), `pbconv\<process
+number>\` (`JXL_WORK_FOLDER`). photo-backup keeps the result only with proof,
+and then one writer copies it into the backup, each file read back and
+checked against its SHA-256 (`--verify-copy`) before it takes its name.
 
-**A TIFF** (jxl-photo checks its own round trip, `--verify-roundtrip`):
+**A TIFF**:
 
 - jxl-photo ended without an error and wrote at least one JXL;
+- **jxl-photo decoded every page and compared it with that page of the TIFF
+  before the page took its name** (`--verify-roundtrip`, jxl-photo 2.31.0-rc1
+  or newer: [JP-20](jxlphoto_contract.md#jp-20--every-page-is-checked-before-it-takes-its-name)):
+  a lossless page decodes to the same pixels; a lossy one holds the same image
+  — its brightness and a PSNR of at least 20 dB catch a black or scrambled
+  encode, not a small loss (real NX Studio TIFFs at distance 0.05 measured 45
+  to 68 dB). A page that fails, or cannot be checked, fails the whole TIFF;
 - every JXL says it was made from the very bytes this run read: its
   `jxlphoto-srcsum` mark is the SHA-256 of the TIFF, taken by photo-backup
   before the conversion;
@@ -109,25 +124,31 @@ only with proof.
 route):
 
 - jxl-photo ended without an error and wrote one JXL;
-- **jxl-photo rebuilds the JPEG from that JXL, and the rebuilt file has the
+- **the JPEG rebuilt from that JXL (by libjxl's djxl, or by jxl-photo) has the
   SHA-256 photo-backup took of the JPEG before** — the same bytes, proven before
   the JXL counts (the JXL of a JPEG carries no marks: they would break that
   rebuilding);
 - the JPEG has the same size and date at the end.
 
-Then the JXL files take their final names and the catalog records each one
-(its own size, date and SHA-256) and the file it came from (size, date,
-SHA-256, page, pages, its kind, whether it is lossless, jxl-photo's version and
-the settings). A TIFF is lossless when the distance its class got is 0
-(jxl-photo marks a scan and an 8-bit TIFF: [JP-17](jxlphoto_contract.md#jp-17--the-tiff-class-marks)).
+Then the JXL files go into the backup — every file of a group written next to
+its final name and checked first, then the names (should a name fail to change,
+the next run moves the pages already renamed aside and makes the group again)
+— and the catalog records each one (its own size, date and SHA-256) and
+the file it came from (size, date, SHA-256, page, pages, its kind, whether it
+is lossless, jxl-photo's version and the settings). A TIFF is lossless when
+the distance its class got is 0 (jxl-photo marks a scan and an 8-bit TIFF:
+[JP-17](jxlphoto_contract.md#jp-17--the-tiff-class-marks)).
 
 **Anything else copies the file as it is**, under its own name: jxl-photo
-missing or failing, a mark that does not match, a group not whole, a JPEG that
-does not come back byte for byte (a CMYK JPEG cannot be transcoded), a file
-that changed while it was converted, `JXL_TIMEOUT_MIN` passed. The log says
-`CONVERT FAILED <file>: <why> (JP-n)`, the summary counts it, and the run exits
-1. Nothing is left without a copy; the next run tries again and, once it works,
-that copy leaves (below).
+missing or failing, a page that fails its check, a mark that does not match, a
+group not whole, a JPEG that does not come back byte for byte (a CMYK JPEG
+cannot be transcoded), a file that changed while it was converted,
+`JXL_TIMEOUT_MIN` passed, a JXL that could not be written into the backup. The
+log says `CONVERT FAILED <file>: <why> (JP-n)` — for an error of jxl-photo, its
+own ERROR line and the path of jxl-photo's log of that conversion, kept in
+`Logs\jxl-photo\` (a conversion that worked keeps no log) —, the summary counts
+it, and the run exits 1. Nothing is left without a copy; the next run tries
+again and, once it works, that copy leaves (below).
 
 ## A second run
 
@@ -136,9 +157,10 @@ that copy leaves (below).
 - **The file was edited**: CHANGED. With `--update-changed` (always in the
   mirror) it is converted again; the old JXL goes to `versions\` (the
   mirror: to its trash).
-- **Another profile** (or other distances, or another `TIFF_JXL_EFFORT` /
-  `JPEG_JXL_EFFORT`): CHANGED, converted again the same way. The catalog keeps
-  the settings each JXL was made with.
+- **Another profile** (or other distances, or another `TIFF_JXL_EFFORT`):
+  CHANGED, converted again the same way. The catalog keeps the settings each
+  JXL was made with. Another `JPEG_JXL_EFFORT` is not a change: every effort
+  gives the same JPEG back, so a JPEG already kept as JXL stays as it is.
 - **A page missing in the backup**: the group is made again.
 
 ## A backup that already holds the TIFF or the JPEG
@@ -187,24 +209,31 @@ back in the format you choose ([restoring.md](restoring.md)):
 JXL it is in the backup (a TIFF made from it would be bigger, never better).
 A file the catalog cannot tell (a backup made by rc2) counts as lossy there.
 
-How each one comes back: the restore copies the JXL files next to the target
-(each one checked against its catalog SHA-256, never written in the backup) and
-runs jxl-photo there. A JPEG is rebuilt (`transcode --format jpeg`) and checked
-against the SHA-256 of the original JPEG: the same bytes, `RESTORED`; a rebuild
-that differs is an `ERROR (JP-16)` and nothing is written. A TIFF is decoded
-(`decode --mode 0 --depth-policy preserve_original --no-preview`: its own pages
-and bit depths, no preview page added): `RESTORED_FROM_JXL`. A JXL kept as it
-is: `RESTORED_AS_JXL`. Every file gets the original's date and never replaces a
+How each one comes back: a JPEG is rebuilt by libjxl's djxl straight from
+the backup's JXL (read once and checked against its catalog SHA-256, never
+written there; [JP-18](jxlphoto_contract.md#jp-18--djxl-gives-the-jpeg-back-from-its-jxl))
+and checked against the SHA-256 of the original JPEG: the same bytes,
+`RESTORED`; a rebuild that differs is an `ERROR (JP-18)` and nothing is
+written. Without djxl (`DJXL`), the restore copies the JXL next to the target
+and jxl-photo rebuilds it there (`transcode --format jpeg`, JP-16). A TIFF's
+JXL files are copied next to the target the same way (each one checked
+against its catalog SHA-256) and decoded by jxl-photo (`decode --mode 0
+--depth-policy preserve_original --no-preview`: its own pages and bit depths,
+no preview page added): `RESTORED_FROM_JXL`. A JXL kept as it is:
+`RESTORED_AS_JXL`. Every file gets the original's date and never replaces a
 file that is there.
 
 - jxl-photo comes from `--jxlphoto` / `JXLPHOTO`; when that is empty or not
   found, the restore uses the newest one kept in the backup (below) and says
-  so.
+  so. The restore runs a jxl-photo from 2.30.0 on
+  (`JXLPHOTO_RESTORE_MIN_VERSION`): the one an older backup keeps still
+  brings its files back.
 - No jxl-photo at all: `NEEDS_JXLPHOTO` for those files (the others are
   restored), exit 1. `--convert-back none` restores the JXL files as they are.
 - `--only` takes the file's own name (`2025\shoot\photo.tif`) or a JXL's.
-- One file at a time, about a second each: a whole backup of JXL takes hours
-  to come back as TIFF and JPEG; `--convert-back none` is a plain copy.
+- Several at a time (v0.14.0-rc4): `JXL_WORKERS` JPEGs and `JXL_TIFF_WORKERS`
+  TIFFs come back together while the plain copies go on in order; the CSV
+  keeps the order of the catalog. `--convert-back none` is a plain copy.
 
 ## Verify
 
@@ -220,7 +249,9 @@ byte for byte when it was made.
 The space check counts each file to convert at its full size (the JXL is
 smaller: the room is there for the worst case). `manifest_backup.py --analyze`
 adds the columns `tiff_to_jxl_bytes` and `jpeg_to_jxl_bytes`: how much of each
-line is TIFF or JPEG that it would keep as JXL.
+line is TIFF or JPEG that it would keep as JXL. The work folder
+(`JXL_WORK_DIR`) holds only the files in flight — each pool runs at most twice
+its size ahead of the writer —: a few GB, however slow the backup's disk is.
 
 ## The programs kept in the backup
 
@@ -258,20 +289,31 @@ At the top of `selective_backup.py`:
 | Setting | Default | Meaning |
 |---|---|---|
 | `JXLPHOTO` | `""` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`; `""` = no conversion (a line that asks for one is refused, exit 2) |
-| `JXLPHOTO_MIN_VERSION` | `"2.30.0"` | the oldest jxl-photo that keeps [the contract](jxlphoto_contract.md); an older one, or one that does not say its version, is refused (exit 2), and the restore does not run it |
+| `JXLPHOTO_MIN_VERSION` | `"2.31.0-rc1"` | the oldest jxl-photo a backup runs ([the contract](jxlphoto_contract.md); 2.31.0-rc1 checks every page it converts, JP-20); an older one, or one that does not say its version, is refused (exit 2) |
+| `JXLPHOTO_RESTORE_MIN_VERSION` | `"2.30.0"` | the oldest the restore runs to bring a file back (the decode and the JPEG rebuild did not change since): the jxl-photo kept in an older backup still restores it |
 | `TIFF_JXL_PROFILES` | `{"jxl": ...}` | the profiles the `Tiff` column (or `--tiff`) names: `distance`, `scan_distance`, `eight_bit_distance` (0 = lossless); no profile may be called `jpeg` |
 | `TIFF_EXTENSIONS` | `(".tif", ".tiff")` | what a profile converts (never in an export folder) |
 | `TIFF_JXL_EFFORT` | `7` | jxl-photo's `--effort` for a TIFF (1 to 10) |
 | `JPEG_JXL_EXTENSIONS` | `(".jpg", ".jpeg")` | what `Jpeg=jxl` (or `--jpeg jxl`) keeps as JXL, exports too |
-| `JPEG_JXL_EFFORT` | `7` | jxl-photo's `--effort` for a JPEG (1 to 10; lossless at any effort) |
-| `JXL_WORKERS` | `4` | files converted at the same time (one jxl-photo each) |
+| `JPEG_JXL_EFFORT` | `5` | jxl-photo's `--effort` for a JPEG (1 to 10; lossless at any effort). Measured on 60 real JPEGs: 3, 5 and 7 give the same size; 16 at a time, 5 was 30% faster than 7 (one at a time, the same); 9 is 8× slower. Changing it never converts a JPEG again |
+| `JXL_WORKERS` | `0` | files converted at the same time (one jxl-photo each); `0` = one per physical core (on a 16-core CPU, 16 were as fast as 32 and left a third of the CPU free), one per logical CPU where the cores cannot be counted |
+| `JXL_TIFF_WORKERS` | `0` | of those, TIFFs at the same time (a TIFF takes GBs of memory); `0` = a quarter of the logical CPUs, at most one per 4 GB of free memory |
+| `DJXL` | `""` | libjxl's `djxl`, which proves and restores a JPEG ([JP-18](jxlphoto_contract.md#jp-18--djxl-gives-the-jpeg-back-from-its-jxl)); `""` = the one on PATH; `"none"` = always through jxl-photo (JP-16) |
 | `JXL_TIMEOUT_MIN` | `30` | a conversion longer than this is given up: the file is copied as it is |
-| `JXL_WORK_FOLDER` | `"converting"` | the conversions' own folder, under `_photo_backup` (emptied by each run) |
+| `JXL_WORK_DIR` | `""` | where the conversions run, each in a folder of its own; `""` = the system's temp folder (an SSD on most computers). The work folder is never inside or above a source or the backup (refused, exit 2: a source that holds the temp folder needs another `JXL_WORK_DIR`). On another volume than the backup, each JXL is copied into it and checked; on the same one, renamed |
+| `JXL_WORK_FOLDER` | `"pbconv"` | photo-backup's folder inside `JXL_WORK_DIR` (one plain name): one folder per running backup, named by its process number and holding a mark file, removed at the end; a later run removes the marked ones of a backup that no longer runs |
 | `KEEP_TOOLS_IN_BACKUP` | `True` | keep photo-backup, jxl-photo and `KEEP_TOOLS_EXTRA` in the backup |
 | `KEEP_TOOLS_EXTRA` | `()` | more files or folders kept there |
 | `TOOLS_FOLDER` | `"tools"` | where, under `_photo_backup` |
 
 The manifest's `Jpeg` column accepts the words of `JPEG_VALUES`
-(`manifest_backup.py`). jxl-photo runs with its own logs in photo-backup's log
-folder (`Logs\jxl-photo\`), without its update check, and without writing
-anything next to itself.
+(`manifest_backup.py`). jxl-photo runs with its log in the conversion's own
+folder (kept in photo-backup's `Logs\jxl-photo\` only when the conversion
+failed: a backup of a whole archive would leave one per photo; the restore's
+go there directly), with its own defaults and not the settings overlay of its
+presets (`JXLPHOTO_SETTINGS` empty:
+[JP-21](jxlphoto_contract.md#jp-21--an-empty-jxlphoto_settings-turns-the-settings-overlay-off)),
+without its update check, and without writing anything next to itself: its
+compiled Python is kept in `Logs\pycache\` (rebuilt by itself when it is gone
+or jxl-photo changes), so it starts in 0.08 s instead of 0.3 to 0.5 s
+([JP-19](jxlphoto_contract.md#jp-19--each-command-is-a-script-beside-jxl_photopy)).

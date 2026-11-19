@@ -64,7 +64,7 @@ def test_j16_a_tiff_profile_cannot_be_named_jpeg(env, monkeypatch, capsys):
 
 
 # ---- J17 a JPEG becomes JXL, proven byte for byte ------------------------------------------------
-def test_j17_jpegs_become_jxl_proven_by_their_rebuild(env, capsys):
+def test_j17_jpegs_become_jxl_proven_by_their_rebuild(env, capsys, monkeypatch):
     add_jpegs(env)
     before = snapshot(env.src)
     assert backup(env, "--jpeg", "jxl") == 0
@@ -79,12 +79,17 @@ def test_j17_jpegs_become_jxl_proven_by_their_rebuild(env, capsys):
     made = [call for call in transcodes if "--format" not in call]
     rebuilt = [call for call in transcodes if "--format" in call]
     assert len(made) == len(rebuilt) == len(ALL_JPEGS)
-    assert all(call[3:] == ["--mode", "0", "--workers", "1", "--effort", "7",
+    assert all(call[3:] == ["--mode", "0", "--workers", "1", "--effort", str(sb.JPEG_JXL_EFFORT),
                             "--force-transcode"] for call in made)
     out = capsys.readouterr().out
     assert "JPEG kept as JXL (lossless: the same bytes back): 4 to convert" in out
     assert "Kept as JXL: 4 converted (4 JPEG)" in out
     assert backup(env, "--jpeg", "jxl") == 0                # a second run: nothing to do
+    assert "0 to convert" in capsys.readouterr().out
+    assert len(calls(env, command="transcode")) == len(transcodes)
+    # every effort gives the same bytes back: another one is no reason to convert again (rc4)
+    monkeypatch.setattr(sb, "JPEG_JXL_EFFORT", sb.JPEG_JXL_EFFORT + 2)
+    assert backup(env, "--jpeg", "jxl") == 0
     assert "0 to convert" in capsys.readouterr().out
     assert len(calls(env, command="transcode")) == len(transcodes)
 
@@ -237,3 +242,128 @@ def test_j23_the_manifest_jpeg_column(env, capsys, photobackup_log_dir):
                     f'"{env.src / "2025"}",6,,,,lossy\n', encoding="utf-8")
     assert mb.main(["--manifest", str(path), "--dest", str(env.dest), "--yes"]) == 2
     assert "Jpeg must be copy or jxl" in capsys.readouterr().err
+
+
+# ---- J24 the fast way: libjxl's djxl proves and rebuilds a JPEG (v0.14.0-rc4) -----------------
+FAKE_DJXL = Path(__file__).with_name("fake_djxl.py")
+
+
+def test_j24_djxl_proves_and_rebuilds_the_jpegs(env, monkeypatch, photobackup_log_dir):
+    add_jpegs(env)
+    monkeypatch.setattr(sb, "DJXL", str(FAKE_DJXL))
+    assert backup(env, "--jpeg", "jxl") == 0
+    transcodes = calls(env, command="transcode")
+    assert transcodes and not [call for call in transcodes if "--format" in call]
+    assert len(calls(env, command="djxl")) == len(ALL_JPEGS)
+    assert {rel + ".jxl" for rel in ALL_JPEGS} <= backed(env.dest)
+    before = len(calls(env, command="transcode"))
+    assert restore(env, "--to", env.out) == 0           # back by djxl, straight from the backup
+    for rel in ALL_JPEGS:
+        assert (env.out / rel).read_bytes() == (env.src / rel).read_bytes(), rel
+    assert len(calls(env, command="transcode")) == before
+    statuses = restore_statuses(photobackup_log_dir)
+    assert {statuses[rel] for rel in ALL_JPEGS} == {"RESTORED"}
+
+
+def test_j24_a_wrong_rebuild_is_never_kept_nor_restored(env, monkeypatch, photobackup_log_dir):
+    add_jpegs(env)
+    monkeypatch.setattr(sb, "DJXL", str(FAKE_DJXL))
+    monkeypatch.setenv("FAKE_DJXL_WRONG", "1")
+    assert backup(env, "--jpeg", "jxl") == 1            # the proof fails: the JPEG as it is
+    assert "(JP-18)" in latest_log(photobackup_log_dir)         # djxl rebuilt it
+    assert ALL_JPEGS <= backed(env.dest)
+    monkeypatch.delenv("FAKE_DJXL_WRONG")
+    assert backup(env, "--jpeg", "jxl") == 0
+    monkeypatch.setenv("FAKE_DJXL_WRONG", "1")
+    assert restore(env, "--to", env.out, "--only", "2025/phone") == 1
+    statuses = restore_statuses(photobackup_log_dir)
+    assert statuses["2025/phone/cmyk.jpg"] == "ERROR"
+    assert not (env.out / "2025/phone/cmyk.jpg").exists()
+    monkeypatch.delenv("FAKE_DJXL_WRONG")
+    jxl = env.dest / "2025/phone/cmyk.jpg.jxl"          # a damaged copy in the backup
+    data = bytearray(jxl.read_bytes())
+    data[-1] ^= 0xFF
+    jxl.write_bytes(bytes(data))
+    shutil.rmtree(env.out)
+    assert restore(env, "--to", env.out, "--only", "2025/phone/cmyk.jpg") == 1
+    assert restore_statuses(photobackup_log_dir)["2025/phone/cmyk.jpg"] == "CORRUPT_IN_BACKUP"
+
+
+
+def test_j24_a_jpeg_needs_only_djxl_to_come_back(env, monkeypatch, photobackup_log_dir, capsys):
+    add_jpegs(env)
+    monkeypatch.setattr(sb, "DJXL", str(FAKE_DJXL))
+    assert backup(env, "--jpeg", "jxl") == 0
+    monkeypatch.setattr(sb, "JXLPHOTO", "")              # a new computer: libjxl, no jxl-photo
+    capsys.readouterr()
+    assert restore(env, "--to", env.out) == 0
+    statuses = restore_statuses(photobackup_log_dir)
+    assert {statuses[rel] for rel in ALL_JPEGS} == {"RESTORED"}
+    for rel in ALL_JPEGS:
+        assert (env.out / rel).read_bytes() == (env.src / rel).read_bytes(), rel
+    assert "JPEG by djxl" in capsys.readouterr().out
+    monkeypatch.setattr(sb, "DJXL", "none")              # neither: NEEDS_JXLPHOTO, as before
+    shutil.rmtree(env.out)
+    assert restore(env, "--to", env.out) == 1
+    assert {restore_statuses(photobackup_log_dir)[rel] for rel in ALL_JPEGS} == {"NEEDS_JXLPHOTO"}
+
+# ---- J25 how many at a time ---------------------------------------------------------------------
+def test_j25_workers_follow_the_machine(monkeypatch, capsys):
+    monkeypatch.setattr(sb, "JXL_WORKERS", 0)
+    cores = sb._physical_cores()                        # rc4: one per physical core
+    if os.name == "nt":
+        assert cores is not None and 1 <= cores <= (os.cpu_count() or 1)
+    assert sb._jxl_workers() == max(1, cores or os.cpu_count() or 1)
+    monkeypatch.setattr(sb, "_physical_cores", lambda: None)    # cannot be counted
+    assert sb._jxl_workers() == max(1, os.cpu_count() or 1)
+    monkeypatch.setattr(sb, "JXL_WORKERS", 3)
+    assert sb._jxl_workers() == 3
+    monkeypatch.setattr(sb, "JXL_TIFF_WORKERS", 0)
+    assert 1 <= sb._jxl_tiff_workers() <= max(1, (os.cpu_count() or 1) // 4)
+    monkeypatch.setattr(sb, "JXL_TIFF_WORKERS", 2)
+    assert sb._jxl_tiff_workers() == 2
+    monkeypatch.setattr(sb, "JXL_TIFF_WORKERS", -1)
+    assert any("JXL_TIFF_WORKERS" in error for error in sb._tiff_profile_errors())
+
+
+# ---- J26 jxl-photo starts fast: each command's own script, its bytecode kept (v0.14.0-rc4) -----
+def _backend_scripts(env, *, leave_out=()):
+    """jxl-photo's layout beside the fake: one script per command (JP-19)."""
+    for command, module in sb._JXLPHOTO_BACKENDS.items():
+        if module in leave_out:
+            continue
+        (env.tool.parent / f"{module}.py").write_text(
+            "import sys\n"
+            "import jxl_photo\n"
+            "if __name__ == '__main__':\n"
+            f"    sys.exit(jxl_photo.main([{command!r}] + sys.argv[1:]))\n", encoding="utf-8")
+
+
+def test_j26_a_command_runs_its_own_script_with_its_bytecode_kept(env, photobackup_log_dir):
+    add_jpegs(env)
+    _backend_scripts(env)
+    tool = str(env.tool)
+    for command, module in sb._JXLPHOTO_BACKENDS.items():
+        argv = sb._jxlphoto_argv(tool, [command, "a", "b"])
+        assert argv[1] == "-c" and argv[3:] == [str(env.tool.parent), module, "a", "b"]
+    assert sb._jxlphoto_argv(tool, ["other", "a"])[1:] == ["-B", tool, "other", "a"]
+    assert sb._jxlphoto_argv("C:/x/jxl-photo.exe", ["transcode", "a"]) == [
+        "C:/x/jxl-photo.exe", "transcode", "a"]
+    assert backup(env, "--jpeg", "jxl", "--tiff", "jxl") == 0
+    assert {rel + ".jxl" for rel in JPEGS} <= backed(env.dest)
+    assert restore(env, "--to", env.out) == 0
+    for rel in ALL_JPEGS:
+        assert (env.out / rel).read_bytes() == (env.src / rel).read_bytes(), rel
+    cache = Path(photobackup_log_dir) / "pycache"
+    kept = {path.name.split(".")[0] for path in cache.rglob("*.pyc")}
+    assert {"jxl_tiff_encoder", "jxl_jpeg_transcoder", "jxl_photo"} <= kept
+    assert not list(env.tool.parent.rglob("__pycache__"))       # nothing beside jxl-photo
+
+
+def test_j26_a_command_without_its_script_goes_through_jxl_photo(env, photobackup_log_dir):
+    add_jpegs(env)
+    _backend_scripts(env, leave_out=("jxl_jpeg_transcoder",))
+    assert sb._jxlphoto_argv(str(env.tool), ["transcode", "a"])[1:3] == ["-B", str(env.tool)]
+    assert backup(env, "--jpeg", "jxl") == 0
+    assert {rel + ".jxl" for rel in JPEGS} <= backed(env.dest)
+    assert not list(env.tool.parent.rglob("__pycache__"))

@@ -19,7 +19,7 @@ restore_backup.py --backup PATH (--to PATH | --to-original) [options]
 | `--space-margin-gb N` | free space kept on each target drive, in GB (default `5.0`) |
 | `--convert-back all\|lossless\|none` | the TIFFs and JPEGs the backup keeps as JXL: `all` back to their own format (default; a JPEG byte for byte), `lossless` only the ones that come back exactly (every JPEG, a lossless TIFF; a lossy TIFF stays JXL), `none` every one as JXL *(v0.14.0-rc3; [the table](tiff_to_jxl.md#restoring))* |
 | `--keep-jxl` | the same as `--convert-back none` *(v0.14.0-rc2)* |
-| `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, to turn a file kept as JXL back into its TIFF or JPEG (default `JXLPHOTO`; empty or not found: the newest one kept in the backup's `_photo_backup\tools`) *(v0.14.0-rc2)* |
+| `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, to turn a file kept as JXL back into its TIFF or JPEG (default `JXLPHOTO`; empty or not found: the newest one kept in the backup's `_photo_backup\tools`) *(v0.14.0-rc2)*; any jxl-photo from 2.30.0 on (`JXLPHOTO_RESTORE_MIN_VERSION`, *rc4*) |
 | `--dry-run` | plan and report, restore nothing |
 | `--yes` | do not ask for confirmation |
 | `--version` | print the version and exit |
@@ -30,8 +30,9 @@ the console, in the log and in `<log>_restore.csv`:
 
 - `RESTORED` — copied from the backup and verified against the catalog
   SHA-256 (`RESTORED_UNVERIFIED` when the catalog had no hash yet); for a JPEG
-  the backup keeps as JXL *(v0.14.0-rc3)*: rebuilt by jxl-photo and checked
-  against the SHA-256 of the original JPEG — the same bytes;
+  the backup keeps as JXL *(v0.14.0-rc3)*: rebuilt by libjxl's djxl straight
+  from the backup's JXL *(rc4; without djxl, by jxl-photo)* and checked against
+  the SHA-256 of the original JPEG — the same bytes;
 - `RESTORED_FROM_JXL` *(v0.14.0-rc2)* — a TIFF the backup keeps as JXL, made
   again by jxl-photo under its own name, with its pages and its date (each JXL
   checked against its catalog SHA-256 first). Lossless gives back the same
@@ -39,7 +40,8 @@ the console, in the log and in `<log>_restore.csv`:
 - `RESTORED_AS_JXL` *(v0.14.0-rc3)* — a file kept as JXL restored as the JXL
   it is (`photo.tif.jxl`), as `--convert-back` chose;
 - `NEEDS_JXLPHOTO` *(v0.14.0-rc2)* — such a TIFF or JPEG, and no jxl-photo:
-  neither `--jxlphoto` / `JXLPHOTO` nor one kept in the backup. The others are
+  neither `--jxlphoto` / `JXLPHOTO` nor one kept in the backup (a JPEG needs
+  only djxl, *rc4*). The others are
   restored, the run exits 1; `--convert-back none` gives the JXL files as they
   are;
 - `ALREADY_THERE` — the target exists with the same content (size and hash;

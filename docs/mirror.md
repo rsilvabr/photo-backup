@@ -144,7 +144,7 @@ is on the screen when the question is asked. Its first lines say what matters:
     261119_221500_mirror_actions.csv
     in C:\photo-backup\Logs
 ================================================================================
-Mirror now? copy 1,234, replace 39, remove 1,204 [y/N]
+Mirror now? copy 1,234, replace 39, remove 1,204 [y/N, Enter = no]
 ```
 
 Anything that needs attention follows in its own lines marked `!!` (the trash
