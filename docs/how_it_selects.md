@@ -45,6 +45,20 @@ _EXPORT\TIFF16\_DSC6491_NXstudio_ProPhoto-g22_v1.tif   ✗  same photo, it has a
 
 The export is matched to the shortest original name it starts with, `_DSC6491`, and every file beside the export folder whose name starts with that name comes along. It makes no difference whether you exported from the RAW or from the TIFF. The TIFF beside the RAW is an original, so the export formats do not filter it; only the files inside `_EXPORT` are.
 
+**A DNG from DxO's denoise.** DxO PureRAW and PhotoLab save the denoised photo as a DNG beside the RAW, named after it; the same rule keeps the whole chain:
+
+```
+DSC_9363.NEF                                                   ✓  the RAW
+DSC_9363.JPG                                                   ✓  the camera JPEG
+DSC_9363-DxO_DeepPRIME XD3.dng                                 ✓  the DNG DxO denoised from the RAW
+DSC_9363-DxO_DeepPRIME XD3.xmp                                 ✓  its sidecar
+CaptureOne\Settings1674\DSC_9363-DxO_DeepPRIME XD3.dng.cos     ✓  the Capture One edit of the DNG
+_EXPORT\16B_JXL\DSC_9363-DxO_DeepPRIME XD3_ProPhoto-g22_v1.jxl ✓  exported from the edited DNG
+_EXPORT\TIFF16\DSC_9363-DxO_DeepPRIME XD3_ProPhoto-g22_v1.tif  ✗  same photo, it has a JXL
+```
+
+The export's key is `DSC_9363`, the shortest original name it starts with, so the RAW comes along even when only the DNG was exported (checked on a real session of 2026 with ten such DNGs: every one kept with its RAW). Keep the DNG beside the RAW: DxO can also save into a subfolder, and a file in a subfolder is not an original of the session. A DNG is a RAW type (`RAW_EXTENSIONS`), so a mode that also keeps the originals that were not exported keeps a DNG that was not exported too.
+
 Sessions are found at any depth. A folder without an export is not copied, but it is listed:
 
 ```
@@ -108,6 +122,9 @@ right before a separator (`_`, `-`, `.`, space, `(`) and equals an anchor:
 - `DSC0001_Nxstudio_v1_sRGB.jpg` with `DSC0001.NEF` and
   `DSC0001_Nxstudio_v1.tiff` → key `DSC0001` (the shortest match wins), so
   both originals are copied.
+- `DSC_9363-DxO_DeepPRIME XD3_ProPhoto-g22_v1.jxl` with `DSC_9363.NEF` and
+  `DSC_9363-DxO_DeepPRIME XD3.dng` → key `DSC_9363` (`-` is a separator), so
+  the RAW and DxO's DNG, with their sidecars, are both copied.
 - `DSC_9360x.jpg` with `DSC_936` beside it does NOT match: the character
   after `DSC_936` is `0`, not a separator.
 - Windows' duplicate counter is part of the name *(v0.5.0)*:

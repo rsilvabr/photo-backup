@@ -11,6 +11,7 @@ current one. Every release in detail: [version_history.md](version_history.md).
 - **A screen made to be read in a hurry**: the verdict first ("N files will be removed: to the trash until ..."), the mirror's box last, right above the question, and where to copy a file back from. `[8] Mirror` in the menu, with "What is in the trash".
 - **The version on the screen and in the backup**: each program shows its name and version (the summary's first line, the mirror's boxes, the console's title), and the catalog records which version created it and which one last changed it.
 - The manifest has an optional `Mirror` column (`disk` / `selection`); `manifest_backup.py` reads it and ignores it.
+- The README shows a photo developed in another program first — a TIFF from NX Studio, a denoised DNG from DxO — and how the final photo, the intermediate and the RAW all come along (nothing changed in the selection: checked on a real session, and now a test).
 
 ## v0.13.2
 

@@ -1,10 +1,10 @@
 # photo-backup — back up the photos you actually kept
 
-You shoot 400 frames, the RAWs land in one folder, and the 30 you keep are exported into an `_EXPORT` folder inside it. photo-backup reads that export folder and backs up **those 30 photos**: the exports, plus — picked out of the 400 — their RAW, camera JPEG, edited TIFF and sidecars, plus your Capture One and NX Studio edits. The rest stays behind, or comes along folder by folder if you choose. Read-only on the source, never deletes on the destination, and verifies the backup on any later day with SHA-256. Tested on a 9 TB archive of Capture One, Lightroom and NX Studio sessions from 1991 to 2026.
+You shoot 400 frames, the RAWs land in one folder, and the 30 you keep are exported into an `_EXPORT` folder inside it. photo-backup reads that export folder and backs up **those 30 photos**: the exports, plus — picked out of the 400 — their RAW, camera JPEG, edited TIFF and sidecars, plus your Capture One and NX Studio edits. The rest stays behind, or comes along folder by folder if you choose. Read-only on the source, never deletes on the destination (unless you choose the mirror, which goes through a trash), and verifies the backup on any later day with SHA-256. Tested on a 9 TB archive of Capture One, Lightroom and NX Studio sessions from 1991 to 2026.
 
 A backup from the menu also keeps **Capture One itself**: the ICC profiles, film curves and styles your `.cos` edits only name, with your presets, recipes, shortcuts and workspaces. A double-click restore (no Python needed) puts them back on a new computer, so your photos open with the same look. [Details](docs/captureone.md).
 
-**Current version: v0.13.2** (2026-11-12) · [What's new](#whats-new-in-v0132) · [All releases](docs/version_history.md)
+**Current version: v0.13.2** (2026-11-12) · [What's new](#whats-new-in-v0132) · [All releases](docs/version_history.md) · Test version: [v0.14.0-rc1](https://github.com/rsilvabr/photo-backup/releases/tag/v0.14.0-rc1), the mirror ([what's new](docs/whats_new.md#v0140-rc1-test-version-not-released-yet))
 
 **Windows program, no Python needed:** [photo-backup-exe](https://github.com/rsilvabr/photo-backup-exe/releases/latest) — unzip and double-click.
 
@@ -31,6 +31,17 @@ G:\2025\250129_Flores\                        a session: it holds an export fold
 │   └── Cache\                                ✗  previews; Capture One rebuilds them
 ├── NKSC_PARAM\                               ✓  the NX Studio edits
 └── _OUTTAKES\                                ✗  the rejects (a per-folder mode can add them)
+```
+
+A photo developed in another program first keeps the whole chain: the final photo, the intermediate file and the RAW, because each name starts with the RAW's. Whether you exported from the RAW, from the intermediate or from both makes no difference:
+
+```
+DSC_9362.NEF                                            ✓  the RAW
+DSC_9362_NXstudio.tif                                   ✓  the TIFF NX Studio developed from it
+_EXPORT\DSC_9362_NXstudio_ProPhoto-g22_v1.jxl           ✓  the final photo, edited from the TIFF
+DSC_9363.NEF                                            ✓  the RAW
+DSC_9363-DxO_DeepPRIME XD3.dng                          ✓  the DNG DxO denoised from it, with its .xmp
+_EXPORT\DSC_9363-DxO_DeepPRIME XD3_ProPhoto-g22_v1.jxl  ✓  the final photo, edited from the DNG
 ```
 
 Each export is matched to the real file names beside the export folder, never by cutting a name at the first underscore: Nikon's `DSC_` and `_DSC`, Canon's `IMG_`, film scans and phone names all work. Sessions are found at any depth. A folder without an export is not copied but listed (`_unexported.csv`), and comes along whole with `--unexported copy` or a `+` mode. The tree is mirrored on the destination (`G:\2025\250129_Flores\DSC_9360.NEF` → `H:\BACKUP\2025\250129_Flores\DSC_9360.NEF`), and later runs add to it.

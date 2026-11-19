@@ -74,6 +74,39 @@ def test_key_shortest_anchor_wins(tmp_path):
     assert "G/2025/shoot/DSC0001_Nxstudio_v1.tiff" in files
 
 
+def test_an_export_of_an_intermediate_keeps_the_whole_chain(tmp_path):
+    """v0.14.0-rc1: a TIFF developed in NX Studio and a DNG denoised by DxO,
+    each beside its RAW and named after it. An export made only from the
+    intermediate brings the final photo, the intermediate (with its sidecar)
+    and the RAW; a photo exported from nothing stays out."""
+    make_tree(tmp_path, {
+        "G/2025/shoot/DSC_9362.NEF": 10,
+        "G/2025/shoot/DSC_9362_NXstudio.tif": 11,
+        "G/2025/shoot/DSC_9363.NEF": 12,
+        "G/2025/shoot/DSC_9363.JPG": 13,
+        "G/2025/shoot/DSC_9363-DxO_DeepPRIME XD3.dng": 14,
+        "G/2025/shoot/DSC_9363-DxO_DeepPRIME XD3.xmp": 15,
+        "G/2025/shoot/DSC_9364.NEF": 16,
+        "G/2025/shoot/DSC_9364-DxO_DeepPRIME XD3.dng": 17,
+        "G/2025/shoot/_EXPORT/16B_JXL/DSC_9362_NXstudio_ProPhoto-g22_v1.jxl": 20,
+        "G/2025/shoot/_EXPORT/16B_JXL/DSC_9363-DxO_DeepPRIME XD3_ProPhoto-g22_v1.jxl": 21,
+        "G/2025/shoot/_EXPORT/TIFF16/DSC_9363-DxO_DeepPRIME XD3_ProPhoto-g22_v1.tif": 22,
+    })
+    planned = selective_backup.plan(parse_args(tmp_path / "G" / "2025" / "shoot",
+                                               tmp_path / "out", tmp_path))
+    rels = planned_rels(planned)
+    shoot = "G/2025/shoot/"
+    for name in ("DSC_9362.NEF", "DSC_9362_NXstudio.tif", "DSC_9363.NEF", "DSC_9363.JPG",
+                 "DSC_9363-DxO_DeepPRIME XD3.dng", "DSC_9363-DxO_DeepPRIME XD3.xmp"):
+        assert rels.get(shoot + name) == selective_backup.CAT_SOURCE, name
+    for name in ("16B_JXL/DSC_9362_NXstudio_ProPhoto-g22_v1.jxl",
+                 "16B_JXL/DSC_9363-DxO_DeepPRIME XD3_ProPhoto-g22_v1.jxl"):
+        assert rels.get(shoot + "_EXPORT/" + name) == selective_backup.CAT_EXPORT, name
+    assert shoot + "_EXPORT/TIFF16/DSC_9363-DxO_DeepPRIME XD3_ProPhoto-g22_v1.tif" not in rels
+    assert shoot + "DSC_9364.NEF" not in rels
+    assert shoot + "DSC_9364-DxO_DeepPRIME XD3.dng" not in rels
+
+
 def test_formats_fallback_per_photo(tmp_path):
     build_base_tree(tmp_path)
     dest = tmp_path / "out"
