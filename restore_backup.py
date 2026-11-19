@@ -11,9 +11,12 @@ moved or deleted (the catalog is opened read-only). A target file that
 already exists is NEVER overwritten: it is reported as ALREADY_THERE or
 CONFLICT and left alone.
 
-A TIFF the backup keeps as JXL (photo.tif.jxl, v0.14.0-rc2) comes back as
-photo.tif through jxl-photo (--jxlphoto / JXLPHOTO, else the newest copy kept
-in the backup's tools folder); --keep-jxl restores the JXL as it is.
+A TIFF or a JPEG the backup keeps as JXL (photo.tif.jxl, photo.jpg.jxl;
+v0.14.0-rc2/rc3) comes back in its own format through jxl-photo (--jxlphoto /
+JXLPHOTO, else the newest copy kept in the backup's tools folder): a JPEG byte
+for byte, a TIFF with its pixels (lossless) or close to them (lossy).
+--convert-back lossless brings back only what is lossless and keeps the rest as
+JXL; --convert-back none (or --keep-jxl) keeps every one as JXL.
 
     python restore_backup.py --backup H:\\BACKUP --to D:\\Restored
     python restore_backup.py --backup H:\\BACKUP --to-original
@@ -21,6 +24,7 @@ in the backup's tools folder); --keep-jxl restores the JXL as it is.
 """
 
 import argparse
+import collections
 import math
 import os
 import re
@@ -33,25 +37,28 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc2"
+__version__ = "0.14.0-rc3"
 
 # ---- Settings -------------------------------------------------------------------
 SPACE_MARGIN_GB = 5.0     # free space kept on each restore target drive (default --space-margin-gb)
 
-GOOD = ("RESTORED", "RESTORED_UNVERIFIED", "RESTORED_FROM_JXL", "ALREADY_THERE")
+GOOD = ("RESTORED", "RESTORED_UNVERIFIED", "RESTORED_FROM_JXL", "RESTORED_AS_JXL",
+        "ALREADY_THERE")
+CONVERT_BACK = ("all", "lossless", "none")
 
 
-class _TiffGroup:
-    """A TIFF the backup keeps as JXL: the JXL files of one TIFF (one per page
-    of a multipage TIFF), restored as one TIFF under the TIFF's own name."""
+class _JxlGroup:
+    """A TIFF or a JPEG the backup keeps as JXL: its JXL files (one per page
+    of a multipage TIFF), restored as one file under its own name."""
 
     def __init__(self, converted, source_path):
         self.conv = converted               # the first page's sb._Converted
-        self.rel = converted.source_rel     # the TIFF's place in the backup's tree
-        self.size = converted.source_size   # the TIFF's size when it was converted
+        self.rel = converted.source_rel     # the TIFF's / JPEG's place in the backup's tree
+        self.size = converted.source_size   # its size when it was converted
         self.source_path = source_path
         self.members = []                   # [(sb._Row, sb._Converted)], by page
         self.sha256 = converted.source_sha256
+        self.kind = converted.kind or sb._convert_kind(converted.source_rel)
 
     def whole(self):
         pages = sorted(conv.page for _row, conv in self.members)
@@ -60,6 +67,11 @@ class _TiffGroup:
 
     def jxl_size(self):
         return sum(row.size for row, _conv in self.members)
+
+    def lossless(self):
+        """1 when the original comes back exactly (a JPEG's bytes, a lossless
+        TIFF's pixels), 0 when lossy, None when the catalog does not know."""
+        return 1 if self.kind == "jpeg" else self.conv.lossless
 
 
 def _drive_root(path):
@@ -86,7 +98,7 @@ def _under_any(rel, patterns):
 
 
 def _target_for(row, args, kept_jxl=False):
-    """Where a catalog row (or a _TiffGroup) is restored. A JXL restored as it
+    """Where a catalog row (or a _JxlGroup) is restored. A JXL restored as it
     is (--keep-jxl) goes back beside its TIFF's place, under its own name."""
     if args.to_original:
         if kept_jxl:
@@ -116,16 +128,22 @@ def _find_jxlphoto(given, backup):
                         found.append((numbers, name == "jxl_photo.py", candidate))
     except OSError:
         pass
-    if found:
-        return max(found)[2], "kept in the backup"
-    return None, sb._jxlphoto_problem(given) or "jxl-photo not found"
+    why = sb._jxlphoto_problem(given) or "jxl-photo not found"
+    for _numbers, _is_py, candidate in sorted(found, reverse=True):
+        problem = sb._jxlphoto_problem(candidate)   # the contract holds for it too (JP-1)
+        if problem is None:
+            return candidate, "kept in the backup"
+        why = f"{why}; the one kept in the backup: {problem}"
+    return None, why
 
 
 def _resolve_group_exists(group, target):
-    """A TIFF kept as JXL whose target already has a file: never overwrite."""
+    """A file kept as JXL whose target already has a file: never overwrite."""
     stat = os.stat(sb._io(target), follow_symlinks=False)
     if stat.st_size == group.size and sb._sha256_file(target) == group.sha256:
-        return ("ALREADY_THERE", "the original TIFF")
+        return ("ALREADY_THERE", f"the original {group.kind.upper()}")
+    if group.kind == "jpeg":
+        return ("CONFLICT", "target exists with different content")
     return ("CONFLICT", "target exists and is not the original TIFF (a TIFF made from its JXL "
                         "earlier is never the same bytes either); left as it was")
 
@@ -162,32 +180,42 @@ def _restore_group(group, backup, target, jxlphoto, work):
                 if "content differs from the catalog" in str(exc):
                     return "CORRUPT_IN_BACKUP", f"{row.rel}: {exc}"
                 raise
-        try:
-            # the pages the TIFF had, each with its own bit depth, and no
+        jpeg = group.kind == "jpeg"
+        if jpeg:            # the JPEG rebuilt from its JXL (JP-16)
+            arguments = sb._jxlphoto_rebuild_args(
+                os.path.join(work_in, os.listdir(sb._io(work_in))[0]), work_out)
+            wanted, item = (".jpg", ".jpeg"), "JP-16"
+        else:               # the pages the TIFF had, each with its own bit depth, and no
             # preview page of jxl-photo's own (the original had none of it)
-            run = sb._run_jxlphoto(jxlphoto, ["decode", work_in, work_out, "--mode", "0",
-                                              "--workers", "1",
-                                              "--depth-policy", "preserve_original",
-                                              "--no-preview"],
-                                   max(sb.TIFF_JXL_TIMEOUT_MIN, 1) * 60)
+            arguments = sb._jxlphoto_decode_args(work_in, work_out)
+            wanted, item = (".tif", ".tiff"), "JP-10"
+        try:
+            run = sb._run_jxlphoto(jxlphoto, arguments, max(sb.JXL_TIMEOUT_MIN, 1) * 60)
         except subprocess.TimeoutExpired:
-            return "ERROR", f"jxl-photo took more than {sb.TIFF_JXL_TIMEOUT_MIN} min"
+            return "ERROR", f"jxl-photo took more than {sb.JXL_TIMEOUT_MIN} min"
         said = sb._tail((run.stdout or "") + "\n" + (run.stderr or ""))
         if run.returncode != 0:
-            return "ERROR", f"jxl-photo stopped with exit {run.returncode}: {said}"
+            return "ERROR", f"jxl-photo stopped with exit {run.returncode} ({item}): {said}"
         with os.scandir(sb._io(work_out)) as listing:
             made = [entry.name for entry in listing if entry.is_file(follow_symlinks=False)
-                    and entry.name.casefold().endswith((".tif", ".tiff"))]
+                    and entry.name.casefold().endswith(wanted)]
         if len(made) != 1:
-            return "ERROR", f"jxl-photo made {len(made)} TIFF instead of 1: {said}"
-        tiff = os.path.join(work_out, made[0])
+            return ("ERROR", f"jxl-photo made {len(made)} {group.kind.upper()} instead of 1 "
+                             f"({item}): {said}")
+        result = os.path.join(work_out, made[0])
+        if jpeg and sb._sha256_file(result) != group.sha256:
+            return "ERROR", ("the JPEG rebuilt from its JXL is not the original's bytes (JP-16); "
+                             "nothing was written at the target")
         mtime_ns = group.conv.source_mtime_ns
-        os.utime(sb._io(tiff), ns=(mtime_ns, mtime_ns))     # the original's date
-        sb._flush_temp(tiff)
+        os.utime(sb._io(result), ns=(mtime_ns, mtime_ns))   # the original's date
+        sb._flush_temp(result)
         try:
-            sb._rename_no_clobber(tiff, target)
+            sb._rename_no_clobber(result, target)
         except FileExistsError:
             return "CONFLICT", "the target appeared during the restore; left as it was"
+        if jpeg:
+            return ("RESTORED", f"rebuilt from its JXL by {group.conv.tool or 'jxl-photo'}: the "
+                                f"original JPEG's bytes (SHA-256 checked)")
         return ("RESTORED_FROM_JXL",
                 f"made from {len(group.members)} JXL by {group.conv.tool or 'jxl-photo'} "
                 f"({group.conv.settings}); not the original TIFF's bytes")
@@ -223,13 +251,16 @@ def _build_parser():
                         help="abort unless the backup holds this backup ID")
     parser.add_argument("--space-margin-gb", type=float, default=SPACE_MARGIN_GB, metavar="N",
                         help="free space kept on the target drive (default: %(default)s)")
+    parser.add_argument("--convert-back", choices=CONVERT_BACK, default="all",
+                        help="the TIFFs and JPEGs the backup keeps as JXL: all back to their "
+                             "format (default), only the lossless ones (every JPEG, a lossless "
+                             "TIFF; the rest stays JXL), or none (every one as JXL)")
     parser.add_argument("--keep-jxl", action="store_true",
-                        help="a TIFF the backup keeps as JXL: restore the JXL as it is "
-                             "(photo.tif.jxl) instead of a TIFF made by jxl-photo")
+                        help="the same as --convert-back none")
     parser.add_argument("--jxlphoto", default=sb.JXLPHOTO, metavar="PATH",
-                        help="jxl-photo's jxl_photo.py or jxl-photo.exe, to turn a TIFF kept as "
-                             "JXL back into a TIFF (default: JXLPHOTO; else the newest one kept "
-                             "in the backup)")
+                        help="jxl-photo's jxl_photo.py or jxl-photo.exe, to turn a file kept as "
+                             "JXL back into its TIFF or JPEG (default: JXLPHOTO; else the newest "
+                             "one kept in the backup)")
     parser.add_argument("--dry-run", action="store_true",
                         help="plan and report, restore nothing")
     parser.add_argument("--yes", action="store_true",
@@ -315,23 +346,32 @@ def _main(argv):
             real_folders[key] = sb._real(folder)
         return sb._is_under(real_folders[key], backup_real)
 
-    # a TIFF kept as JXL is one entry (its JXL files are one TIFF), unless
-    # --keep-jxl restores the JXL as they are
+    # a TIFF or JPEG kept as JXL is one entry (its JXL files are one file);
+    # --convert-back says which ones go back to their format: all, only the
+    # lossless ones (the others stay JXL), or none
+    convert_back = "none" if args.keep_jxl else args.convert_back
     entries = []
     groups = {}
     for row in rows:
         conv = converted.get(row.key)
-        if conv is None or args.keep_jxl:
+        if conv is None or convert_back == "none":
             entries.append(row)
             continue
         group = groups.get(conv.source_key)
         if group is None:
-            group = groups[conv.source_key] = _TiffGroup(conv, row.source_path)
+            group = groups[conv.source_key] = _JxlGroup(conv, row.source_path)
             entries.append(group)
         group.members.append((row, conv))
     for group in groups.values():
         group.members.sort(key=lambda member: member[1].page)
         group.conv = group.members[0][1]
+    if convert_back == "lossless":      # a lossy (or unknown) TIFF stays JXL
+        kept_as_jxl = {key for key, group in groups.items() if group.lossless() != 1}
+        entries = [item for entry in entries for item in
+                   ([member for member, _conv in entry.members]
+                    if isinstance(entry, _JxlGroup) and entry.conv.source_key in kept_as_jxl
+                    else [entry])]
+        groups = {key: group for key, group in groups.items() if key not in kept_as_jxl}
     jxlphoto = jxlphoto_where = None
     if groups:
         jxlphoto, jxlphoto_where = _find_jxlphoto(args.jxlphoto, backup)
@@ -339,8 +379,10 @@ def _main(argv):
     matched = set()
     items = []
     for row in entries:
-        is_group = isinstance(row, _TiffGroup)
+        is_group = isinstance(row, _JxlGroup)
         names = [row.rel] + ([member.rel for member, _conv in row.members] if is_group else [])
+        if not is_group and row.key in converted:   # a JXL kept as it is: its TIFF's/JPEG's name too
+            names.append(converted[row.key].source_rel)
         if patterns is not None:
             hits = [pattern for pattern in patterns
                     if any(_under_any(name, [pattern]) for name in names)]
@@ -368,7 +410,7 @@ def _main(argv):
     for _status, row, _src, target in restores:
         root = _drive_root(target)
         # a TIFF made from its JXL needs its own size plus the JXL copied beside it
-        need = row.size + (row.jxl_size() if isinstance(row, _TiffGroup) else 0)
+        need = row.size + (row.jxl_size() if isinstance(row, _JxlGroup) else 0)
         by_drive[root] = by_drive.get(root, 0) + need
     margin = int(float(args.space_margin_gb) * 1e9)
     space_ok = True
@@ -400,15 +442,24 @@ def _main(argv):
         f"Catalog:   {sb._num(len(rows))} files; selected {sb._num(len(items))}",
         f"Plan:      {plan_text if plan_text else '(nothing to restore)'}",
     ] + space_lines
-    from_jxl = [item for item in items if isinstance(item[1], _TiffGroup)]
+    from_jxl = [item[1] for item in items if isinstance(item[1], _JxlGroup)]
     if from_jxl:
-        lines.append(f"TIFF kept as JXL: {sb._num(len(from_jxl))} (restored as TIFF "
-                     + (f"by {sb._jxlphoto_version(jxlphoto)}, {jxlphoto_where}: {jxlphoto})"
-                        if jxlphoto else "-- jxl-photo is needed)"))
+        kinds = collections.Counter(group.kind.upper() for group in from_jxl)
+        lines.append(f"Kept as JXL, back to their format ({convert_back}): "
+                     f"{', '.join(f'{sb._num(count)} {kind}' for kind, count in sorted(kinds.items()))}"
+                     + (f" -- by {sb._jxlphoto_version(jxlphoto)}, {jxlphoto_where}: {jxlphoto}"
+                        if jxlphoto else " -- jxl-photo is needed"))
+    as_jxl = [row for _status, row, _src, _target in items
+              if not isinstance(row, _JxlGroup) and row.key in converted]
+    if as_jxl:
+        sources = {converted[row.key].source_key for row in as_jxl}
+        lines.append(f"Kept as JXL, restored as JXL ({convert_back}): {sb._num(len(sources))} TIFF "
+                     f"or JPEG ({sb._num(len(as_jxl))} JXL files; --convert-back all gives their "
+                     f"TIFF or JPEG)")
     if counts.get("NEEDS_JXLPHOTO"):
-        lines.append(f"NEEDS_JXLPHOTO: {sb._num(counts['NEEDS_JXLPHOTO'])} TIFF kept as JXL "
-                     f"cannot be made without jxl-photo ({jxlphoto_where}). Set JXLPHOTO or "
-                     f"--jxlphoto, or restore the JXL as they are with --keep-jxl.")
+        lines.append(f"NEEDS_JXLPHOTO: {sb._num(counts['NEEDS_JXLPHOTO'])} TIFF or JPEG kept as "
+                     f"JXL cannot be made without jxl-photo ({jxlphoto_where}). Set JXLPHOTO or "
+                     f"--jxlphoto, or restore them as JXL with --convert-back none.")
     # B21: an --only that matches nothing is named, and the run ends with exit 1
     unmatched = [pattern for pattern in (patterns or []) if pattern not in matched]
     for pattern in unmatched:
@@ -477,7 +528,7 @@ def _main(argv):
                     bad = True
                     log.log(f"REFUSED {row.rel}: the target is inside the backup")
                     continue
-                is_group = isinstance(row, _TiffGroup)
+                is_group = isinstance(row, _JxlGroup)
                 if status == "NEEDS_JXLPHOTO":
                     result_rows.append((status, row.rel, target,
                                         f"kept as JXL; jxl-photo not found ({jxlphoto_where})"))
@@ -506,7 +557,7 @@ def _main(argv):
                         status, detail = _restore_group(row, backup, target, jxlphoto, work)
                     except Exception as exc:
                         status, detail = "ERROR", str(exc)
-                    if status == "RESTORED_FROM_JXL":
+                    if status in ("RESTORED_FROM_JXL", "RESTORED"):
                         done_bytes += row.size
                     else:
                         bad = True
@@ -533,6 +584,10 @@ def _main(argv):
                     done_bytes += row.size
                     status = "RESTORED" if row.sha256 else "RESTORED_UNVERIFIED"
                     detail = ""
+                    if row.key in converted:        # a JXL kept as it is (--convert-back)
+                        status = "RESTORED_AS_JXL"
+                        detail = (f"the JXL of {converted[row.key].source_rel}, as it is in the "
+                                  f"backup ({convert_back})")
                 except FileExistsError:
                     status = "CONFLICT"
                     detail = "the target appeared during the restore; left as it was"

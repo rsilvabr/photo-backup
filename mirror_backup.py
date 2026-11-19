@@ -53,7 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 import manifest_backup as mb
 
-__version__ = "0.14.0-rc2"
+__version__ = "0.14.0-rc3"
 
 # ---- Settings -------------------------------------------------------------------
 MIRROR_KEEP_DAYS = 30               # days a file the mirror removed or replaced stays in the trash
@@ -908,7 +908,7 @@ class MirrorJob:
                                            listings.get(os.path.dirname(status.dst)))
                 item = _Item("retire", "replaced_by_jxl", None, status.replaces,
                              found[0] if found else 0, status.planned.src,
-                             "a TIFF copy that its JXL replaces", row=row)
+                             "a TIFF or JPEG copy that its JXL replaces", row=row)
                 self.items.append(item)
                 self.retire_items[status.replaces.casefold()] = item
                 if row is None:
@@ -989,6 +989,8 @@ class MirrorJob:
         changed = [s for s in statuses if s.status == sb.ST_CHANGED and not s.planned.convert]
         converts = [s for s in statuses if s.planned.convert
                     and s.status in (sb.ST_NEW, sb.ST_CHANGED)]
+        jpegs = [s for s in converts if s.planned.convert == sb.JPEG_CONVERT]
+        tiffs = [s for s in converts if s.planned.convert != sb.JPEG_CONVERT]
         removes = self._items("remove")
         removed_bytes = sum(item.size for item in removes)
         mode = "total" if self.total else "scoped"
@@ -1018,13 +1020,16 @@ class MirrorJob:
             if others:
                 lines.append(_table_line("old copy to versions\\ (not written by the backup)",
                                          len(others), sum(item.size for item in others), indent=4))
-        if converts:
-            lines.append(_table_line("convert TIFF to JXL (the TIFF's size)", len(converts),
-                                     sum(s.planned.size for s in converts)))
+        if tiffs:
+            lines.append(_table_line("convert TIFF to JXL (the TIFF's size)", len(tiffs),
+                                     sum(s.planned.size for s in tiffs)))
+        if jpegs:
+            lines.append(_table_line("convert JPEG to JXL (lossless)", len(jpegs),
+                                     sum(s.planned.size for s in jpegs)))
         retires = self._items("retire")
         if retires:
             where = "deleted (no trash)" if self.for_good else "to the trash"
-            lines.append(_table_line(f"TIFF copy replaced by its JXL ({where})", len(retires),
+            lines.append(_table_line(f"old copy replaced by its JXL ({where})", len(retires),
                                      sum(item.size for item in retires), indent=4))
         where = "delete for good" if self.for_good else "to the trash"
         lines.append(_table_line(f"remove from the backup ({where})", len(removes), removed_bytes))
@@ -1270,7 +1275,7 @@ class MirrorJob:
 
     def proceed_prompt(self):
         verb = "delete for good" if self.for_good else "remove"
-        convert = (f", convert {_n(self.numbers['convert'])} TIFF to JXL"
+        convert = (f", convert {_n(self.numbers['convert'])} to JXL"
                    if self.numbers.get("convert") else "")
         return (f"Mirror now? copy {_n(self.numbers['new'])}, replace "
                 f"{_n(self.numbers['changed'])}{convert}, {verb} "
@@ -1505,7 +1510,9 @@ class MirrorJob:
                                      len(not_now), sum(item.size for item in not_now)))
         info = self.convert_info or {}
         if info.get("converted") or info.get("failed") or info.get("retired"):
-            lines.append(_table_line("TIFF converted to JXL (the TIFF's size)",
+            kinds = ", ".join(f"{info[kind]} {kind.upper()}" for kind in ("tiff", "jpeg")
+                              if info.get(kind))
+            lines.append(_table_line(f"converted to JXL ({kinds or 'their own size'})",
                                      info.get("converted", 0), info.get("bytes_in", 0)))
             lines.append(_table_line("the JXL written", info.get("converted", 0),
                                      info.get("bytes_out", 0), indent=4))

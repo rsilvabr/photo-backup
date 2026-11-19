@@ -4,17 +4,25 @@ command line photo-backup calls, and files shaped where photo-backup looks.
     fake_jxlphoto.py encode --version
     fake_jxlphoto.py encode <tiff> <folder> --mode 0 --distance D ... --verify-roundtrip
     fake_jxlphoto.py decode <folder> <folder> --mode 0 ...
+    fake_jxlphoto.py transcode <jpeg> <folder> --mode 0 ... --force-transcode
+    fake_jxlphoto.py transcode <jxl> <folder> --mode 0 ... --format jpeg
 
 encode writes <stem>.jxl: the JXL container signature, an XMP box with the
-jxlphoto-src and jxlphoto-srcsum tokens (the real srcsum of the TIFF's bytes),
-then the TIFF's bytes in a jxlc box. A TIFF whose bytes hold PAGES=<n> becomes
-n files (<stem>.jxl, <stem>_page1.jxl, ...) with jxlphoto-pages, jxlphoto-page
-and jxlphoto-mpg, each holding a slice of the bytes. decode puts the slices
-back together as <stem>.tif. The environment (set by the tests):
-    FAKE_JXLPHOTO_FAIL   exit | none | srcsum | short | changed : how encode fails
-    FAKE_JXLPHOTO_ONLY   fail only for a TIFF whose name holds this text
-    FAKE_JXLPHOTO_DECODE_FAIL   any value: decode stops with exit 1
+jxlphoto-src and jxlphoto-srcsum tokens (the real srcsum of the TIFF's bytes)
+and the class marks (jxlphoto-origin, jxlphoto-scan for a TIFF whose bytes say
+SCAN), then the TIFF's bytes in a jxlc box. A TIFF whose bytes hold PAGES=<n>
+becomes n files (<stem>.jxl, <stem>_page1.jxl, ...) with jxlphoto-pages,
+jxlphoto-page and jxlphoto-mpg, each holding a slice of the bytes. decode puts
+the slices back together as <stem>.tif. transcode keeps a JPEG's bytes in a
+JXL without marks, and gives them back with --format jpeg. The environment
+(set by the tests):
+    FAKE_JXLPHOTO_FAIL   exit | none | srcsum | short | changed (encode),
+                         exit | none | mismatch (transcode): how it fails
+    FAKE_JXLPHOTO_ONLY   fail only for a file whose name holds this text
+    FAKE_JXLPHOTO_DECODE_FAIL   any value: decode (and the JPEG rebuild) stop with exit 1
+    FAKE_JXLPHOTO_REBUILD_WRONG  any value: a rebuilt JPEG is not the original's bytes
     FAKE_JXLPHOTO_CALLS  a folder: each call writes its arguments there (one JSON file)
+    FAKE_JXLPHOTO_VERSION  what `encode --version` says (default 9.9.9; "none": no number)
 """
 import hashlib
 import json
@@ -24,7 +32,7 @@ import struct
 import sys
 import time
 
-VERSION = "9.9.9"
+VERSION = os.environ.get("FAKE_JXLPHOTO_VERSION", "9.9.9")    # "none": no version said
 SIGNATURE = b"\x00\x00\x00\x0cJXL \r\n\x87\n"
 
 
@@ -69,7 +77,12 @@ def encode(tiff, folder):
     for page in range(written):
         name = stem if page == 0 else f"{stem}_page{page}"
         tokens = [f"jxlphoto-src:{os.path.basename(tiff).replace(' ', '_')}",
-                  f"jxlphoto-srcsum:{srcsum}", "jxlphoto-depth:16"]
+                  f"jxlphoto-srcsum:{srcsum}", "jxlphoto-depth:16",
+                  # the class marks (JP-17): a TIFF whose bytes say SCAN is a film
+                  # scan, 8BIT an 8-bit TIFF
+                  f"jxlphoto-origin:{'tiff8' if b'8BIT' in data else 'tiff16'}"]
+        if b"SCAN" in data:
+            tokens.append("jxlphoto-scan:raw")
         if pages > 1:
             tokens += [f"jxlphoto-pages:{pages}", f"jxlphoto-page:{page}",
                        f"jxlphoto-mpg:{srcsum}"]
@@ -110,6 +123,44 @@ def decode(folder, out):
     return 0
 
 
+def transcode(source, folder, argv):
+    """A JPEG -> <stem>.jxl (its bytes in a jxlc box, no XMP: as the real one
+    keeps a JPEG rebuildable) + checksums.md5; with --format jpeg, a JXL ->
+    <stem>.jpg rebuilt from those bytes. FAKE_JXLPHOTO_FAIL: exit, none, or
+    mismatch (a JXL whose JPEG comes back different)."""
+    stem = os.path.splitext(os.path.basename(source))[0]
+    if "--format" in argv:
+        if os.environ.get("FAKE_JXLPHOTO_DECODE_FAIL"):
+            print("ERROR: the fake decoder was told to fail", file=sys.stderr)
+            return 1
+        payload = b""
+        for kind, content in boxes(open(source, "rb").read()):
+            if kind == b"jxlc":
+                payload = content
+        if os.environ.get("FAKE_JXLPHOTO_REBUILD_WRONG"):
+            payload += b"!"                 # a rebuild that is not the original's bytes
+        with open(os.path.join(folder, stem + ".jpg"), "wb") as handle:
+            handle.write(payload)
+        return 0
+    data = open(source, "rb").read()
+    fail = os.environ.get("FAKE_JXLPHOTO_FAIL", "")
+    only = os.environ.get("FAKE_JXLPHOTO_ONLY", "")
+    if only and only not in os.path.basename(source):
+        fail = ""
+    if fail == "exit":
+        print("ERROR: EncodeImageJXL() failed (the fake was told to)", file=sys.stderr)
+        return 1
+    if fail == "none":
+        return 0
+    payload = data + (b"x" if fail == "mismatch" else b"")
+    with open(os.path.join(folder, stem + ".jxl"), "wb") as handle:
+        handle.write(SIGNATURE + box(b"ftyp", b"jxl \x00\x00\x00\x00jxl ")
+                     + box(b"jbrd", b"reconstruction") + box(b"jxlc", payload))
+    with open(os.path.join(folder, "checksums.md5"), "w", encoding="utf-8") as handle:
+        handle.write(f"{hashlib.md5(data).hexdigest()}  {stem}.jxl\n")
+    return 0
+
+
 def main(argv):
     calls = os.environ.get("FAKE_JXLPHOTO_CALLS")
     if calls:                           # a folder: one file per call (calls run at once)
@@ -118,12 +169,14 @@ def main(argv):
         with open(os.path.join(calls, name), "w", encoding="utf-8") as handle:
             json.dump(argv, handle)
     if len(argv) >= 2 and argv[1] == "--version":
-        print(f"jxl-photo {VERSION}")
+        print("jxl-photo" if VERSION == "none" else f"jxl-photo {VERSION}")
         return 0
     if argv[0] == "encode":
         return encode(argv[1], argv[2])
     if argv[0] == "decode":
         return decode(argv[1], argv[2])
+    if argv[0] == "transcode":
+        return transcode(argv[1], argv[2], argv)
     print(f"unknown command {argv}", file=sys.stderr)
     return 2
 

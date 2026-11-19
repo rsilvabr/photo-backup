@@ -239,7 +239,7 @@ mirror of its manifest with `--unattended` ([menu.md](menu.md#unattended-runs-ta
 
 | Option | Description |
 |---|---|
-| `--manifest PATH` | the manifest (`Folder,Mode,Originals,Mirror,Tiff`; `Tiff` keeps that line's TIFFs as JXL, [tiff_to_jxl.md](tiff_to_jxl.md)) |
+| `--manifest PATH` | the manifest (`Folder,Mode,Originals,Mirror,Tiff,Jpeg`; `Tiff` and `Jpeg` keep that line's TIFFs and JPEGs as JXL, [tiff_to_jxl.md](tiff_to_jxl.md)) |
 | `--source PATH` | without a manifest: a folder to mirror (repeatable). Every selection option of `selective_backup.py` works too (`--unselected`, `--unexported`, `--c1-cache`, `--exclude-folders`, ...) |
 | `--dest PATH` | the backup; required |
 | `--modes PATH` | the modes table (default `backup_modes.csv` beside the scripts) |
@@ -247,7 +247,7 @@ mirror of its manifest with `--unattended` ([menu.md](menu.md#unattended-runs-ta
 | `--mirror {disk,selection}` | with `--source`: what "gone" means for the whole run (default `disk`) |
 | `--total` | also remove what came from folders that are not in this run (typed confirmation) |
 | `--allow-mass-delete` | let a line remove or replace more than `MIRROR_MAX_DELETE_PERCENT` of its files without typing the number |
-| `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, for the lines whose `Tiff` column names a profile (default `JXLPHOTO`) *(v0.14.0-rc2)* |
+| `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, for the lines that keep TIFF or JPEG as JXL (default `JXLPHOTO`) *(v0.14.0-rc2)* |
 | `--unattended` | nobody at the console: never ask; what needs a typed number stops the run (implies `--yes`) |
 | `--show-trash` | list what is in the trash of `--dest` and how to get it back; changes nothing |
 | `--empty-trash` | delete the trash of `--dest` for good, after the typed number of files |

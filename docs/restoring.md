@@ -17,8 +17,9 @@ restore_backup.py --backup PATH (--to PATH | --to-original) [options]
 | `--only REL` | restore only this folder or file (repeatable, case-insensitive); default: everything. An `--only` that matches nothing in the catalog is named (`--only REL: matches nothing in the catalog`), the others are restored, and the run exits 1 *(v0.12.1)*. An empty `--only ""` is refused, exit 2 *(v0.13.2; it selected everything)* |
 | `--expect-backup-id ID` | abort unless the backup holds this backup ID |
 | `--space-margin-gb N` | free space kept on each target drive, in GB (default `5.0`) |
-| `--keep-jxl` | a TIFF the backup keeps as JXL: restore the JXL files as they are (`photo.tif.jxl`) instead of a TIFF made by jxl-photo *(v0.14.0-rc2)* |
-| `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, to turn a TIFF kept as JXL back into the TIFF (default `JXLPHOTO`; empty or not found: the newest one kept in the backup's `_photo_backup\tools`) *(v0.14.0-rc2)* |
+| `--convert-back all\|lossless\|none` | the TIFFs and JPEGs the backup keeps as JXL: `all` back to their own format (default; a JPEG byte for byte), `lossless` only the ones that come back exactly (every JPEG, a lossless TIFF; a lossy TIFF stays JXL), `none` every one as JXL *(v0.14.0-rc3; [the table](tiff_to_jxl.md#restoring))* |
+| `--keep-jxl` | the same as `--convert-back none` *(v0.14.0-rc2)* |
+| `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, to turn a file kept as JXL back into its TIFF or JPEG (default `JXLPHOTO`; empty or not found: the newest one kept in the backup's `_photo_backup\tools`) *(v0.14.0-rc2)* |
 | `--dry-run` | plan and report, restore nothing |
 | `--yes` | do not ask for confirmation |
 | `--version` | print the version and exit |
@@ -28,16 +29,21 @@ Exactly one of `--to` and `--to-original` is required. Outcomes per file, in
 the console, in the log and in `<log>_restore.csv`:
 
 - `RESTORED` — copied from the backup and verified against the catalog
-  SHA-256 (`RESTORED_UNVERIFIED` when the catalog had no hash yet);
+  SHA-256 (`RESTORED_UNVERIFIED` when the catalog had no hash yet); for a JPEG
+  the backup keeps as JXL *(v0.14.0-rc3)*: rebuilt by jxl-photo and checked
+  against the SHA-256 of the original JPEG — the same bytes;
 - `RESTORED_FROM_JXL` *(v0.14.0-rc2)* — a TIFF the backup keeps as JXL, made
   again by jxl-photo under its own name, with its pages and its date (each JXL
   checked against its catalog SHA-256 first). Lossless gives back the same
   pixels, not the same bytes ([tiff_to_jxl.md](tiff_to_jxl.md#restoring));
-- `NEEDS_JXLPHOTO` *(v0.14.0-rc2)* — such a TIFF, and no jxl-photo: neither
-  `--jxlphoto` / `JXLPHOTO` nor one kept in the backup. The others are
-  restored, the run exits 1; `--keep-jxl` gives the JXL files as they are;
+- `RESTORED_AS_JXL` *(v0.14.0-rc3)* — a file kept as JXL restored as the JXL
+  it is (`photo.tif.jxl`), as `--convert-back` chose;
+- `NEEDS_JXLPHOTO` *(v0.14.0-rc2)* — such a TIFF or JPEG, and no jxl-photo:
+  neither `--jxlphoto` / `JXLPHOTO` nor one kept in the backup. The others are
+  restored, the run exits 1; `--convert-back none` gives the JXL files as they
+  are;
 - `ALREADY_THERE` — the target exists with the same content (size and hash;
-  for a TIFF kept as JXL: the original TIFF's);
+  for a file kept as JXL: the original TIFF's or JPEG's);
 - `CONFLICT` — the target exists with different content; it is left alone and
   the run exits 1;
 - `CORRUPT_IN_BACKUP` — the backup copy does not match the catalog hash;

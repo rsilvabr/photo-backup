@@ -36,7 +36,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc2"
+__version__ = "0.14.0-rc3"
 
 # ---- Settings -------------------------------------------------------------------
 MODES_FILE = "backup_modes.csv"     # next to this script; --modes reads another
@@ -54,7 +54,8 @@ MODE_COLUMNS = ("Mode", "Unselected", "AddFolders", "AddWhole", "Exclude", "Whol
 MODE_OPTIONAL_COLUMNS = ("Unexported", "Only", "Skip",   # a table written before them keeps working
                          "LeaveOut")                     # (without LeaveOut: selective_backup.SESSION_LEAVE_OUT)
 MANIFEST_COLUMNS = ("Folder", "Mode", "Originals")
-MANIFEST_OPTIONAL_COLUMNS = ("Mirror", "Tiff")  # a manifest written before them keeps working
+MANIFEST_OPTIONAL_COLUMNS = ("Mirror", "Tiff", "Jpeg")  # a manifest written before them keeps working
+JPEG_VALUES = ("copy", "jxl")       # the Jpeg column: the JPEGs as they are, or kept as JXL (lossless)
 DEFAULT_MIRROR = "disk"             # a manifest line with an empty Mirror: mirror_backup.py removes only what
                                     # is gone from the folder (this script reads the column and ignores it)
 MIRROR_VALUES = ("disk", "selection")   # selection: mirror_backup.py also removes what the line no longer selects
@@ -87,6 +88,7 @@ class ManifestRow:
     originals: str
     mirror: str = DEFAULT_MIRROR    # read by mirror_backup.py only
     tiff: str = "copy"              # "copy", or a selective_backup.TIFF_JXL_PROFILES name
+    jpeg: str = "copy"              # "copy" or "jxl" (JPEG_VALUES)
 
 
 def _drive_key(path):
@@ -225,6 +227,10 @@ def read_manifest(path, modes):
                                 f"TIFF_JXL_PROFILES ({', '.join(sb.TIFF_JXL_PROFILES)}), "
                                 f"not {tiff!r}")
         tiff = "copy" if tiff.casefold() == "copy" else profiles[tiff.casefold()]
+        jpeg = str(row.get("Jpeg") or "").strip().casefold() or "copy"
+        if jpeg not in JPEG_VALUES:
+            raise ManifestError(f"{path} line {line}: Jpeg must be {' or '.join(JPEG_VALUES)}, "
+                                f"not {jpeg!r}")
         if not folder:
             raise ManifestError(f"{path} line {line}: empty Folder")
         if mode not in modes:
@@ -245,7 +251,7 @@ def read_manifest(path, modes):
             raise ManifestError(f"{path} line {line}: folder repeated: {folder}")
         seen.add(key)
         drives.add(_drive_key(folder))
-        rows.append(ManifestRow(folder, mode, originals, mirror, tiff))
+        rows.append(ManifestRow(folder, mode, originals, mirror, tiff, jpeg))
     if not rows:
         raise ManifestError(f"{path}: no manifest lines")
     if len(drives) > 1:
@@ -269,24 +275,32 @@ def _row_unselected(mode, originals):
     return ORIGINALS_VALUES[originals] if mode.unselected else "skip"
 
 
-def _row_rules(mode, originals, tiff="copy"):
+def _row_rules(mode, originals, tiff="copy", jpeg="copy"):
     return sb.FolderRules(add_filtered=mode.add_folders, add_whole=mode.add_whole,
                           exclude=mode.exclude, whole=mode.whole,
                           originals=ORIGINALS_VALUES[originals],
                           skip=mode.skip, only=mode.only, leave_out=mode.leave_out,
-                          tiff=tiff)
+                          tiff=tiff, jpeg=jpeg)
 
 
 def _tiff_rows_errors(rows, jxlphoto):
-    """Why the manifest's TIFFs kept as JXL cannot be made, or []."""
-    using = [row for row in rows if row.tiff != "copy"]
+    """Why the manifest's TIFFs or JPEGs kept as JXL cannot be made, or []."""
+    using = [row for row in rows if row.tiff != "copy" or row.jpeg != "copy"]
     if not using:
         return []
     errors = list(sb._tiff_profile_errors())
     problem = sb._jxlphoto_problem(jxlphoto)
     if problem:
-        errors.append(f"{len(using)} manifest line(s) keep TIFF as JXL (Tiff column): {problem}")
+        errors.append(f"{len(using)} manifest line(s) keep TIFF or JPEG as JXL (Tiff, Jpeg "
+                      f"columns): {problem}")
     return errors
+
+
+def _jxl_bytes(files, jpeg):
+    """The bytes of the planned TIFFs (jpeg=False) or JPEGs (jpeg=True) that a
+    line keeps as JXL, at their own size."""
+    return sum(item.size for item in files
+               if item.convert and (item.convert == sb.JPEG_CONVERT) == jpeg)
 
 
 def _skip_paths_for(folder, rows):
@@ -313,7 +327,7 @@ def _plan_row(row, rows, modes, args, list_cache, originals=None, mode=None, rol
     planner = sb._Planner(_row_args(args, row.folder, _row_unselected(mode, originals),
                                     mode.unexported),
                           list_cache, _skip_paths_for(row.folder, rows),
-                          _row_rules(mode, originals, row.tiff), role_cache)
+                          _row_rules(mode, originals, row.tiff, row.jpeg), role_cache)
     planner.build()
     return planner
 
@@ -426,7 +440,7 @@ def _run(parsed, rows, modes, stamp, argv):
         log.log("modes: " + os.path.abspath(parsed.modes))
         for row in rows:
             log.log(f"row {row.folder} mode {row.mode} originals {row.originals} "
-                    f"tiff {row.tiff}")
+                    f"tiff {row.tiff} jpeg {row.jpeg}")
         list_cache = {}
 
         def plan_fn(plan_args):
@@ -464,13 +478,13 @@ def _analysis_counts(row, rows, modes, args, list_cache, mode, errors, role_cach
             errors.extend(planner.errors)
             counts[originals] = (len(planner.files),
                                  sum(item.size for item in planner.files),
-                                 sum(item.size for item in planner.files if item.convert))
+                                 _jxl_bytes(planner.files, False), _jxl_bytes(planner.files, True))
         return counts
     planner = _plan_row(row, rows, modes, args, list_cache,
                         originals=ANALYSIS_ORIGINALS[0], mode=mode, role_cache=role_cache)
     errors.extend(planner.errors)
     count = (len(planner.files), sum(item.size for item in planner.files),
-             sum(item.size for item in planner.files if item.convert))
+             _jxl_bytes(planner.files, False), _jxl_bytes(planner.files, True))
     return {originals: count for originals in ANALYSIS_ORIGINALS}
 
 
@@ -514,18 +528,20 @@ def _analyze_rows(parsed, rows, modes, stamp, log):
             counts = _analysis_counts(row, rows, modes, backend_args, list_cache, mode, errors,
                                       role_cache)
             for originals in ANALYSIS_ORIGINALS:
-                files, nbytes, to_jxl = counts[originals]
+                files, nbytes, tiff_jxl, jpeg_jxl = counts[originals]
                 chosen = mode.name == row.mode and originals == row.originals
                 line_rows.append((row.folder, mode.name, originals, files, nbytes,
-                                  "yes" if chosen else "", to_jxl))
+                                  "yes" if chosen else "", tiff_jxl, jpeg_jxl))
                 if chosen:
                     total_files += files
                     total_bytes += nbytes
         log.out(f"    {'mode':<6} {'originals':<10} {'files':>10} {'bytes':>12}")
-        for _folder, mode_name, originals, files, nbytes, chosen, to_jxl in line_rows:
+        for _folder, mode_name, originals, files, nbytes, chosen, tiff_jxl, jpeg_jxl in line_rows:
             mark = "  <- chosen" if chosen else ""
-            if chosen and to_jxl:
-                mark += f" (of it {sb._gb(to_jxl)} of TIFF kept as JXL: the backup is smaller)"
+            kept = [f"{sb._gb(size)} of {kind}" for kind, size in (("TIFF", tiff_jxl),
+                                                                   ("JPEG", jpeg_jxl)) if size]
+            if chosen and kept:
+                mark += f" (of it {' and '.join(kept)} kept as JXL: the backup is smaller)"
             log.out(f"    {mode_name:<6} {originals:<10} {sb._num(files):>10} "
                     f"{sb._gb(nbytes):>12}{mark}")
         results.extend(line_rows)
@@ -534,7 +550,7 @@ def _analyze_rows(parsed, rows, modes, stamp, log):
     with open(sb._io(path), "w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
         writer.writerow(["folder", "mode", "originals", "files", "bytes", "chosen",
-                         "tiff_to_jxl_bytes"])
+                         "tiff_to_jxl_bytes", "jpeg_to_jxl_bytes"])
         writer.writerows(results)
     log.out(f"Total (the mode chosen in each line): {sb._num(total_files)} files / "
             f"{sb._gb(total_bytes)}")

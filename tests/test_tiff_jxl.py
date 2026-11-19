@@ -61,9 +61,10 @@ def env(tmp_path, monkeypatch):
     shutil.copy2(FAKE, tool)
     calls = tmp_path / "calls"
     monkeypatch.setattr(sb, "JXLPHOTO", str(tool))
-    monkeypatch.setattr(sb, "TIFF_JXL_WORKERS", 2)
+    monkeypatch.setattr(sb, "JXL_WORKERS", 2)
     monkeypatch.setenv("FAKE_JXLPHOTO_CALLS", str(calls))
-    for name in ("FAKE_JXLPHOTO_FAIL", "FAKE_JXLPHOTO_ONLY", "FAKE_JXLPHOTO_DECODE_FAIL"):
+    for name in ("FAKE_JXLPHOTO_FAIL", "FAKE_JXLPHOTO_ONLY", "FAKE_JXLPHOTO_DECODE_FAIL",
+                 "FAKE_JXLPHOTO_VERSION"):
         monkeypatch.delenv(name, raising=False)
     sb._JXLPHOTO_VERSIONS.clear()
     return SimpleNamespace(root=root, src=src, dest=root / "dest", tool=tool, calls=calls,
@@ -192,8 +193,8 @@ def test_j2_new_tiffs_become_jxl(env, capsys):
             "--verify-roundtrip"]
     out = capsys.readouterr().out
     assert "TIFF kept as JXL (jxl: d=0.05 scan=0 8bit=0 e=7): 3 to convert" in out
-    assert "TIFF kept as JXL: 3 converted" in out
-    assert not Path(env.dest, sb.CATALOG_FOLDER, sb.TIFF_JXL_FOLDER).exists()
+    assert "Kept as JXL: 3 converted (3 TIFF)" in out
+    assert not Path(env.dest, sb.CATALOG_FOLDER, sb.JXL_WORK_FOLDER).exists()
 
 
 # ---- J3 a second run, a changed TIFF, another profile --------------------------------------
@@ -238,8 +239,8 @@ def test_j4_our_tiff_copies_become_jxl(env, capsys):
     assert not {rel for (rel,) in db(env.dest, "SELECT rel FROM files")} & {
         rel.replace("/", "\\") for rel in TIFFS}
     out = capsys.readouterr().out
-    assert "TIFF copies in the backup that their JXL replaces: 3 (to versions\\)" in out
-    assert "3 TIFF copies in the backup replaced by their JXL (to versions)" in out
+    assert "copies in the backup that their JXL replaces: 3 (to versions\\)" in out
+    assert "3 copies in the backup replaced by their JXL (to versions)" in out
 
 
 def test_j4_another_programs_copies_become_jxl_a_different_one_stays(env):
@@ -269,7 +270,7 @@ def test_j5_a_failed_conversion_copies_the_tiff(env, monkeypatch, how, photoback
     assert (env.dest / "2025/scans/000038.tif").read_bytes() == (
         env.src / "2025/scans/000038.tif").read_bytes()
     assert {"2025/shoot/DSC_0001.tif.jxl", "2025/scans/000037.tiff.jxl"} <= have
-    assert not Path(env.dest, sb.CATALOG_FOLDER, sb.TIFF_JXL_FOLDER).exists()
+    assert not Path(env.dest, sb.CATALOG_FOLDER, sb.JXL_WORK_FOLDER).exists()
     # the next run converts it, and the TIFF copy goes to versions
     monkeypatch.delenv("FAKE_JXLPHOTO_FAIL")
     assert backup(env, "--tiff", "jxl") == 0
@@ -456,7 +457,7 @@ def test_j9_without_jxlphoto_and_conflicts(env, monkeypatch, photobackup_log_dir
     assert restore(env, "--to", env.out) == 1
     assert restored(env) == OTHERS                      # every other file is restored
     out = capsys.readouterr().out
-    assert "NEEDS_JXLPHOTO: 3 TIFF kept as JXL" in out and "--keep-jxl" in out
+    assert "NEEDS_JXLPHOTO: 3 TIFF or JPEG kept as JXL" in out and "--convert-back none" in out
     monkeypatch.setattr(sb, "JXLPHOTO", str(env.tool))
     target = env.out / "2025/scans/000037.tiff"
     target.write_bytes(b"someone else's file")
@@ -496,7 +497,7 @@ def test_j10_schema_1_becomes_2_and_an_unsafe_source_rel_is_damage(env):
         catalog.close()
     assert restore(env, "--to", env.out) == 0
     assert backup(env, "--tiff", "jxl") == 0
-    assert db(env.dest, "SELECT v FROM meta WHERE k='schema_version'") == [("2",)]
+    assert db(env.dest, "SELECT v FROM meta WHERE k='schema_version'") == [("3",)]
     assert len(converted(env.dest)) == 5
     connection = sqlite3.connect(str(env.dest / sb.CATALOG_FOLDER / "catalog.sqlite"))
     with connection:
@@ -594,7 +595,7 @@ def test_j14_ctrl_c_while_converting(env, monkeypatch):
         placed.append(real(*args, **kwargs))
     monkeypatch.setattr(sb, "_place_group", place_then_stop)
     assert backup(env, "--tiff", "jxl") == 130
-    assert not Path(env.dest, sb.CATALOG_FOLDER, sb.TIFF_JXL_FOLDER).exists()
+    assert not Path(env.dest, sb.CATALOG_FOLDER, sb.JXL_WORK_FOLDER).exists()
     groups = {source for source, *_rest in converted(env.dest).values()}
     assert len(groups) == 1                             # the one placed is whole and recorded
     have = backed(env.dest)
@@ -602,3 +603,48 @@ def test_j14_ctrl_c_while_converting(env, monkeypatch):
     monkeypatch.setattr(sb, "_place_group", real)
     assert backup(env, "--tiff", "jxl") == 0
     assert backed(env.dest) == OTHERS | JXL
+
+
+# ---- J15 the jxl-photo contract: the minimum version (docs/jxlphoto_contract.md, JP-1) ----------
+def fake_version(monkeypatch, version):
+    monkeypatch.setenv("FAKE_JXLPHOTO_VERSION", version)
+    sb._JXLPHOTO_VERSIONS.clear()
+
+
+def test_j15_versions_in_order():
+    key = sb._version_key
+    assert key("2.30.0-rc2") < key("2.30.0") < key("2.30.1") < key("jxl-photo 2.31.0_beta1")
+    assert key("2.17.0_beta1") < key("2.17.0") and key("jxl-photo ?") is None
+    assert key(sb.JXLPHOTO_MIN_VERSION) is not None
+
+
+def test_j15_an_old_or_silent_jxlphoto_is_refused(env, monkeypatch, capsys):
+    monkeypatch.setattr(sb, "JXLPHOTO_MIN_VERSION", "2.30.0")
+    fake_version(monkeypatch, "2.29.1")
+    assert backup(env, "--tiff", "jxl") == 2
+    assert "jxl-photo 2.29.1 is older than 2.30.0" in capsys.readouterr().err
+    fake_version(monkeypatch, "2.30.0_beta1")           # a test version of the minimum
+    assert backup(env, "--tiff", "jxl") == 2
+    fake_version(monkeypatch, "none")
+    assert backup(env, "--tiff", "jxl") == 2
+    assert "did not say its version" in capsys.readouterr().err
+    man = write_manifest(env.root / "m.csv", (env.src / "2025", "6", "", "", "jxl"))
+    assert mb.main(["--manifest", str(man), "--dest", str(env.dest), "--yes"]) == 2
+    assert mir.main(["--manifest", str(man), "--dest", str(env.dest), "--yes"]) == 2
+    assert not env.dest.exists()
+    assert backup(env) == 0                             # without a profile: no jxl-photo needed
+    fake_version(monkeypatch, "2.30.0")
+    assert backup(env, "--tiff", "jxl") == 0
+    assert backed(env.dest) == OTHERS | JXL
+
+
+def test_j15_the_restore_never_runs_an_old_kept_jxlphoto(env, monkeypatch, capsys):
+    monkeypatch.setattr(sb, "KEEP_TOOLS_IN_BACKUP", True)
+    assert backup(env, "--tiff", "jxl") == 0
+    monkeypatch.setattr(sb, "JXLPHOTO", "")
+    fake_version(monkeypatch, "2.29.1")                 # what the kept copy now says
+    capsys.readouterr()
+    assert restore(env, "--to", env.out) == 1
+    out = capsys.readouterr().out
+    assert "NEEDS_JXLPHOTO: 3 TIFF or JPEG kept as JXL" in out and "older than" in out
+    assert restored(env) == OTHERS

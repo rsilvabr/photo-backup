@@ -81,8 +81,13 @@ added the newer parts. The restore has its own guarantees
   change meanwhile. Anything else copies the TIFF as it is (exit 1): nothing is
   ever left without a copy. A TIFF copy already in the backup leaves only
   after its JXL is in the backup and in the catalog, to `versions\` (the
-  mirror: its trash). An export is never converted
+  mirror: its trash). A TIFF export is never converted
   ([tiff_to_jxl.md](tiff_to_jxl.md)).
+- **A JPEG kept as JXL comes back byte for byte** *(v0.14.0-rc3)*: jxl-photo's
+  lossless transcode only (`--force-transcode`), and the JXL is kept only after
+  jxl-photo rebuilt the JPEG from it and the rebuilt file had the SHA-256
+  photo-backup took of the JPEG; anything else copies the JPEG as it is. The
+  restore checks that SHA-256 again before the JPEG takes its name.
 - A copy is written to a temp file next to its final name, verified, then
   `os.replace`d — a crash never leaves a half file under the final name.
 - **A destination that stops taking writes stops the backup** *(v0.12.1)*.

@@ -28,8 +28,9 @@ v0.13.1: also when it gave an error while it was read)*, `SOURCE_CHANGED`,
 changed without changing size or mtime — the most important to report),
 `DEST_NOT_FROM_SOURCE` *(v0.14.0-rc2: a TIFF kept as JXL whose JXL does not say
 it was made from the TIFF the catalog recorded; `--verify full` only)*. A TIFF
-kept as JXL is checked as its JXL (size, date, SHA-256) against the TIFF the
-conversion recorded ([tiff_to_jxl.md](tiff_to_jxl.md#verify)). The
+or a JPEG kept as JXL is checked as its JXL (size, date, SHA-256) against the
+file the conversion recorded; a JPEG's JXL has no mark to read, it was proven
+byte for byte when it was made ([tiff_to_jxl.md](tiff_to_jxl.md#verify)). The
 counts go to the console; `_verify.csv` lists every file that is not `OK`
 (`VERIFY_CSV_OK = True` lists the `OK` ones too), and the log gets each of
 those lines the moment it is found. Exit 0 only if every file is `OK` or

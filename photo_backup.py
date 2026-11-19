@@ -28,7 +28,7 @@ import string
 import subprocess
 import sys
 
-__version__ = "0.14.0-rc2"
+__version__ = "0.14.0-rc3"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
@@ -666,6 +666,22 @@ def presets_menu(config):
 
 
 # ---- Restore -----------------------------------------------------------------------------------
+def _kept_as_jxl(backup):
+    """(TIFFs, JPEGs, lossy or unknown TIFFs) the backup keeps as JXL, counted
+    once per file (not per page)."""
+    catalog = _backend()._Catalog(backup, create=False, readonly=True)
+    try:
+        converted = catalog.converted_rows()
+    except sqlite3.Error:
+        return 0, 0, 0
+    finally:
+        catalog.close()
+    first = [item for item in converted.values() if item.page == 0]
+    tiffs = [item for item in first if item.kind != "jpeg"]
+    jpegs = [item for item in first if item.kind == "jpeg"]
+    return len(tiffs), len(jpegs), sum(1 for item in tiffs if item.lossless != 1)
+
+
 def _catalog_folder_rows(backup):
     """The backup by folder: [(label, files, bytes, only), ...], `only` being
     the --only values that restore exactly that line. The files that sit
@@ -740,6 +756,14 @@ def restore_flow(config):
     argv = ["--backup", backup]
     for rel in only:
         argv += ["--only", rel]
+    tiffs, jpegs, lossy = _kept_as_jxl(backup)
+    if tiffs or jpegs:
+        say(f"  This backup keeps {tiffs} TIFF ({lossy} of them lossy) and {jpegs} JPEG as JXL.")
+        argv += ["--convert-back", choose("Those files", [
+            ("all", "back to TIFF / JPEG, every one (a JPEG byte for byte)"),
+            ("lossless", "back only what is lossless (every JPEG, the lossless TIFFs); the lossy "
+                         "TIFFs stay JXL"),
+            ("none", "keep every one as JXL (photo.tif.jxl, photo.jpg.jxl)")], "all")]
     if destination == "original":
         argv.append("--to-original")
     else:
@@ -1090,8 +1114,9 @@ def settings_menu(config):
                  "COPY_JXLPHOTO_DERIVATIVES", "AUTO_UPDATE",
                  "AUTO_UPDATE_EXTENSIONS", "SPACE_MARGIN_GB", "VERIFY_COPY"):
         say(f"    {name:<26} {_setting(name)!r}")
-    say("  TIFF kept as JXL in the backup (a manifest's Tiff column names a profile):")
-    for name in ("JXLPHOTO", "TIFF_JXL_PROFILES", "KEEP_TOOLS_IN_BACKUP", "KEEP_TOOLS_EXTRA"):
+    say("  TIFF and JPEG kept as JXL in the backup (a manifest's Tiff and Jpeg columns):")
+    for name in ("JXLPHOTO", "JXLPHOTO_MIN_VERSION", "TIFF_JXL_PROFILES", "JPEG_JXL_EXTENSIONS",
+                 "KEEP_TOOLS_IN_BACKUP", "KEEP_TOOLS_EXTRA"):
         say(f"    {name:<26} {_setting(name)!r}")
     say("  Defaults of mirror_backup.py (edit the top of that file to change them):")
     for name in ("MIRROR_KEEP_DAYS", "MIRROR_MAX_DELETE_PERCENT", "MIRROR_MAX_DELETE_MIN"):

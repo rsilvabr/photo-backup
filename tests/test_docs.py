@@ -19,7 +19,7 @@ NOT_SETTINGS = {
                             "CAT_NX_STUDIO", "CAT_UNEXPORTED", "CAT_ADDED", "CAT_WHOLE",
                             "ST_NEW", "ST_CHANGED", "ST_UP_TO_DATE", "ST_MOVED",
                             "SCHEMA_VERSION"},
-    "restore_backup.py": {"GOOD"},
+    "restore_backup.py": {"GOOD", "CONVERT_BACK"},
     "photo_backup.py": {"KIND_BACKUP", "KIND_VERIFY", "KIND_MIRROR"},
     "manifest_backup.py": set(),
     "mirror_backup.py": set(),

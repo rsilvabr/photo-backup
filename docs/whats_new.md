@@ -3,6 +3,17 @@
 The short notes of each recent release, newest first; the README keeps the
 current one. Every release in detail: [version_history.md](version_history.md).
 
+## v0.14.0-rc3 (test version, not released yet)
+
+2026-11-19. JPEG kept as JXL, the restore's choice of formats, and the contract
+with jxl-photo. Everything of rc2 and rc1 below holds.
+
+- **JPEG kept as JXL, byte for byte**: a manifest line's new `Jpeg` column (or `--jpeg jxl`) keeps every JPEG of the line as JXL — exports too — by jxl-photo's lossless transcode. The JXL counts only after jxl-photo rebuilt the JPEG from it and the rebuilt file had the original's SHA-256; anything else (a CMYK JPEG) is copied as it is. Measured: 146 real JPEGs took 81% of their size ([tiff_to_jxl.md](tiff_to_jxl.md)).
+- **The restore chooses the formats**: `--convert-back all` (default: TIFF and JPEG back; a JPEG byte for byte), `lossless` (every JPEG and the lossless TIFFs back; a lossy TIFF stays JXL) or `none` (every one as JXL; `--keep-jxl` still works). The menu asks when the backup holds such files. New outcome `RESTORED_AS_JXL`.
+- **The contract with jxl-photo (仕様書)**: [jxlphoto_contract.md](jxlphoto_contract.md) says, item by item (JP-1 to JP-17), what jxl-photo must keep doing for photo-backup, where each item lives in both programs and what breaks; `tests/test_jxlphoto_contract.py` checks a real jxl-photo against it. photo-backup refuses a jxl-photo older than 2.30.0 (`JXLPHOTO_MIN_VERSION`), measured by running that test on jxl-photo's own versions; every failure message names its item (`CONVERT FAILED ...: ... (JP-5)`).
+- The catalog's table of files kept as JXL knows their kind and whether they are lossless (schema 3; a catalog of rc2 is upgraded when written). `TIFF_JXL_WORKERS`, `TIFF_JXL_TIMEOUT_MIN` and `TIFF_JXL_FOLDER` are now `JXL_WORKERS`, `JXL_TIMEOUT_MIN` and `JXL_WORK_FOLDER` (they serve JPEG too).
+- The README says how photo-backup and jxl-photo make a backup smaller, in four steps.
+
 ## v0.14.0-rc2 (test version, not released yet)
 
 2026-11-19. TIFF kept as JXL in the backup, and the fixes of an independent
