@@ -4,6 +4,7 @@ from pathlib import Path
 
 import captureone_backup
 import manifest_backup
+import mirror_backup
 import restore_backup
 import selective_backup
 
@@ -19,8 +20,9 @@ NOT_SETTINGS = {
                             "ST_NEW", "ST_CHANGED", "ST_UP_TO_DATE", "ST_MOVED",
                             "SCHEMA_VERSION"},
     "restore_backup.py": {"GOOD"},
-    "photo_backup.py": {"KIND_BACKUP", "KIND_VERIFY"},
+    "photo_backup.py": {"KIND_BACKUP", "KIND_VERIFY", "KIND_MIRROR"},
     "manifest_backup.py": set(),
+    "mirror_backup.py": set(),
     "captureone_backup.py": {"LABEL_USER", "LABEL_PREFERENCES", "LABEL_INSTALLED",
                              "LABEL_WINDOWS", "PROTECTED_LABELS", "BAD_RESTORE", "BAD_REVERT"},
     "mobile_backup.py": set(),
@@ -65,13 +67,15 @@ def test_docs_cover_the_settings():
 def test_docs_cover_the_flags():
     docs = _docs_text()
     for parser in (selective_backup._build_parser(), restore_backup._build_parser(),
-                   captureone_backup.build_parser(), manifest_backup.build_parser()):
+                   captureone_backup.build_parser(), manifest_backup.build_parser(),
+                   mirror_backup.build_parser()):
         for action in parser._actions:
             for option in action.option_strings:
                 if option.startswith("--"):
                     assert option in docs, f"{option} is missing from README.md and docs/"
     for text in ("restore_backup.py", "[5] Restore", "captureone_backup.py",
-                 "[6] Capture One only", "manifest_backup.py", "[7] Manifest"):
+                 "[6] Capture One only", "manifest_backup.py", "[7] Manifest",
+                 "mirror_backup.py", "[8] Mirror"):
         assert text in docs, f"{text} is missing from README.md and docs/"
 
 

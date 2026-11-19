@@ -61,7 +61,8 @@ A `--dry-run` on one of your folders shows what it would take before anything is
 - **One export format per photo**: `jxl>tif>jpg` keeps a photo's JXL; its TIFF when it has no JXL; its JPEG when it has neither ([formats](docs/how_it_selects.md#export-formats)).
 - **Your edits come along**: Capture One `Settings*` and NX Studio `NKSC_PARAM`. Changed `.xmp`, `.cos` and `.nksc` files are updated on every run, the previous version kept in a `versions\` folder ([re-runs](docs/reruns_and_moves.md)).
 - **Different rules per folder, in one run**: a manifest gives each folder its own mode, and `--analyze` shows how many TB each mode would take first ([modes](docs/per_folder_modes.md)).
-- **Never loses anything**: the source is read-only, nothing on the destination is deleted or overwritten in place, and each copy goes to a temp file, is verified, then renamed ([safety](docs/safety.md)).
+- **Never loses anything**: the source is read-only, nothing on the destination is deleted or overwritten in place (the mirror aside), and each copy goes to a temp file, is verified, then renamed ([safety](docs/safety.md)).
+- **A mirror when you want one**: `mirror_backup.py` makes the backup follow a manifest — what is gone from the source leaves the backup too, kept 30 days in a trash first ([mirror](docs/mirror.md)).
 - **Checks the space before the first byte**: a run that does not fit stops before copying anything.
 - **Verify any day later**: the SHA-256 recorded at copy time tells a damaged backup copy from an original that changed without changing its date (bit rot); `--max-gb` checks a big backup over several nights ([verify](docs/verifying.md)).
 - **Renamed folders are moved, not copied again**, once SHA-256 confirms the content; files whose original is gone are listed as orphans ([moves](docs/reruns_and_moves.md#moved-and-renamed-folders)).
@@ -74,6 +75,7 @@ A `--dry-run` on one of your folders shows what it would take before anything is
 | [`photo_backup.py`](photo_backup.py) | **Start here.** The interactive menu: back up (dry-run first, then copy), verify, presets, unattended runs, restore. Runs the scripts below for you |
 | [`selective_backup.py`](selective_backup.py) | The selective backup from the command line: plan, copy, catalog, verify. Everything the menu does goes through it |
 | [`manifest_backup.py`](manifest_backup.py) | Each folder of a manifest with its own mode; `--analyze` shows how many TB each mode would take |
+| [`mirror_backup.py`](mirror_backup.py) | The backup follows a manifest: what changed is replaced, what is gone is removed, through a 30-day trash |
 | [`restore_backup.py`](restore_backup.py) | Restores files from a backup: under a new folder or to the original places |
 | [`captureone_backup.py`](captureone_backup.py) | Backs up, verifies and restores Capture One's own profiles, styles and settings |
 | [`mobile_backup.py`](mobile_backup.py) | Mirrors the phone-sized exports to another disk, one album per event ([its own README](README_mobile_backup.md)) |
@@ -111,6 +113,7 @@ python photo_backup.py
   [5] Restore from a backup
   [6] Capture One only (back up, restore, force, undo)
   [7] Manifest (each folder with its own mode)
+  [8] Mirror (the backup follows a manifest; removes what is gone, through a trash)
   [0] Exit
 ```
 
@@ -161,7 +164,7 @@ Every mode starts from the export selection and adds to it. Measured with `--ana
 | 5 | mode 4 + every `_OUTTAKES*` | 4.25 TB |
 | 6 | the whole folder (without the Capture One `Cache`) | 11.16 TB |
 
-Modes `1+` to `5+` also copy whole every folder not exported yet. A bigger mode never copies less, and lowering a mode deletes nothing. Every column, the shipped modes and the commands: [docs/per_folder_modes.md](docs/per_folder_modes.md).
+Modes `1+` to `5+` also copy whole every folder not exported yet. A bigger mode never copies less, and lowering a mode deletes nothing (in a [mirror](docs/mirror.md), a `selection` line removes it). Every column, the shipped modes and the commands: [docs/per_folder_modes.md](docs/per_folder_modes.md).
 
 ---
 
@@ -170,7 +173,7 @@ Modes `1+` to `5+` also copy whole every folder not exported yet. A bigger mode 
 One line each; every rule in full: [docs/safety.md](docs/safety.md).
 
 - **The source is read-only.** Nothing under a `--source` is opened for writing, renamed, deleted, touched or changed.
-- **Nothing on the destination is ever deleted.** A file whose source changed is reported; with `--update-changed` the old copy is moved to the versions folder first, never overwritten in place.
+- **Nothing on the destination is ever deleted** — except by the mirror (`mirror_backup.py`): only what it wrote itself, and through a trash. A file whose source changed is reported; with `--update-changed` the old copy is moved to the versions folder first, never overwritten in place.
 - **Fail closed.** Not enough space, a missing drive, a damaged catalog, a destination inside a source (also through a junction or a `subst` letter): the run stops before the first byte is copied, exit 2.
 - **Nothing is skipped silently.** Every file under a source is in the plan or counted in the summary's `Not copied:`; a folder or file that cannot be read makes the run exit 1.
 - **A copy is never half a file.** It is written to a temp file, verified and put on the disk, and only then given its final name.
@@ -202,6 +205,7 @@ One line each; the detail is behind each link.
 |---|---|
 | [docs/how_it_selects.md](docs/how_it_selects.md) | How a session is read, how an export finds its originals, export formats, what happens to the rest |
 | [docs/per_folder_modes.md](docs/per_folder_modes.md) | `manifest_backup.py`: the manifest, the modes table column by column, the shipped modes, `--analyze` |
+| [docs/mirror.md](docs/mirror.md) | `mirror_backup.py`: getting a file back, the two modes, what leaves the backup and what never does, the trash, the locks |
 | [docs/menu.md](docs/menu.md) | The interactive menu item by item, unattended runs, running after jxl-photo, the menu's settings |
 | [docs/commands_and_settings.md](docs/commands_and_settings.md) | Every option and setting of `selective_backup.py`, the logs and CSVs, exit codes |
 | [docs/safety.md](docs/safety.md) | Every safety guarantee in full |

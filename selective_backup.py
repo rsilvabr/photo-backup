@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeou
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-__version__ = "0.13.2"
+__version__ = "0.14.0-rc1"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -155,6 +155,33 @@ def _split_names(value):
 
 def _fold_set(value):
     return {name.casefold() for name in _split_names(value)}
+
+
+_SCRIPTS = ("selective_backup", "manifest_backup", "mirror_backup", "restore_backup",
+            "captureone_backup", "photo_backup")
+
+
+def _program_name(default="selective_backup"):
+    """'mirror_backup 0.14.0-rc1': the script this process runs (the name it
+    was started with, when it is one of this project's) and the version. It
+    heads the summary, the console's title and the catalog's record of who
+    created and last wrote it."""
+    name = os.path.splitext(os.path.basename(sys.argv[0] or ""))[0] if sys.argv else ""
+    return f"{name if name in _SCRIPTS else default} {__version__}"
+
+
+def _set_console_title(text):
+    """Show `text` (a program and its version) in the console window's title and
+    the taskbar. Windows only, and only on a real console; never an error."""
+    if os.name != "nt":
+        return
+    try:
+        if not sys.stdout.isatty():
+            return
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleTitleW(str(text))
+    except (AttributeError, OSError, ValueError):
+        pass
 
 
 def _io(path):
@@ -1402,13 +1429,16 @@ def _list_dest_folder(folder):
     return listed
 
 
-def _file_statuses(files, dest):
+def _file_statuses(files, dest, listings=None):
     """_file_status of every planned file, in the same order, with one listing
     per destination folder instead of one question per file (6 times faster on
     96 000 files, and no file record is read from a cold disk). The listing
     only answers for a name it holds exactly as planned: any other case -- a
     name stored in another case, a folder that could not be listed -- still
-    asks the system, so a file that is there is never taken for a NEW one."""
+    asks the system, so a file that is there is never taken for a NEW one.
+    `listings` (a dict), when given, receives {folder: what _list_dest_folder
+    returned} for every destination folder listed: the mirror looks there for
+    files this tool did not write without listing them again."""
     statuses = [None] * len(files)
     by_folder = {}
     for index, planned in enumerate(files):
@@ -1416,6 +1446,8 @@ def _file_statuses(files, dest):
         by_folder.setdefault(os.path.dirname(dst), []).append((index, planned, dst))
     for folder, items in by_folder.items():
         listed = _list_dest_folder(folder)
+        if listings is not None:
+            listings[folder] = listed
         for index, planned, dst in items:
             if listed is None:
                 statuses[index] = FileStatus(planned, dst, ST_NEW)
@@ -1534,6 +1566,10 @@ class _Catalog:
             os.makedirs(_io(self.dir), exist_ok=True)
         self.conn = None
         self.scratch = None
+        self.writers = dict.fromkeys(("created_by", "created_at", "updated_by", "updated_at"), "")
+        self._writer_recorded = True        # nothing to record until it is open to write
+        self._changes_at_open = 0
+        self._first_copy = ""
         database = self.path
         if readonly and _exists(self.path + "-journal"):
             # An interrupted commit left its journal: reading the catalog here
@@ -1570,6 +1606,7 @@ class _Catalog:
                     "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
                 row = self.conn.execute(
                     "SELECT v FROM meta WHERE k='schema_version'").fetchone()
+                created_now = row is None
                 if row is None:
                     self.conn.execute(
                         "INSERT OR REPLACE INTO meta(k, v) VALUES('schema_version', ?)",
@@ -1596,12 +1633,63 @@ class _Catalog:
                     f"catalog is damaged: the row {unsafe[0]!r} has {unsafe[1]}, which would "
                     f"lead outside the backup: {self.path}. Nothing was read or written "
                     f"through it; see 'A damaged catalog' in the README.")
+            # who made it and who wrote it last, as they were before this run;
+            # this run is recorded at its first commit that changes something
+            self.writers = self._writers()
+            self._writer_recorded = readonly
+            self._first_copy = ""
+            if not readonly and created_now:
+                self._record_writer(created_now)
+                self.conn.commit()
+            elif not readonly and not self.writers["created_by"]:
+                # made before v0.14.0: its first copy, read before this run adds any
+                self._first_copy = self.conn.execute(
+                    "SELECT min(copied_at) FROM files").fetchone()[0] or ""
+            self._changes_at_open = self.conn.total_changes
         except sqlite3.Error as exc:
             self.close()
             raise RuntimeError(f"cannot open catalog {self.path}: {exc}")
         except RuntimeError:
             self.close()
             raise
+
+    def _writers(self):
+        """{created_by, created_at, updated_by, updated_at} as the catalog
+        records them ('' for what it does not record)."""
+        keys = ("created_by", "created_at", "updated_by", "updated_at")
+        recorded = dict(self.conn.execute(
+            "SELECT k, v FROM meta WHERE k IN (?, ?, ?, ?)", keys).fetchall())
+        return {key: recorded.get(key) or "" for key in keys}
+
+    def _record_writer(self, created_now):
+        """Record the program and version that made this catalog (once) and the
+        last one that changed it (v0.14.0); the caller commits. A catalog made
+        before this was recorded says so, with the date of its first copy."""
+        self._writer_recorded = True
+        now = datetime.now().isoformat(timespec="seconds")
+        program = _program_name()
+        values = {"updated_by": program, "updated_at": now}
+        if not self.writers["created_by"]:
+            if created_now:
+                values.update(created_by=program, created_at=now)
+            else:
+                values.update(created_by="an earlier version (before 0.14.0)",
+                              created_at=self._first_copy)
+        for key, value in values.items():
+            self.conn.execute("INSERT OR REPLACE INTO meta(k, v) VALUES(?, ?)", (key, value))
+
+    def writers_line(self):
+        """'created by X on D; last written by Y on D', from what was recorded
+        when it was opened (before this run), or '' when nothing was."""
+        writers = self.writers
+        parts = []
+        if writers["created_by"]:
+            parts.append(f"created by {writers['created_by']}"
+                         + (f" on {writers['created_at']}" if writers["created_at"] else ""))
+        if writers["updated_by"]:
+            parts.append(f"last written by {writers['updated_by']}"
+                         + (f" on {writers['updated_at']}" if writers["updated_at"] else ""))
+        return "; ".join(parts)
 
     def _first_unsafe_rel(self):
         """(rel, why) of the first row whose path would lead outside the
@@ -1672,6 +1760,11 @@ class _Catalog:
                           (sha256, when, key))
 
     def commit(self):
+        """Commit. The first commit that changed something also records this
+        program as the last one that wrote the catalog (v0.14.0): a run that
+        changes nothing leaves the catalog as it was, byte for byte."""
+        if not self._writer_recorded and self.conn.total_changes > self._changes_at_open:
+            self._record_writer(created_now=False)
         self.conn.commit()
 
     def close(self):
@@ -1766,7 +1859,7 @@ def _move_to_versions(dest, stamp, status, log):
             + ("" if used == target else f" (kept as {os.path.basename(used)})"))
 
 
-def _handle_old_copy(dest, stamp, status, log):
+def _handle_old_copy(dest, stamp, status, log, keep_old=None):
     """The destination's old copy of a CHANGED file. It keeps its name until
     the returned callback runs, right before the new file takes that name: a
     copy that fails, or a crash before that, leaves the old copy where it was.
@@ -1774,13 +1867,15 @@ def _handle_old_copy(dest, stamp, status, log):
     versions folder. With the same size the callback compares it with the hash
     of the bytes really copied: only a new file identical byte for byte leaves
     the old one out of the versions folder (Capture One rewrites every .cos it
-    opens, new date, same bytes). The new file is copied either way."""
+    opens, new date, same bytes). The new file is copied either way.
+    `keep_old(dest, stamp, status, log)` keeps an old copy that differs
+    (default: the versions folder; the mirror passes its trash)."""
     same_size = os.stat(_io(status.dst)).st_size == status.planned.size
     old_sha256 = _sha256_file(status.dst) if same_size else None
 
     def before_final(new_sha256):
         if old_sha256 is None or new_sha256 != old_sha256:
-            _move_to_versions(dest, stamp, status, log)
+            (keep_old or _move_to_versions)(dest, stamp, status, log)
             return
         # Windows refuses to replace a read-only file
         os.chmod(_io(status.dst), os.stat(_io(status.dst)).st_mode | 0o200)
@@ -2300,14 +2395,16 @@ def _orphan_csv_rows(orphans):
             for reason, row in orphans]
 
 
-def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None):
+def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_copy=None):
     """Copy what the plan says. `stop_info` (a dict) receives why the copy
     stopped early and what was left, when the destination stopped taking
     writes: after DEST_CHECK_AFTER_ERRORS failed copies in a row the
     destination is tested, and a test that fails stops the reading too (B16).
     A catalog that can no longer be written (sqlite3.Error) is a destination
     that stopped taking writes too: nothing more is tried, and `unrecorded`
-    says how many copies have their final name but no row (R1)."""
+    says how many copies have their final name but no row (R1).
+    `old_copy(dest, stamp, status, log)` decides what happens to the old copy
+    of a CHANGED file (default: _handle_old_copy; the mirror passes its own)."""
     to_copy = [status for status in statuses if _will_copy(status, args)]
     total_bytes = sum(status.planned.size for status in to_copy)
     done = 0
@@ -2400,7 +2497,7 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None):
             try:
                 before_final = None
                 if status.status == ST_CHANGED:
-                    before_final = _handle_old_copy(dest, stamp, status, log)
+                    before_final = (old_copy or _handle_old_copy)(dest, stamp, status, log)
                 if FLUSH_BATCH_FILES > 1 and status.planned.size < SMALL_FILE_KB * 1024:
                     pending.append(_stage_small_file(status, source, before_final))
                     in_a_row = 0            # the destination took this write
@@ -2464,14 +2561,14 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None):
 
 
 def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_paths,
-                   dest_error=None, extra_lines=()):
+                   dest_error=None, extra_lines=(), freed=0, catalog_note=""):
     new = [status for status in statuses if status.status == ST_NEW]
     changed = [status for status in statuses if status.status == ST_CHANGED]
     auto = [status for status in changed if _auto_updated(status, args)]
     auto_note = f" ({_num(len(auto))} edit settings/sidecars auto-updated)" if auto else ""
     up_to_date = [status for status in statuses if status.status == ST_UP_TO_DATE]
     lines = [
-        f"selective_backup {__version__}",
+        _program_name(),
         "Sources:      " + ", ".join(os.path.abspath(source) for source in args.source),
     ]
     bases = {base for _, base in planned.sources}
@@ -2485,6 +2582,8 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
         id_note = (f"   backup ID {backup_id[:8]}" if backup_id
                    else "   backup ID (none yet; created on the next copy)")
     lines.append(f"Destination:  {dest}{suffix}{id_note}")
+    if catalog_note:
+        lines.append(f"              catalog {catalog_note}")
     lines.append(f"Sessions: {_num(planned.stats.shoots)}   "
                  f"export folders: {_num(planned.stats.export_folders)}   "
                  f"export formats: {args.export_formats}")
@@ -2554,12 +2653,18 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
     if dest_error:
         lines.append(f"Space: need {_gb(needed)}, destination not available ({dest_error})")
     else:
-        lines.append(f"Space: need {_gb(needed)}, free {_gb(free)}, margin {_gb(margin)} -> "
-                     + ("fits" if fits else "DOES NOT FIT"))
+        freed_note = f" + {_gb(freed)} freed by this run" if freed else ""
+        lines.append(f"Space: need {_gb(needed)}, free {_gb(free)}{freed_note}, "
+                     f"margin {_gb(margin)} -> " + ("fits" if fits else "DOES NOT FIT"))
     return lines
 
 
-def _run_backup(args, log, stamp, plan_fn=None):
+def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
+    """Plan, summarise, check the space, ask, then copy. `mirror` (a
+    mirror_backup.MirrorJob) makes it a mirror: the job reviews what would
+    leave the backup, prints its own block after the summary, may free space
+    after a typed confirmation, confirms, removes before the copy and decides
+    the old copy of each changed file. None = a normal backup, unchanged."""
     dest = os.path.abspath(args.dest)
     if args.expect_backup_id:
         found = read_backup_id(dest)
@@ -2585,7 +2690,8 @@ def _run_backup(args, log, stamp, plan_fn=None):
         print(reserved, file=sys.stderr)
         log.log(f"ERROR {reserved}")
         return 2
-    statuses = _file_statuses(planned.files, dest)
+    listings = {} if mirror is not None else None
+    statuses = _file_statuses(planned.files, dest, listings)
     to_copy = [status for status in statuses if _will_copy(status, args)]
     needed = sum(status.planned.size for status in to_copy)
     dest_error = None
@@ -2617,7 +2723,11 @@ def _run_backup(args, log, stamp, plan_fn=None):
         print(str(exc), file=sys.stderr)
         log.log(f"ERROR {exc}")
         return 2
+    catalog_note = ""
     if read_only_catalog is not None:
+        catalog_note = read_only_catalog.writers_line()
+        if catalog_note:
+            log.log(f"catalog: {catalog_note}")
         try:
             rows = read_only_catalog.all_rows()
         except sqlite3.Error as exc:
@@ -2672,6 +2782,12 @@ def _run_backup(args, log, stamp, plan_fn=None):
         f"{_num(len(gone))} files / {_gb(sum(row.size for row in gone))} source gone, "
         f"{_num(len(unselected))} files / {_gb(sum(row.size for row in unselected))} "
         f"no longer selected{not_proven} -> {log_paths['orphans_csv']}")
+    freed = 0
+    mirror_lines = []
+    if mirror is not None:
+        mirror_lines, freed = mirror.review(planned, statuses, rows, prefixes, tentative_orphans,
+                                            tentative_used, listings, dest, log, possible)
+        fits = dest_error is None and needed <= free + freed - margin
     orphans_blocked = (f"nothing moved: {_num(len(planned.errors))} errors in the plan of this "
                        f"run (a source that cannot be read is not one that is gone)")
     if args.move_orphans and args.dry_run:
@@ -2682,7 +2798,11 @@ def _run_backup(args, log, stamp, plan_fn=None):
                 f"  --move-orphans: {_num(len(gone))} files would be moved to "
                 f"{os.path.join(dest, CATALOG_FOLDER, ORPHANS_FOLDER, stamp)}")
     for line in _summary_lines(args, planned, statuses, needed, free, margin, fits, log_paths,
-                               dest_error, extra_lines):
+                               dest_error, extra_lines, freed, catalog_note):
+        log.out(line)
+    # the mirror's own block comes last: it is what is on the screen when the
+    # question is asked
+    for line in mirror_lines:
         log.out(line)
     read_errors = 1 if planned.errors else 0
     # A dry-run lists every planned file. A run that copies lists what it will
@@ -2725,7 +2845,9 @@ def _run_backup(args, log, stamp, plan_fn=None):
         log.log(message)
         return 2
     if not fits:
-        message = f"Not enough space: need {_gb(needed)}, free {_gb(free)}, margin {_gb(margin)}"
+        freed_note = f" + {_gb(freed)} freed by this run" if freed else ""
+        message = (f"Not enough space: need {_gb(needed)}, free {_gb(free)}{freed_note}, "
+                   f"margin {_gb(margin)}")
         # The count stays closed (B15): a possible move is only confirmed by
         # hash later, so it is counted as a copy; the message says how much.
         moves_note = ""
@@ -2734,20 +2856,26 @@ def _run_backup(args, log, stamp, plan_fn=None):
                           f"may be files moved inside the backup (possible moves, confirmed "
                           f"by hash when copying), which would need no new space")
         message += moves_note
+        if mirror is not None:
+            for line in mirror.space_lines(needed, free + freed, margin):
+                log.out(line)
         if args.dry_run:
-            print(f"WARNING: would not fit ({_gb(needed)} needed, {_gb(free)} free, "
+            print(f"WARNING: would not fit ({_gb(needed)} needed, {_gb(free)} free{freed_note}, "
                   f"{_gb(margin)} margin{moves_note})")
             log.log("WARNING: would not fit")
             return read_errors
-        print(message, file=sys.stderr)
-        log.log(message)
-        return 2
+        if mirror is None or not mirror.free_space(needed, free + freed, margin):
+            print(message, file=sys.stderr)
+            log.log(message)
+            return 2
     if args.dry_run:
         log.log("dry run: nothing copied")
         return read_errors
+    if mirror is not None and not mirror.confirm():
+        return 2
     if not args.yes:
         try:
-            answer = input("Proceed? [y/N] ")
+            answer = input("Proceed? [y/N] " if mirror is None else mirror.proceed_prompt())
         except EOFError:
             print("Aborted.")
             log.log("Aborted (no answer)")
@@ -2775,6 +2903,7 @@ def _run_backup(args, log, stamp, plan_fn=None):
     moved = moved_bytes = move_errors = 0
     interrupted = False
     stop_info = {}
+    mirror_problems = False
     try:
         _ensure_backup_id(dest, log)
         _adopt_rows(catalog, statuses)
@@ -2783,12 +2912,19 @@ def _run_backup(args, log, stamp, plan_fn=None):
                 candidates, dest, catalog, log)
         if interrupted:
             return 130
+        # --move-orphans and the mirror ask every source again, right now
+        fresh = args.move_orphans or mirror is not None
         orphans = _find_orphans(catalog.all_rows(), statuses, prefixes, set(), planned.sources,
-                                None if args.move_orphans else orphan_states)
+                                None if fresh else orphan_states)
         log.csv("_orphans.csv", ["reason", "rel", "size", "source_path", "copied_at"],
                 _orphan_csv_rows(orphans))
+        if mirror is not None:
+            mirror.remove(dest, stamp, catalog, orphans, log)
+            if mirror.interrupted:
+                return 130
         done, done_bytes, error_count, interrupted = _copy_all(
-            args, statuses, dest, stamp, catalog, log, stop_info)
+            args, statuses, dest, stamp, catalog, log, stop_info,
+            mirror.old_copy if mirror is not None else None)
         log.log(f"moved {moved} files / {_gb(moved_bytes)}")
         log.out(f"copied {done} files / {_gb(done_bytes)}; {error_count} errors")
         if error_count or move_errors:
@@ -2804,6 +2940,8 @@ def _run_backup(args, log, stamp, plan_fn=None):
                 log.out(f"CATALOG: {_num(stop_info['unrecorded'])} copied files have no row "
                         f"in the catalog (it could not be written); they keep their final "
                         f"names and the next run adopts them by their size and date")
+        if mirror is not None:
+            mirror_problems = mirror.finish(log, done, done_bytes, error_count, interrupted)
         if interrupted:
             return 130
         if args.move_orphans and stop_info:
@@ -2821,7 +2959,7 @@ def _run_backup(args, log, stamp, plan_fn=None):
         return 1 if done or moved else 2
     finally:
         catalog.close()
-    return 1 if error_count or move_errors or planned.errors or stop_info else 0
+    return 1 if error_count or move_errors or planned.errors or stop_info or mirror_problems else 0
 
 
 @dataclass
@@ -3355,6 +3493,7 @@ def main(argv=None):
         return 2
     stamp = time.strftime("%y%m%d_%H%M%S")
     kind = "verify" if args.verify else "backup"
+    _set_console_title(_program_name())
     try:
         log = _Logger(os.path.join(LOG_DIR, f"{stamp}_{kind}"))
     except OSError as exc:

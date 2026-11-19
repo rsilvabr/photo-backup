@@ -14,7 +14,8 @@ manifest line and hands the result to selective_backup._run_backup, so the
 copy, the catalog, the space check, the orphans and the confirmation are the
 ones of a normal selective backup. Nothing on the destination is ever deleted;
 a file that a lower mode no longer selects only appears as a `not_selected`
-orphan. The source is READ-ONLY.
+orphan. The source is READ-ONLY. The optional Mirror column is read by
+mirror_backup.py only; this script ignores it.
 
 --analyze copies nothing: it prints how many bytes each mode would take in each
 folder of the manifest, and writes <stamp>_analysis.csv next to the log.
@@ -35,7 +36,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.13.2"
+__version__ = "0.14.0-rc1"
 
 # ---- Settings -------------------------------------------------------------------
 MODES_FILE = "backup_modes.csv"     # next to this script; --modes reads another
@@ -53,6 +54,10 @@ MODE_COLUMNS = ("Mode", "Unselected", "AddFolders", "AddWhole", "Exclude", "Whol
 MODE_OPTIONAL_COLUMNS = ("Unexported", "Only", "Skip",   # a table written before them keeps working
                          "LeaveOut")                     # (without LeaveOut: selective_backup.SESSION_LEAVE_OUT)
 MANIFEST_COLUMNS = ("Folder", "Mode", "Originals")
+MANIFEST_OPTIONAL_COLUMNS = ("Mirror",)  # a manifest written before it keeps working
+DEFAULT_MIRROR = "disk"             # a manifest line with an empty Mirror: mirror_backup.py removes only what
+                                    # is gone from the folder (this script reads the column and ignores it)
+MIRROR_VALUES = ("disk", "selection")   # selection: mirror_backup.py also removes what the line no longer selects
 
 
 class ManifestError(Exception):
@@ -80,6 +85,7 @@ class ManifestRow:
     folder: str
     mode: str
     originals: str
+    mirror: str = DEFAULT_MIRROR    # read by mirror_backup.py only
 
 
 def _drive_key(path):
@@ -206,10 +212,11 @@ def read_manifest(path, modes):
     rows = []
     seen = set()
     drives = set()
-    for line, row in _read_csv(path, MANIFEST_COLUMNS):
+    for line, row in _read_csv(path, MANIFEST_COLUMNS, MANIFEST_OPTIONAL_COLUMNS):
         folder = str(row.get("Folder") or "").strip()
         mode = str(row.get("Mode") or "").strip()
         originals = str(row.get("Originals") or "").strip().casefold() or DEFAULT_ORIGINALS
+        mirror = str(row.get("Mirror") or "").strip().casefold() or DEFAULT_MIRROR
         if not folder:
             raise ManifestError(f"{path} line {line}: empty Folder")
         if mode not in modes:
@@ -218,6 +225,10 @@ def read_manifest(path, modes):
             raise ManifestError(f"{path} line {line}: Originals must be one of "
                                 + ", ".join(ORIGINALS_VALUES)
                                 + f", not {originals!r}")
+        if mirror not in MIRROR_VALUES:
+            raise ManifestError(f"{path} line {line}: Mirror must be one of "
+                                + ", ".join(MIRROR_VALUES)
+                                + f", not {row.get('Mirror')!r}")
         folder = os.path.abspath(folder)
         if not os.path.isdir(sb._io(folder)):
             raise ManifestError(f"{path} line {line}: folder does not exist: {folder}")
@@ -226,7 +237,7 @@ def read_manifest(path, modes):
             raise ManifestError(f"{path} line {line}: folder repeated: {folder}")
         seen.add(key)
         drives.add(_drive_key(folder))
-        rows.append(ManifestRow(folder, mode, originals))
+        rows.append(ManifestRow(folder, mode, originals, mirror))
     if not rows:
         raise ManifestError(f"{path}: no manifest lines")
     if len(drives) > 1:
@@ -286,8 +297,10 @@ def _plan_row(row, rows, modes, args, list_cache, originals=None, mode=None, rol
     return planner
 
 
-def _plan_rows(rows, modes, args, list_cache):
-    """One _Planner per manifest line, everything joined in one sb.Plan."""
+def _plan_rows(rows, modes, args, list_cache, on_row=None):
+    """One _Planner per manifest line, everything joined in one sb.Plan.
+    `on_row(row, planner)`, when given, is called once per line right after
+    its planner ran (the mirror keeps the read errors of each line)."""
     files = []
     unexported_folders = []
     unmatched = []
@@ -301,6 +314,8 @@ def _plan_rows(rows, modes, args, list_cache):
     stats = sb.Stats()
     for row in rows:
         planner = _plan_row(row, rows, modes, args, list_cache)
+        if on_row is not None:
+            on_row(row, planner)
         files.extend(planner.files)
         unexported_folders.extend(planner.unexported)
         unmatched.extend(planner.unmatched)
@@ -556,6 +571,7 @@ def main(argv=None):
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, OSError):
         pass
+    sb._set_console_title(sb._program_name("manifest_backup"))
     parser = build_parser()
     try:
         args = parser.parse_args(argv)

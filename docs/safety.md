@@ -22,6 +22,9 @@ added the newer parts. The restore has its own guarantees
   once and never replaced, also when it cannot be read for a moment
   *(v0.13.2)*. The one folder the tool removes is one left empty by its own
   move inside the backup ([reruns_and_moves.md](reruns_and_moves.md#moved-and-renamed-folders)).
+  **The exception is the mirror** (`mirror_backup.py`), whose job is to remove
+  from the backup what is gone from the source: its own rules are
+  [at the end of this page](#the-mirror-mirror_backuppy).
 - **Fail closed.** Not enough space, a destination drive that is not
   connected, an unreadable or damaged catalog (checked every time it is
   opened, a dry-run and a verify too, *v0.13.1*; also a catalog row whose
@@ -71,3 +74,35 @@ added the newer parts. The restore has its own guarantees
   They keep their final names, and the next run adopts them by their size and
   date instead of copying them again; `--move-orphans` moves nothing in that
   run.
+
+## The mirror (`mirror_backup.py`)
+
+The mirror removes from the backup what is gone from the source — the one
+exception to "nothing on the destination is ever deleted". Every rule in full:
+[mirror.md](mirror.md).
+
+- **Only what it wrote itself:** a file with a catalog row that still has that
+  row's size and date. A file it did not write, or that was changed in the
+  backup, is never removed, and its changed copy goes to `versions\`.
+- **Only with proof:** "gone" is proven as for the orphans (the folder above
+  could be read); a source that cannot be read keeps its files. A `disk` line
+  keeps what is still on the disk; only a `selection` line removes what it no
+  longer selects.
+- **Only its scope:** the scoped mirror never touches what came from folders
+  that are not in its run; only `--total` does, after the typed number.
+- **Nothing behind a link** the backup does not follow; **nothing in a line
+  with read errors** (without a manifest: in a run with read errors).
+- **Only what the summary showed:** each source is asked again right before;
+  what changed reason stays, what appeared later waits for the next run.
+- **Through a trash:** what leaves and the old copy of what is replaced go to
+  `_photo_backup\trash\<run>\` for `MIRROR_KEEP_DAYS` days; nothing in it is
+  deleted before that date except after a typed number (`--empty-trash`, the
+  space question). Only folders named like a run are deleted, by their real
+  path; a link inside is never followed; a trash or `_photo_backup` that is a
+  link stops every real run (exit 2).
+- **Typed numbers:** a line over `MIRROR_MAX_DELETE_PERCENT`, a total mirror,
+  deleting for good to make room and emptying the trash need the number of
+  files typed; anything else cancels and changes nothing. `--unattended`
+  never asks: those cases stop the run (exit 2), nothing changed.
+- **One run at a time** (`_photo_backup\mirror.lock`); a folder is removed only
+  when its removal left it empty, never inside `_photo_backup`.

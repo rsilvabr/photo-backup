@@ -150,6 +150,15 @@ is the right one. A destination with no catalog yet says `NEW BACKUP`; a
 backup made before v0.4.0 (catalog but no `volume.json`) says
 `backup ID (none yet; created on the next copy)`.
 
+**Which version made it** *(v0.14.0)*: the catalog records the program and
+version that created it and the last one that changed it (`created_by`,
+`created_at`, `updated_by`, `updated_at` in its `meta` table; a run that
+changes nothing records nothing). The summary shows them under the
+`Destination:` line — `catalog created by selective_backup 0.13.2 on ...; last
+written by mirror_backup 0.14.0-rc1 on ...` — and the log keeps the same line.
+A catalog made before v0.14.0 says `an earlier version (before 0.14.0)`, with
+the date of its first copy.
+
 `--expect-backup-id ID` makes it strict: the run (copy, dry-run or verify)
 aborts with exit 2 before planning anything unless the destination holds
 exactly that ID. The menu saves the ID with every preset, and a preset run

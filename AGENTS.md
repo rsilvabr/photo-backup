@@ -27,6 +27,23 @@ from the command line. A future job (e.g. a full mirror) is a new
   `<stamp>_analysis.csv`. `--verify` hands the same joined plan to
   `selective_backup._run_verify(..., plan_fn=...)`: only the manifest knows
   what each line selects. Never duplicate a copy or catalog routine here.
+- `mirror_backup.py` — the mirror (v0.14.0): the backup follows a manifest
+  (or `--source`): what changed is replaced, what is gone is removed, through
+  a trash. It hands `selective_backup._run_backup(..., plan_fn=...,
+  mirror=MirrorJob)` the same joined plan as `manifest_backup.py`; the job is
+  called at fixed points (`review` before the summary, `space_lines` /
+  `free_space`, `confirm`, `proceed_prompt`, `remove` before the copy,
+  `old_copy` per changed file, `finish`). All of its policy lives in this
+  script; `selective_backup.py` only has the call points and the parameters
+  `listings=` (`_file_statuses`), `keep_old=` (`_handle_old_copy`),
+  `old_copy=` (`_copy_all`), `freed=` (`_summary_lines`) — `None`/`0` = the
+  normal backup, unchanged. Its lock functions are a deliberate copy of
+  `mobile_backup.py` 0.1.4's (that script stays independent). The manifest's
+  optional `Mirror` column (`disk`/`selection`) is read by
+  `manifest_backup.read_manifest` and ignored by `manifest_backup.py` itself.
+  Its screen: the verdict first, the mirror's box last (right above the
+  question), tables label | files | size, concrete dates, the trash folder
+  always printed; keep it that way (the owner reads it under pressure).
 - `photo_backup.py` — interactive menu + presets (`--run-preset`). It
   never copies by itself: it builds an argv and runs `selective_backup.py` (or
   `restore_backup.py`, via `run_restore`) as a child process (`run_backend`).
@@ -113,7 +130,9 @@ from the command line. A future job (e.g. a full mirror) is a new
   a `subst` letter cannot lead the backup into a source. Use `_overlaps` for
   every such safety check (also restore target × backup); `_is_under` stays
   string-only for the catalog's own paths.
-- **Nothing on the destination is ever deleted.** A file whose source changed
+- **Nothing on the destination is ever deleted** — except by `mirror_backup.py`
+  (v0.14.0), see its rule below; its trash is the one folder inside
+  `CATALOG_FOLDER` where files are deleted. A file whose source changed
   is reported; with `--update-changed` the old copy is MOVED to the versions
   folder first, never overwritten in place. A new file identical byte for byte
   to the old copy takes its place instead: `_handle_old_copy` compares the old
@@ -134,6 +153,27 @@ from the command line. A future job (e.g. a full mirror) is a new
   `_rename_no_clobber` too; `_ensure_backup_id` never replaces a
   `volume.json` that is there, readable or not (v0.13.2). Never `os.replace`
   onto a name that may hold a file we did not just check.
+- **`mirror_backup.py` removes only what it wrote, with proof (v0.14.0).** A
+  catalogued file leaves the backup only when it is "ours" (`_ours`: the
+  file still has its row's size and date) and its reason allows it:
+  `source_missing` always; `not_selected` only in a `Mirror=selection` line;
+  `other_source` and `outside_run` (rows outside this run's prefixes) only
+  with `--total`; `source_unreadable` never. Never behind a link the plan did
+  not follow (`_behind_link`), never in a line with read errors (without a
+  manifest: a run with any), never what the review did not show (`remove`
+  re-asks `_find_orphans` and acts only when the reason is the same). A
+  changed file that is ours: old copy to the trash; not ours: `versions\`
+  (`sb._handle_old_copy`). What leaves goes to
+  `_photo_backup\trash\<stamp>\<rel>` (`sb._move_aside`) for
+  `MIRROR_KEEP_DAYS`; a run deletes trash runs past that date
+  (`_purge_trash_run`: only folders named `\d{6}_\d{6}`, only by their real
+  path, never following a link; `_trash_problem` stops a real run when
+  `_photo_backup` or the trash is a link). Deleting for good before the date,
+  a line over `MIRROR_MAX_DELETE_PERCENT` (unless `--allow-mass-delete`) and
+  a total mirror need the number of files typed (`_typed_confirmation`);
+  `--unattended` never asks and stops instead (exit 2, nothing changed). One
+  real run at a time (`mirror.lock`). Files it did not write are never
+  removed, only counted (`stray`).
 - **The restore never writes to the backup.** `restore_backup.py` opens the
   catalog read-only, never writes, moves or deletes anything under `--backup`,
   and never overwrites a target file that already exists. An empty `--to` or
@@ -394,7 +434,15 @@ Same as the sibling repo `jxl-photo`. Documents live in `AI_tools/`
 ## Commits and releases
 - Commits carry the repo owner's authorship only — **no `Co-Authored-By` or
   `Claude-Session` trailers**.
-- Tags: `vX.Y.Z`, betas `vX.Y.Z_betaN`.
+- Tags: `vX.Y.Z`; a test version before a release is `vX.Y.Z-rcN` (since
+  v0.14.0-rc1; never `_betaN`, as in jxl-photo: the version is written into
+  the catalog, `created_by` / `updated_by`, and must stay a clean
+  `X.Y.Z[-rcN]`). `__version__` is the same in every script but
+  `mobile_backup.py` (its own `0.1.x`).
+- Each program shows its name and version: the summary's first line
+  (`sb._program_name()`: the script it was started as), the mirror's box
+  borders (`_top_rule`), the console's title (`sb._set_console_title`; the
+  menu takes its title back after each script it runs).
 
 ## Docs map
 - `README.md` — short by design, in jxl-photo's format (owner's rule,
@@ -414,6 +462,10 @@ Same as the sibling repo `jxl-photo`. Documents live in `AI_tools/`
   column, the shipped modes and their sizes, its options and settings.
 - `docs/menu.md` — the menu item by item, unattended runs, after jxl-photo,
   the menu's settings.
+- `docs/mirror.md` — `mirror_backup.py`: getting a file back (first, for the
+  owner under pressure), the two modes, the `Mirror` column, what leaves and
+  what never does, the screen, the trash, the locks, space, unattended runs,
+  options, settings, logs and exit codes.
 - `docs/commands_and_settings.md` — every option and setting of
   `selective_backup.py`, the logs and CSVs, exit codes.
 - `docs/safety.md` — every safety guarantee in full (the README keeps one

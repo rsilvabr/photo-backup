@@ -238,3 +238,74 @@ def test_menu_restore_flow(tmp_path, monkeypatch, menu_config):
     assert "--to-original" in calls[0]
     assert "--yes" in calls[1] and "--dry-run" not in calls[1]
     assert "--only" not in calls[0]
+
+
+def capture_mirror(monkeypatch, codes=None):
+    calls = []
+    codes = list(codes or [])
+
+    def fake_run(argv):
+        calls.append(list(argv))
+        return codes.pop(0) if codes else 0
+    monkeypatch.setattr(menu, "run_mirror", fake_run)
+    monkeypatch.setattr(menu, "run_captureone", lambda argv: 0)
+    return calls
+
+
+def test_menu_mirror_is_a_dry_run_then_a_mirror(tmp_path, monkeypatch, menu_config):
+    calls = capture_mirror(monkeypatch)
+    manifest, dest = str(tmp_path / "m.csv"), str(tmp_path / "out")
+    script(monkeypatch, ["8", "1", manifest, dest, "n", "y", "n", "0", "0"])
+    assert menu.main([]) == 0
+    assert calls == [["--manifest", manifest, "--dest", dest, "--dry-run"],
+                     ["--manifest", manifest, "--dest", dest, "--yes"]]
+
+
+def test_menu_mirror_step_two_defaults_to_no(tmp_path, monkeypatch, menu_config):
+    calls = capture_mirror(monkeypatch)
+    script(monkeypatch, ["8", "1", str(tmp_path / "m.csv"), str(tmp_path / "out"), "n", "",
+                         "0", "0"])
+    assert menu.main([]) == 0
+    assert len(calls) == 1 and "--dry-run" in calls[0]
+
+
+def test_menu_total_mirror_and_a_stopped_dry_run(tmp_path, monkeypatch, menu_config):
+    calls = capture_mirror(monkeypatch)
+    script(monkeypatch, ["8", "2", str(tmp_path / "m.csv"), str(tmp_path / "out"), "n", "y",
+                         "0", "0"])           # a total mirror never offers a preset
+    assert menu.main([]) == 0
+    assert all("--total" in call for call in calls) and len(calls) == 2
+    calls = capture_mirror(monkeypatch, codes=[2])
+    script(monkeypatch, ["8", "1", "", "", "n", "0", "0"])     # the remembered manifest/dest
+    assert menu.main([]) == 0
+    assert len(calls) == 1
+
+
+def test_menu_mirror_preset_runs_unattended(tmp_path, monkeypatch, menu_config, capsys):
+    calls = capture_mirror(monkeypatch)
+    manifest, dest = str(tmp_path / "m.csv"), str(tmp_path / "out")
+    script(monkeypatch, ["8", "1", manifest, dest, "n", "y", "y", "MIRROR NIGHT", "0", "0"])
+    assert menu.main([]) == 0
+    saved = json.loads(menu_config.read_text(encoding="utf-8"))["presets"]["MIRROR NIGHT"]
+    assert saved["kind"] == menu.KIND_MIRROR and saved["manifest"] == os.path.abspath(manifest)
+    capsys.readouterr()
+    assert menu.main(["--list-presets"]) == 0
+    assert "mirror: " in capsys.readouterr().out
+    calls.clear()
+    assert menu.main(["--run-preset", "MIRROR NIGHT"]) == 0
+    assert calls == [["--manifest", os.path.abspath(manifest), "--dest", dest, "--unattended"]]
+
+
+def test_menu_trash_items(tmp_path, monkeypatch, menu_config):
+    calls = capture_mirror(monkeypatch)
+    dest = str(tmp_path)
+    script(monkeypatch, ["8", "3", dest, "4", dest, "2026-13-01", "2026-11-01", "0", "0"])
+    assert menu.main([]) == 0
+    assert calls == [["--dest", dest, "--show-trash"],
+                     ["--dest", dest, "--empty-trash", "--dry-run"],
+                     ["--dest", dest, "--empty-trash", "--before", "2026-11-01"]]
+
+
+def test_menu_mirror_settings_come_from_the_script(monkeypatch):
+    import mirror_backup
+    assert menu._mirror_setting("MIRROR_KEEP_DAYS") == mirror_backup.MIRROR_KEEP_DAYS

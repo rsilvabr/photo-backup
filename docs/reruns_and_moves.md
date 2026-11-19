@@ -97,3 +97,6 @@ path) moves no orphan at all, and says so: `--move-orphans: nothing moved: N
 errors in the plan of this run`. Since the old
 copy is only moved inside the backup, the space does not shrink until you
 delete the orphans folder yourself — that is outside this tool's scope.
+
+To make the backup follow the source instead (what is gone leaves the backup,
+through a 30-day trash), see [the mirror](mirror.md).

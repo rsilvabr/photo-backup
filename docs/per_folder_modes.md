@@ -9,8 +9,10 @@ another set in another. Every mode starts from the export selection of
 Two CSV files say what to do:
 
 - **The manifest** (`--manifest`, required) lists the folders:
-  `Folder,Mode,Originals`. The owner's real manifest (`backup_manifest.csv`)
-  stays out of git; `backup_manifest.example.csv` shows the format.
+  `Folder,Mode,Originals`, and optionally `Mirror` (`disk` or `selection`),
+  which only [the mirror](mirror.md#the-mirror-column) reads. The owner's real
+  manifest (`backup_manifest.csv`) stays out of git;
+  `backup_manifest.example.csv` shows the format.
 - **The modes table** (`--modes`, default `backup_modes.csv` beside the
   script) says what each mode copies:
   `Mode,Unselected,AddFolders,AddWhole,Exclude,Whole,Unexported,Only,Skip,LeaveOut,Description`.
@@ -165,7 +167,9 @@ Settings at the top of `manifest_backup.py` *(listed since v0.13.2)*:
 | `ORIGINALS_VALUES` | `raw` → `raw_or_jpeg`, `raw+jpeg` → `raw_jpeg`, `all` → `all` | the manifest's `Originals` words and what each one keeps |
 | `ANALYSIS_ORIGINALS` | `raw`, `raw+jpeg`, `all` | the `Originals` columns of `--analyze` |
 | `ONLY_GROUPS` | the export format groups + `raw`, `jpeg` | the names the `Only` column accepts |
-| `MODE_COLUMNS`, `MODE_OPTIONAL_COLUMNS`, `MANIFEST_COLUMNS` | the column names | the headers of the two tables (a column name nobody knows stops the run) |
+| `MODE_COLUMNS`, `MODE_OPTIONAL_COLUMNS`, `MANIFEST_COLUMNS`, `MANIFEST_OPTIONAL_COLUMNS` | the column names | the headers of the two tables (a column name nobody knows stops the run) |
+| `DEFAULT_MIRROR` | `disk` | what a manifest line with an empty `Mirror` means to `mirror_backup.py` |
+| `MIRROR_VALUES` | `disk`, `selection` | the words the `Mirror` column accepts ([the mirror](mirror.md#the-mirror-column)) |
 
 ## Verify and analyze
 

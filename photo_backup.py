@@ -6,9 +6,11 @@ starts with a dry-run of the same choices: you see what would be copied, what
 would not and whether it fits, and only then decide to copy.
 
 The menu never copies anything itself: it builds the command line and runs
-selective_backup.py as a child process, so the backend's safety rules (read-only
-source, nothing deleted, space check) apply unchanged. The defaults it shows
-are read from selective_backup.py, never repeated here.
+selective_backup.py (or manifest_backup.py, mirror_backup.py, restore_backup.py,
+captureone_backup.py) as a child process, so the backends' safety rules
+(read-only source, space check; nothing deleted but by the mirror, through its
+trash) apply unchanged. The defaults it shows are read from the scripts
+themselves, never repeated here.
 
     python photo_backup.py                    # interactive menu
     python photo_backup.py --list-presets
@@ -16,6 +18,7 @@ are read from selective_backup.py, never repeated here.
 """
 
 import argparse
+import datetime
 import importlib.util
 import json
 import os
@@ -25,7 +28,7 @@ import string
 import subprocess
 import sys
 
-__version__ = "0.13.2"
+__version__ = "0.14.0-rc1"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
@@ -34,6 +37,7 @@ BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "selective_ba
 RESTORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "restore_backup.py")
 CAPTUREONE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captureone_backup.py")
 MANIFEST_BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifest_backup.py")
+MIRROR_BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mirror_backup.py")
 COPY_CAPTUREONE_SETTINGS = True # every backup also keeps Capture One's profiles, styles and settings
 VERIFY_MODE = "quick"           # default verify mode offered by the menu: quick | full
 MAX_ONLY_CHARS = 20000          # [5] Restore: the --only values of one command (Windows takes about 32 000 characters)
@@ -53,6 +57,7 @@ UNSELECTED_TEXT = {             # what each --unselected value means (the values
 
 KIND_BACKUP = "backup"
 KIND_VERIFY = "verify"
+KIND_MIRROR = "mirror"
 
 try:                                    # colours when rich is installed; plain text otherwise
     from rich.console import Console
@@ -106,36 +111,64 @@ def _captureone_setting(name):
     return getattr(_CAPTUREONE_MODULE, name)
 
 
-def run_backend(argv):
-    """Run selective_backup.py with `argv`; its output goes straight to the console."""
+def _menu_title():
+    """The console's title while the menu runs: its name and version (a
+    script it ran shows its own; the menu takes the title back after it)."""
     try:
-        return subprocess.run([sys.executable, BACKEND, *argv]).returncode
+        _backend()._set_console_title(f"photo-backup {__version__}")
+    except Exception:
+        pass
+
+
+def _run_child(script, argv):
+    """Run one of the scripts with `argv`; its output (and its questions) go
+    straight to the console."""
+    try:
+        return subprocess.run([sys.executable, script, *argv]).returncode
     except KeyboardInterrupt:
         return 130
+    finally:
+        _menu_title()
+
+
+def run_backend(argv):
+    """Run selective_backup.py with `argv`; its output goes straight to the console."""
+    return _run_child(BACKEND, argv)
 
 
 def run_restore(argv):
     """Run restore_backup.py with `argv`; its output goes straight to the console."""
-    try:
-        return subprocess.run([sys.executable, RESTORE, *argv]).returncode
-    except KeyboardInterrupt:
-        return 130
+    return _run_child(RESTORE, argv)
 
 
 def run_captureone(argv):
     """Run captureone_backup.py with `argv`; its output goes straight to the console."""
-    try:
-        return subprocess.run([sys.executable, CAPTUREONE, *argv]).returncode
-    except KeyboardInterrupt:
-        return 130
+    return _run_child(CAPTUREONE, argv)
 
 
 def run_manifest(argv):
     """Run manifest_backup.py with `argv`; its output goes straight to the console."""
-    try:
-        return subprocess.run([sys.executable, MANIFEST_BACKEND, *argv]).returncode
-    except KeyboardInterrupt:
-        return 130
+    return _run_child(MANIFEST_BACKEND, argv)
+
+
+def run_mirror(argv):
+    """Run mirror_backup.py with `argv`; its output (and its own questions, such
+    as a number to type) go straight to the console."""
+    return _run_child(MIRROR_BACKEND, argv)
+
+
+_MIRROR_MODULE = None
+
+
+def _mirror_setting(name):
+    """A setting of mirror_backup.py, read from the script itself."""
+    global _MIRROR_MODULE
+    if _MIRROR_MODULE is None:
+        spec = importlib.util.spec_from_file_location("mirror_backup", MIRROR_BACKEND)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _MIRROR_MODULE = module
+    return getattr(_MIRROR_MODULE, name)
 
 
 # ---- Console helpers ----------------------------------------------------------------
@@ -595,9 +628,7 @@ def presets_menu(config):
         if not names:
             say("  No presets yet - a backup offers to save one when it ends.")
         for index, name in enumerate(names, 1):
-            preset = config["presets"][name]
-            say(f"  [{index}] {name}  ({preset.get('kind', KIND_BACKUP)}: "
-                f"{'; '.join(preset.get('sources', []))} -> {preset.get('dest', '')})")
+            say(f"  [{index}] {_preset_line(name, config['presets'][name])}")
         say("  [N] new verify preset   [D] delete   [0] back")
         answer = ask("Run which preset", "0").casefold()
         if answer == "0":
@@ -618,6 +649,11 @@ def presets_menu(config):
             dest = _locate_backup(preset)
             if dest is None:
                 _backup_not_found(name, preset)
+                continue
+            if preset.get("kind") == KIND_MIRROR:
+                mirror_flow(config, manifest=preset.get("manifest", ""), dest=dest,
+                            backup_id=preset.get("backup_id"), preset_name=name,
+                            captureone=preset.get("captureone", COPY_CAPTUREONE_SETTINGS))
                 continue
             session = session_from(preset)
             session["dest"] = dest
@@ -821,6 +857,172 @@ def manifest_flow(config):
     return rc
 
 
+# ---- Mirror ----------------------------------------------------------------------------------------
+_MIRROR_EXIT_TEXT = {
+    0: "done",
+    1: "finished with problems - read the box above and the log",
+    2: "stopped: nothing changed in the backup (see the message above)",
+    130: "interrupted",
+}
+
+
+def _trash_sentence():
+    """What happens to what leaves the backup, with the day it is deleted."""
+    keep_days = _mirror_setting("MIRROR_KEEP_DAYS")
+    if not keep_days:
+        return "what leaves the backup is DELETED FOR GOOD (no trash: MIRROR_KEEP_DAYS = 0)"
+    until = datetime.date.today() + datetime.timedelta(days=keep_days)
+    return f"what leaves the backup goes to its trash until {until:%Y-%m-%d}"
+
+
+def mirror_menu(config):
+    while True:
+        title("Mirror - the backup follows a manifest")
+        say("  What changed on the source is replaced; what is gone leaves the backup.")
+        keep_days = _mirror_setting("MIRROR_KEEP_DAYS")
+        if keep_days:
+            say(f"  It stays {keep_days} days in the backup's trash first (MIRROR_KEEP_DAYS).")
+        else:
+            say("  No trash: it is deleted for good at once (MIRROR_KEEP_DAYS = 0).", "yellow")
+        say("  [1] Mirror (dry-run first, then mirror)")
+        say("  [2] Total mirror (also removes what came from folders not in this manifest)")
+        say("  [3] What is in the trash (and how to get files back)")
+        say("  [4] Empty the trash")
+        say("  [0] Back")
+        answer = ask("Choose", "0")
+        if answer == "0":
+            return
+        if answer == "1":
+            mirror_flow(config)
+        elif answer == "2":
+            mirror_flow(config, total=True)
+        elif answer == "3":
+            show_trash_flow(config)
+        elif answer == "4":
+            empty_trash_flow(config)
+
+
+def _mirror_dest_default(config):
+    return (config.get("last_mirror_dest") or config.get("last_manifest_dest")
+            or config["last"].get("dest", ""))
+
+
+def mirror_flow(config, total=False, manifest=None, dest=None, backup_id=None,
+                preset_name=None, captureone=None):
+    """Dry-run, then the mirror after an explicit yes (Enter = no). The mirror
+    itself asks for a typed number when something needs it."""
+    if manifest is None:
+        title("Total mirror" if total else "Mirror")
+        if total:
+            say("  A total mirror also removes from the backup what came from folders that are "
+                "not in this manifest.", "yellow")
+        default = config.get("last_mirror_manifest") or config.get("last_manifest") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "backup_manifest.csv")
+        while True:
+            manifest = ask("Manifest file", default).strip().strip('"')
+            if manifest:
+                break
+            say("  Type the manifest file.", "yellow")
+        dest = ask_dest(_mirror_dest_default(config), must_exist=False)
+        config["last_mirror_manifest"] = manifest
+        config["last_mirror_dest"] = dest
+    if captureone is None:
+        captureone = yes_no("Also back up Capture One's own files (profiles, styles, settings)?",
+                            bool(config.get("last_mirror_captureone", COPY_CAPTUREONE_SETTINGS)))
+        config["last_mirror_captureone"] = captureone
+    save_config(config)
+    step = {"dest": dest, "captureone": bool(captureone)}
+    base = _with_backup_id(["--manifest", manifest, "--dest", dest]
+                           + (["--total"] if total else []), backup_id)
+    title("Step 1/2 - what the mirror would do (dry-run, nothing is written)")
+    rc = run_mirror(base + ["--dry-run"])
+    if rc == 2:
+        say(f"Dry-run: {_MIRROR_EXIT_TEXT[2]}.", "red")
+        return rc
+    if rc == 130:
+        return rc
+    captureone_step(step, "dry-run")
+    if rc == 1:
+        say("Some folders or files could not be read: they are NOT backed up, and their lines "
+            "remove nothing (see the log).", "yellow")
+        if not yes_no("Mirror the rest anyway?", False):
+            say("Nothing changed.")
+            return rc
+    say(f"  Read the box above: {_trash_sentence()}.")
+    if not yes_no("Step 2/2 - mirror now?", False):
+        say("Nothing changed.")
+        return 0
+    title("Mirroring")
+    rc = run_mirror(base + ["--yes"])
+    if rc in (0, 1):
+        rc = max(rc, 1 if captureone_step(step, "copy") else 0)
+    say(f"Mirror: {_MIRROR_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "green" if rc == 0 else "yellow")
+    if preset_name is None and not total and rc in (0, 1):
+        offer_mirror_preset(config, manifest, dest, captureone)
+    return rc
+
+
+def show_trash_flow(config):
+    title("What is in the trash")
+    dest = ask_dest(_mirror_dest_default(config), must_exist=True)
+    config["last_mirror_dest"] = dest
+    save_config(config)
+    rc = run_mirror(["--dest", dest, "--show-trash"])
+    if rc != 0:
+        say(f"Trash: {_MIRROR_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "yellow")
+    return rc
+
+
+def empty_trash_flow(config):
+    title("Empty the trash")
+    say("  What is deleted here can NOT be recovered. The mirror empties the trash by itself "
+        "when its date comes.", "yellow")
+    dest = ask_dest(_mirror_dest_default(config), must_exist=True)
+    config["last_mirror_dest"] = dest
+    save_config(config)
+    rc = run_mirror(["--dest", dest, "--empty-trash", "--dry-run"])
+    if rc != 0:
+        say(f"Trash: {_MIRROR_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "yellow")
+        return rc
+    while True:
+        before = ask("Delete only what was taken out before this day (YYYY-MM-DD, "
+                     "Enter = everything listed)", "").strip()
+        if not before:
+            break
+        try:
+            datetime.datetime.strptime(before, "%Y-%m-%d")
+            break
+        except ValueError:
+            say("  Write the day as YYYY-MM-DD, or press Enter.", "yellow")
+    rc = run_mirror(["--dest", dest, "--empty-trash"] + (["--before", before] if before else []))
+    say(f"Trash: {_MIRROR_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "green" if rc == 0 else "yellow")
+    return rc
+
+
+def offer_mirror_preset(config, manifest, dest, captureone):
+    if not yes_no("Save this mirror as a preset (to run it unattended)?", False):
+        return
+    name = ask("Preset name").strip()
+    if not name:
+        return
+    if name in config["presets"] and not yes_no(f"Replace the preset '{name}'?", False):
+        return
+    config["presets"][name] = {"kind": KIND_MIRROR, "manifest": os.path.abspath(manifest),
+                               "dest": dest, "captureone": bool(captureone),
+                               "backup_id": _backend().read_backup_id(dest)}
+    save_config(config)
+    say(f"Saved. Unattended: python photo_backup.py --run-preset \"{name}\"", "green")
+    say("  Unattended, the mirror never deletes for good before the trash's date and stops "
+        "(changing nothing) when something needs a typed number.")
+
+
+def _preset_line(name, preset):
+    if preset.get("kind") == KIND_MIRROR:
+        return f"{name}  (mirror: {preset.get('manifest', '')} -> {preset.get('dest', '')})"
+    return (f"{name}  ({preset.get('kind', KIND_BACKUP)}: "
+            f"{'; '.join(preset.get('sources', []))} -> {preset.get('dest', '')})")
+
+
 def _captureone_folder(config, must_exist):
     """The folder of a Capture One job; the last one is offered again."""
     folder = ask_dest(config.get("captureone_folder") or config["last"].get("dest", ""), must_exist)
@@ -897,6 +1099,9 @@ def settings_menu(config):
                  "COPY_JXLPHOTO_DERIVATIVES", "AUTO_UPDATE",
                  "AUTO_UPDATE_EXTENSIONS", "SPACE_MARGIN_GB", "VERIFY_COPY"):
         say(f"    {name:<26} {_setting(name)!r}")
+    say("  Defaults of mirror_backup.py (edit the top of that file to change them):")
+    for name in ("MIRROR_KEEP_DAYS", "MIRROR_MAX_DELETE_PERCENT", "MIRROR_MAX_DELETE_MIN"):
+        say(f"    {name:<26} {_mirror_setting(name)!r}")
     if yes_no("Forget the remembered choices (presets are kept)?", False):
         config["last"] = {}
         save_config(config)
@@ -915,6 +1120,7 @@ def interactive():
         say("  [5] Restore from a backup")
         say("  [6] Capture One only (back up, restore, force, undo)")
         say("  [7] Manifest (each folder with its own mode)")
+        say("  [8] Mirror (the backup follows a manifest; removes what is gone, through a trash)")
         say("  [0] Exit")
         answer = ask("Choose", "1")
         if answer == "0":
@@ -933,6 +1139,8 @@ def interactive():
             captureone_menu(config)
         elif answer == "7":
             manifest_flow(config)
+        elif answer == "8":
+            mirror_menu(config)
 
 
 def run_preset(name):
@@ -948,9 +1156,19 @@ def run_preset(name):
     if dest is None:
         _backup_not_found(name, preset)
         return 2
+    backup_id = preset.get("backup_id")
+    if preset.get("kind") == KIND_MIRROR:
+        say(f"photo-backup preset '{name}' (mirror, unattended)")
+        say(f"  Manifest:     {preset.get('manifest', '')}\n  Destination:  {dest}")
+        rc = run_mirror(_with_backup_id(["--manifest", preset.get("manifest", ""), "--dest", dest,
+                                         "--unattended"], backup_id))
+        if rc in (0, 1):
+            step = {"dest": dest,
+                    "captureone": bool(preset.get("captureone", COPY_CAPTUREONE_SETTINGS))}
+            rc = max(rc, 1 if captureone_step(step, "copy") else 0)
+        return rc
     session = session_from(preset)
     session["dest"] = dest
-    backup_id = preset.get("backup_id")
     say(f"photo-backup preset '{name}' ({preset.get('kind', KIND_BACKUP)})")
     say(describe(session))
     if preset.get("kind") == KIND_VERIFY:
@@ -976,11 +1194,15 @@ def main(argv=None):
         presets = load_config()["presets"]
         for name in sorted(presets):
             preset = presets[name]
+            if preset.get("kind") == KIND_MIRROR:
+                say(f"{name}\n    mirror: {preset.get('manifest', '')} -> {preset.get('dest', '')}")
+                continue
             say(f"{name}\n    {preset.get('kind', KIND_BACKUP)}: "
                 f"{'; '.join(preset.get('sources', []))} -> {preset.get('dest', '')}")
         if not presets:
             say("(no presets)")
         return 0
+    _menu_title()
     if args.run_preset:
         return run_preset(args.run_preset)
     try:

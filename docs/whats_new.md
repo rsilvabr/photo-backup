@@ -3,6 +3,15 @@
 The short notes of each recent release, newest first; the README keeps the
 current one. Every release in detail: [version_history.md](version_history.md).
 
+## v0.14.0-rc1 (test version, not released yet)
+
+2026-11-19. The mirror, for testing before v0.14.0.
+
+- **`mirror_backup.py`, the mirror**: the backup follows a manifest — what changed is replaced, what is gone leaves the backup, first into a trash for `MIRROR_KEEP_DAYS` (30) days. It removes only what it wrote itself, with proof, and a person types the number of files for anything unusual ([mirror.md](mirror.md)).
+- **A screen made to be read in a hurry**: the verdict first ("N files will be removed: to the trash until ..."), the mirror's box last, right above the question, and where to copy a file back from. `[8] Mirror` in the menu, with "What is in the trash".
+- **The version on the screen and in the backup**: each program shows its name and version (the summary's first line, the mirror's boxes, the console's title), and the catalog records which version created it and which one last changed it.
+- The manifest has an optional `Mirror` column (`disk` / `selection`); `manifest_backup.py` reads it and ignores it.
+
 ## v0.13.2
 
 2026-11-12. Fixes from a third bug sweep: most of them close edge cases where

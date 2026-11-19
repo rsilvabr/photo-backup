@@ -1,9 +1,9 @@
 # The interactive menu (`photo_backup.py`)
 
 The easiest way to use photo-backup. The menu never copies anything itself:
-it runs `selective_backup.py`, `manifest_backup.py`, `restore_backup.py` or
-`captureone_backup.py` with the options you confirmed, so every
-[safety guarantee](safety.md) holds either way.
+it runs `selective_backup.py`, `manifest_backup.py`, `mirror_backup.py`,
+`restore_backup.py` or `captureone_backup.py` with the options you confirmed,
+so every [safety guarantee](safety.md) holds either way.
 
 ```console
 python photo_backup.py
@@ -18,6 +18,7 @@ python photo_backup.py
   [5] Restore from a backup
   [6] Capture One only (back up, restore, force, undo)
   [7] Manifest (each folder with its own mode)
+  [8] Mirror (the backup follows a manifest; removes what is gone, through a trash)
   [0] Exit
 ```
 
@@ -29,6 +30,7 @@ python photo_backup.py
 - **[5] Restore** lists the backup's top folders, asks what to restore and where to (the original places or another folder), runs a dry-run and then restores after a yes. Files that sit loose above the listed folders (directly in the year) have a line of their own, `(files directly in 2025)`, which restores those files only *(v0.13.1)*. See [restoring.md](restoring.md).
 - **[6] Capture One only** backs up just Capture One to a folder you choose, restores from one, force-restores and undoes the last force restore; see [Capture One's own files](captureone.md).
 - **[7] Manifest** asks for a manifest and a destination and offers `[1] Analyze only` (how many bytes each mode would take in each folder), `[2] Back up` or `[3] Verify` (the backup against what the manifest selects); see [Per-folder modes](per_folder_modes.md). `[2] Back up` does what `[1]` does: it asks whether to back up Capture One's own files too and whether to replace originals/exports that changed since the last backup (`--update-changed`; the answers are remembered for the next manifest run), then runs a dry-run with those answers — the Capture One step too — and the copy after a yes. `[3] Verify` asks quick or full, with `full` the "Max GB" (default `VERIFY_MAX_GB` of `selective_backup.py`), and verifies `_captureone` too when the backup has one.
+- **[8] Mirror** runs [`mirror_backup.py`](mirror.md): `[1] Mirror` asks for the manifest and the backup, runs a dry-run (its box, last on the screen, says how many files would leave the backup and until when they stay in the trash), then asks **"Step 2/2 - mirror now?"** — the default is **no**: Enter changes nothing. When something needs it (a line over the limit, not enough space), the mirror itself asks you to type the number of files. After a mirror it offers to save it as a preset. `[2] Total mirror` also removes what came from folders not in the manifest (never as a preset). `[3] What is in the trash` lists what the mirror took out, until when it stays and how to get a file back ([Lost a file?](mirror.md#lost-a-file-getting-it-back)); `[4] Empty the trash` deletes it for good, everything or only what was taken out before a day, after the typed number.
 
 > **Tip:** The value shown in `[brackets]` is the default — just press Enter to accept it.
 
@@ -48,6 +50,8 @@ Start in:  C:\path\to\photo-backup
 ```
 
 The exit code is the backend's (see [Exit codes](commands_and_settings.md#exit-codes)).
+
+A **mirror preset** (saved from `[8] Mirror`) runs its manifest with `mirror_backup.py --unattended`: it never asks anything, never deletes from the trash before its date, and stops with exit 2, changing nothing, when something would need a typed number — a line over the limit, not enough space ([unattended runs of the mirror](mirror.md#unattended-runs)). A total mirror is never a preset.
 
 ## Run it after jxl-photo
 
@@ -76,7 +80,7 @@ instead of repeating it:
 | Constant | Default | Meaning |
 |---|---|---|
 | `CONFIG_PATH` | `$PHOTOBACKUP_CONFIG` or `%USERPROFILE%\.photo_backup_config.json` | the remembered choices and the presets |
-| `BACKEND`, `RESTORE`, `CAPTUREONE`, `MANIFEST_BACKEND` | the scripts next to it | what the menu runs |
+| `BACKEND`, `RESTORE`, `CAPTUREONE`, `MANIFEST_BACKEND`, `MIRROR_BACKEND` | the scripts next to it | what the menu runs |
 | `COPY_CAPTUREONE_SETTINGS` | `True` | every backup and verify of the menu also keeps (and checks) Capture One's own files |
 | `VERIFY_MODE` | `quick` | the verify mode the menu offers first: `quick` or `full` |
 | `MAX_ONLY_CHARS` | `20000` | `[5] Restore`: the most `--only` text one command may carry (Windows takes about 32 000 characters); a longer choice asks for the folder above *(v0.13.1)* |
