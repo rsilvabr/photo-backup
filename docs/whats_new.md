@@ -3,6 +3,17 @@
 The short notes of each recent release, newest first; the README keeps the
 current one. Every release in detail: [version_history.md](version_history.md).
 
+## v0.14.0-rc5 (test version, not released yet)
+
+2026-11-20. A summary you read at a glance, the conversions where you want
+them, and the conversion off for a trip. Needs jxl-photo 2.31.0-rc1, as rc4. Everything of rc4, rc3, rc2 and rc1
+below holds.
+
+- **The summary in tables**: "This run", "In the backup, not on the source (orphans)" and "Not copied" are tables of files and sizes, one fact per line (the categories to copy each on a row with a plain name; the orphans by reason); counts with thousands separators and sizes in TB from 1,000 GB on, everywhere; up to three sources by name, else how many and the first and last; the CSVs and the log named once, at the end, with what each holds and their folder; `Space` stays the last line, right above the question.
+- **Ctrl+C stops in seconds, and says so**: at once `Ctrl+C: stopping at a safe point...`; the conversions running are ended (with the cjxl and exiftool jxl-photo started) instead of waited for, a group's names and catalog rows go together, the catalog is written, and only then `Stopped (Ctrl+C) ... the disk can be removed`. A longer stop says `still stopping: ...` every few seconds; a second Ctrl+C stops waiting (the next run cleans up). The restore does the same. Every line now reaches a pipe or a file as it is printed (a scheduled run's log no longer lags minutes behind).
+- **The conversions where you want them**: `--work-dir` says where this run converts (default `JXL_WORK_DIR`: the system's temp folder), checked as that setting is, and the menu remembers one per computer (`[4] Settings` → "Set where the conversions run") — a work folder on another disk spares the system's SSD. jxl-photo's own temp files now go into each conversion's folder too (before, into the system's temp folder whatever `JXL_WORK_DIR` said) and leave with it; the restore's, into its own folder next to the target.
+- **The conversion off, for a trip with a slow computer**: `--no-convert` (or `[4] Settings` → "Turn the conversion off on this computer", which the menu's first screen then shows) keeps the manifest as it is and converts nothing: the JXL already in the backup stay, a new or changed TIFF or JPEG is copied as it is (not a failure; an outdated JXL to `versions\` after the copy), no jxl-photo needed. Back home, a run with the conversion on makes them JXL.
+
 ## v0.14.0-rc4 (test version, not released yet)
 
 2026-11-20. Faster, every TIFF page checked, and the conversions out of the

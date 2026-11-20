@@ -52,6 +52,8 @@ selective_backup.py --source PATH [--source PATH ...] --dest PATH [options]
 | `--tiff {copy,PROFILE}` | the TIFFs outside export folders: copied as they are (`copy`, default) or kept as JXL with a profile of `TIFF_JXL_PROFILES`, made by jxl-photo *(v0.14.0-rc2; [TIFF kept as JXL](tiff_to_jxl.md))* |
 | `--jpeg {copy,jxl}` | the JPEGs (exports too): copied as they are (`copy`, default) or kept as JXL by jxl-photo's lossless transcode, proven byte for byte *(v0.14.0-rc3)* |
 | `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, for `--tiff` and `--jpeg` (default `JXLPHOTO`). A run that asks for either without jxl-photo is refused before anything is read, exit 2 |
+| `--no-convert` | the conversion off for this run (a slow computer, a trip): a TIFF or JPEG that `--tiff`/`--jpeg` would convert is copied as it is, not a failure; the JXL already in the backup stay unless their file changed; no jxl-photo needed *(v0.14.0-rc5; [the conversion off](tiff_to_jxl.md#the-conversion-off-a-trip-with-a-slow-computer))* |
+| `--work-dir PATH` | where the conversions of `--tiff` and `--jpeg` run, jxl-photo's temp files too (default `JXL_WORK_DIR`; empty = the system's temp folder); never inside or above a source or the backup, exit 2 *(v0.14.0-rc5)* |
 | `--expect-backup-id ID` | abort (exit 2) unless the destination holds this backup ID; also applies to `--verify` and `--dry-run` |
 | `--space-margin-gb N` | free space kept on the destination, in GB (default `20.0`) |
 | `--dry-run` | plan, print the summary and write the logs/CSVs; copy nothing |
@@ -140,7 +142,7 @@ TIFF and JPEG kept as JXL in the backup, and the programs kept in it
 | `JXL_TIFF_WORKERS` | `0` | of those, TIFFs at the same time; `0` = a quarter of the logical CPUs, at most one per 4 GB of free memory |
 | `DJXL` | `""` | libjxl's `djxl` for the proof and the restore of a JPEG; `""` = PATH; `"none"` = through jxl-photo |
 | `JXL_TIMEOUT_MIN` | `30` | a conversion longer than this is given up: the file is copied as it is |
-| `JXL_WORK_DIR` | `""` | where the conversions run; `""` = the system's temp folder. One writer then copies each finished JXL into the backup |
+| `JXL_WORK_DIR` | `""` | where the conversions run, jxl-photo's temp files too; `""` = the system's temp folder (`--work-dir` for one run; the menu remembers one per computer). One writer then copies each finished JXL into the backup |
 | `JXL_WORK_FOLDER` | `pbconv` | photo-backup's folder inside `JXL_WORK_DIR`: one per running backup (its process number), removed at the end |
 | `KEEP_TOOLS_IN_BACKUP` | `True` | every real run keeps photo-backup and jxl-photo in the backup, one folder per version |
 | `KEEP_TOOLS_EXTRA` | `()` | more files or folders kept there (the `.zip` of photo-backup-exe, say) |
@@ -248,7 +250,7 @@ manifest still writes its 83 MB every time.
 | 0 | everything fine (also a dry-run without read errors) |
 | 1 | finished with file errors or unreadable folders (a dry-run too), the destination stopped taking writes, or verify found a problem |
 | 2 | aborted before copying: usage error (a `--space-margin-gb` or `--max-gb` that is not a number, *v0.13.2*), not enough space, destination not available, a destination that is really inside a source (a junction or a `subst` letter, *v0.13.2*), no confirmation, bad or damaged catalog (a row leading outside the backup too, *v0.13.2*), a plan that would write into `_photo_backup` |
-| 130 | interrupted with Ctrl+C (partial summary; the temp file is removed; a verify keeps what it had checked) |
+| 130 | interrupted with Ctrl+C (partial summary; the temp file is removed; a verify keeps what it had checked). Since *v0.14.0-rc5* it says so at once, ends the conversions running instead of waiting for them, writes the catalog and ends with `Stopped (Ctrl+C) ... the disk can be removed` ([safety.md](safety.md)) |
 
 The restore has its own ([restoring.md](restoring.md)); `manifest_backup.py`
 uses these.

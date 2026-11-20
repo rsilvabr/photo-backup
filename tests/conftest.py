@@ -31,6 +31,8 @@ def photobackup_log_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(selective_backup, "JXL_WORK_DIR", str(tmp_path / "work"))
     monkeypatch.setattr(selective_backup, "_jxl_copy_needed", lambda work_root, dest: True)
     log_dir.mkdir(parents=True, exist_ok=True)
+    # a Ctrl+C a test pressed (v0.14.0-rc5) never reaches the next test
+    selective_backup._STOPPING.clear()
     # No test may ever read the real Capture One folders of this computer.
     empty = tmp_path / "no_capture_one"
     empty.mkdir(exist_ok=True)

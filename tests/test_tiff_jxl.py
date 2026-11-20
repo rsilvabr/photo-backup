@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import threading
 import time
@@ -70,7 +71,8 @@ def env(request, tmp_path, monkeypatch):
     monkeypatch.setattr(sb, "JXL_WORKERS", 2)
     monkeypatch.setenv("FAKE_JXLPHOTO_CALLS", str(calls))
     for name in ("FAKE_JXLPHOTO_FAIL", "FAKE_JXLPHOTO_ONLY", "FAKE_JXLPHOTO_DECODE_FAIL",
-                 "FAKE_JXLPHOTO_VERSION", "FAKE_JXLPHOTO_ENVS"):
+                 "FAKE_JXLPHOTO_VERSION", "FAKE_JXLPHOTO_ENVS", "FAKE_JXLPHOTO_LEAK_TEMP",
+                 "FAKE_JXLPHOTO_SLEEP", "FAKE_JXLPHOTO_SLEEP_ONLY", "FAKE_JXLPHOTO_SLEEP_PIDS"):
         monkeypatch.delenv(name, raising=False)
     if request.param == "rename":
         monkeypatch.setattr(sb, "_jxl_copy_needed", lambda work_root, dest: False)
@@ -827,7 +829,7 @@ REAL_COPY_NEEDED = sb._jxl_copy_needed         # conftest puts a stand-in for ev
 REAL_DJXL_ON_PATH = sb._djxl_on_path
 
 
-# ---- J37-J44 the findings of the rc4 review ------------------------------------------------------
+# ---- J37-J43 the findings of the rc4 review ------------------------------------------------------
 def test_j37_a_work_folder_name_that_is_not_one_name_is_refused(env, monkeypatch, capsys):
     for name in ("", " ", "..", ".", "a\\b", "a/b", "C:"):
         monkeypatch.setattr(sb, "JXL_WORK_FOLDER", name)
@@ -854,7 +856,7 @@ def test_j38_the_default_work_folder_is_checked_too(env, monkeypatch, capsys):
 
 def test_j39_a_work_folder_that_cannot_be_made_copies_every_file(env, monkeypatch,
                                                                 photobackup_log_dir):
-    def cannot():
+    def cannot(work_dir=None):
         raise OSError("the disk of the work folder is gone (test)")
     monkeypatch.setattr(sb, "_work_root", cannot)
     assert backup(env, "--tiff", "jxl") == 1                # no traceback, nothing left out
@@ -922,6 +924,184 @@ def test_j43_djxl_is_looked_for_on_path(tmp_path, monkeypatch):
     assert REAL_DJXL_ON_PATH() is not None
 
 
+# ---- J44-J45 where the conversions run (v0.14.0-rc5) ---------------------------------------------
+def env_calls(envs, command):
+    calls = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(envs.glob("*.json"))]
+    return [call for call in calls if call["argv"][0] == command and "--version" not in call["argv"]]
+
+
+def test_j44_jxlphotos_own_temp_files_stay_in_the_conversions_folder(env, monkeypatch):
+    """TMPDIR, TEMP and TMP of each jxl-photo call are its conversion's own
+    folder: nothing of a conversion goes to the system's temp folder (the
+    owner's SSD), and what jxl-photo leaves there leaves with the folder."""
+    envs = env.root / "envs"
+    monkeypatch.setenv("FAKE_JXLPHOTO_ENVS", str(envs))
+    monkeypatch.setenv("FAKE_JXLPHOTO_LEAK_TEMP", "1")      # a temp file it never removes
+    assert backup(env, "--tiff", "jxl") == 0
+    assert backed(env.dest) == OTHERS | JXL
+    work_root = Path(sb.JXL_WORK_DIR, sb.JXL_WORK_FOLDER, str(os.getpid()))
+    calls = env_calls(envs, "encode")
+    assert len(calls) == 3
+    for call in calls:
+        temp = Path(call["argv"][2]) / "temp"
+        assert temp.parent.parent == work_root
+        assert [Path(call[name]) for name in ("TMPDIR", "TEMP", "TMP")] == [temp] * 3
+        assert Path(call["gettempdir"]) == temp             # what jxl-photo's tempfile uses
+    assert no_work_left(env)
+    monkeypatch.setenv("FAKE_JXLPHOTO_ENVS", str(envs / "restore"))   # the restore's own folder
+    assert restore(env, "--to", env.out) == 0
+    for call in env_calls(envs / "restore", "decode"):
+        work = Path(call["argv"][1]).parent             # <restore folder>\jxl -> the folder
+        assert Path(call["gettempdir"]) == work / "temp"
+        assert not work.exists()
+    assert not [path for path in env.out.rglob("*") if "fake_jxlphoto_" in path.name]
+
+
+def test_j45_work_dir_says_where_the_conversions_run(env, monkeypatch, capsys):
+    """--work-dir (what the menu remembers on a computer) for one run, checked
+    like JXL_WORK_DIR, and handed on by the manifest and the mirror."""
+    elsewhere = env.root.parent / "E_TEMP"
+    elsewhere.mkdir()
+    envs = env.root / "envs"
+    monkeypatch.setenv("FAKE_JXLPHOTO_ENVS", str(envs))
+    assert backup(env, "--tiff", "jxl", "--work-dir", str(elsewhere)) == 0
+    here = elsewhere / sb.JXL_WORK_FOLDER / str(os.getpid())
+    assert {Path(call["argv"][2]).parent for call in env_calls(envs, "encode")} == {here}
+    assert not here.exists() and backed(env.dest) == OTHERS | JXL
+    assert not Path(sb.JXL_WORK_DIR, sb.JXL_WORK_FOLDER, str(os.getpid())).exists()
+    capsys.readouterr()
+    missing, inside = env.root / "missing", env.src / "2025"
+    assert backup(env, "--tiff", "jxl", "--work-dir", str(missing)) == 2
+    assert "--work-dir does not exist" in capsys.readouterr().err
+    assert backup(env, "--tiff", "jxl", "--work-dir", str(inside)) == 2
+    assert "--work-dir overlaps a source" in capsys.readouterr().err
+    man = write_manifest(env.root / "m.csv", (env.src / "2025", "6", "", "", "jxl"))
+    dest2 = env.root / "dest2"
+    for main in (mb.main, mir.main):
+        assert main(["--manifest", str(man), "--dest", str(dest2), "--yes",
+                     "--work-dir", str(missing)]) == 2
+        assert "--work-dir does not exist" in capsys.readouterr().err
+    assert not dest2.exists()
+    shutil.rmtree(envs)
+    assert mb.main(["--manifest", str(man), "--dest", str(dest2), "--yes",
+                    "--work-dir", str(elsewhere)]) == 0
+    assert {Path(call["argv"][2]).parent for call in env_calls(envs, "encode")} == {here}
+    assert not here.exists()
+
+
+# ---- J46-J49 Ctrl+C stops in seconds, and says so (v0.14.0-rc5) -----------------------------------
+def test_j46_ctrl_c_ends_the_conversions_at_once_and_says_so(env, monkeypatch, capsys):
+    """The owner (20/11): a stop must never look like a hang. Ctrl+C while a
+    TIFF takes 60 s: the run says it stops, ends that conversion instead of
+    waiting for it, keeps what was placed (catalog written) and says last that
+    the disk can be removed; the next run goes on."""
+    pids = env.root / "pids"
+    monkeypatch.setattr(sb, "JXL_TIFF_WORKERS", 2)     # 000038 sleeps while the others go on
+    monkeypatch.setenv("FAKE_JXLPHOTO_SLEEP", "60")
+    monkeypatch.setenv("FAKE_JXLPHOTO_SLEEP_ONLY", "000038")
+    monkeypatch.setenv("FAKE_JXLPHOTO_SLEEP_PIDS", str(pids))
+    real_wait, real_place = sb._wait_futures, sb._place_group
+    placed, state = [], {"pressed": False}
+
+    def place(*args, **kwargs):
+        result = real_place(*args, **kwargs)
+        placed.append(args[0].planned.rel)
+        return result
+
+    def wait(fs, *args, **kwargs):
+        if not state["pressed"] and len(placed) == 2 and list(pids.glob("*.pid")):
+            state["pressed"] = True
+            signal.raise_signal(signal.SIGINT)          # Ctrl+C while 000038 converts
+        return real_wait(fs, *args, **kwargs)
+    monkeypatch.setattr(sb, "_place_group", place)
+    monkeypatch.setattr(sb, "_wait_futures", wait)
+    started = time.monotonic()
+    assert backup(env, "--tiff", "jxl") == 130
+    assert time.monotonic() - started < 30              # not the 60 s of the conversion
+    out = capsys.readouterr().out
+    assert sb.STOP_SAYING in out and out.rstrip().endswith(sb.STOPPED_SAYING)
+    assert out.index(sb.STOP_SAYING) < out.index(sb.STOPPED_SAYING)
+    assert list(pids.glob("*.pid"))
+    for pid in pids.glob("*.pid"):
+        assert not sb._pid_alive(int(pid.stem))         # ended, not waited for
+    have = backed(env.dest)
+    assert not {rel for rel in have if "000038" in rel}  # neither a JXL nor a copy as it is
+    assert {"2025/shoot/DSC_0001.tif.jxl", "2025/scans/000037.tiff.jxl"} <= have
+    assert {rel.casefold() for rel in have if rel.endswith(".jxl")} == set(converted(env.dest))
+    assert no_work_left(env)
+    for name in ("FAKE_JXLPHOTO_SLEEP", "FAKE_JXLPHOTO_SLEEP_ONLY"):
+        monkeypatch.delenv(name)
+    assert backup(env, "--tiff", "jxl") == 0            # the next run goes on from there
+    assert backed(env.dest) == OTHERS | JXL
+    assert not under(env.dest, VERSIONS)
+
+
+def test_j47_ctrl_c_waits_for_a_groups_names_and_rows(env, monkeypatch, capsys):
+    """Ctrl+C right after a JXL took its name: the group's other names and its
+    catalog rows are written first, so no JXL is left without its row (before
+    rc5 the next run set such a group aside to versions\\ and made it again)."""
+    real = sb._rename_no_clobber
+    state = {"pressed": False}
+
+    def rename(source, target):
+        real(source, target)
+        if not state["pressed"] and str(target).endswith(".jxl"):
+            state["pressed"] = True
+            signal.raise_signal(signal.SIGINT)
+    monkeypatch.setattr(sb, "_rename_no_clobber", rename)
+    assert backup(env, "--tiff", "jxl") == 130
+    assert capsys.readouterr().out.rstrip().endswith(sb.STOPPED_SAYING)
+    jxl_files = {rel.casefold() for rel in backed(env.dest) if rel.endswith(".jxl")}
+    assert jxl_files and jxl_files == set(converted(env.dest))
+    assert no_work_left(env)
+    monkeypatch.setattr(sb, "_rename_no_clobber", real)
+    assert backup(env, "--tiff", "jxl") == 0
+    assert backed(env.dest) == OTHERS | JXL
+    assert not under(env.dest, VERSIONS)                # nothing had to be set aside
+
+
+def test_j48_a_work_folder_that_cannot_go_yet_keeps_its_mark(tmp_path):
+    """A file still held (a converter ended by Ctrl+C) keeps the run's mark,
+    so a later run can still sweep the folder: never a folder left unmarked."""
+    root = tmp_path / "pbconv" / "424242"
+    (root / "7" / "temp").mkdir(parents=True)
+    (root / sb._WORK_MARK).write_text("mark", encoding="utf-8")
+    held = root / "7" / "page.jxl"
+    held.write_bytes(b"x")
+    with open(held, "rb"):
+        sb._remove_work_root(str(root))
+        if os.name == "nt":                             # Windows keeps an open file
+            assert held.exists() and sb._ours_to_sweep(str(root))
+    sb._remove_work_root(str(root))
+    assert not root.exists()
+
+
+def test_j49_ctrl_c_in_a_restore_ends_what_is_being_made(env, monkeypatch, capsys):
+    assert backup(env, "--tiff", "jxl") == 0
+    pids = env.root / "pids"
+    monkeypatch.setenv("FAKE_JXLPHOTO_SLEEP", "60")
+    monkeypatch.setenv("FAKE_JXLPHOTO_SLEEP_PIDS", str(pids))
+    real = rb.as_completed
+
+    def pressed(futures, *args, **kwargs):
+        deadline = time.monotonic() + 20                # until a TIFF is being made
+        while time.monotonic() < deadline and not list(pids.glob("*.pid")):
+            time.sleep(0.1)
+        signal.raise_signal(signal.SIGINT)
+        return real(futures, *args, **kwargs)
+    monkeypatch.setattr(rb, "as_completed", pressed)
+    started = time.monotonic()
+    assert restore(env, "--to", env.out) == 130
+    assert time.monotonic() - started < 30
+    out = capsys.readouterr().out
+    assert sb.STOP_SAYING in out and "Stopped (Ctrl+C)" in out
+    assert list(pids.glob("*.pid"))
+    for pid in pids.glob("*.pid"):
+        assert not sb._pid_alive(int(pid.stem))
+    assert restored(env) == OTHERS                      # the plain files; no TIFF half made
+    assert not [path for path in env.out.rglob("*") if ".restoring_" in path.name]
+
+
 def test_j36_the_restore_runs_a_kept_jxlphoto_older_than_a_backup_needs(env, monkeypatch,
                                                                         photobackup_log_dir):
     monkeypatch.setattr(sb, "KEEP_TOOLS_IN_BACKUP", True)
@@ -931,3 +1111,62 @@ def test_j36_the_restore_runs_a_kept_jxlphoto_older_than_a_backup_needs(env, mon
     sb._JXLPHOTO_VERSIONS.clear()
     assert restore(env, "--to", env.out) == 0
     assert restored(env) == OTHERS | TIFFS
+
+
+# ---- J50 the conversion off for a run: --no-convert (v0.14.0-rc5) ----------------------------------
+def test_j50_no_convert_copies_tiffs_as_they_are_and_keeps_the_jxl(env, monkeypatch, capsys):
+    """A trip with a slow computer: no jxl-photo, no djxl needed; a new or
+    changed TIFF is copied as it is (the outdated JXL to versions, after the
+    copy), a JXL of an unchanged TIFF stays even when the profile changed; the
+    next run with it changes nothing; a run without it converts them."""
+    assert backup(env, "--tiff", "jxl") == 0
+    assert len(encodes(env)) == 3
+    new_tiff = env.src / "2025/scans/000039.tif"
+    new_tiff.write_text("SCAN 000039 " * 40, encoding="utf-8")
+    tiff = env.src / "2025/scans/000037.tiff"
+    tiff.write_text(SCAN_B + "edited", encoding="utf-8")
+    stat = tiff.stat()
+    os.utime(tiff, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10_000_000_000))
+    monkeypatch.setattr(sb, "TIFF_JXL_PROFILES",
+                        {"jxl": {"distance": 0.1, "scan_distance": 0, "eight_bit_distance": 0}})
+    monkeypatch.setattr(sb, "JXLPHOTO", str(env.root / "no-jxl-photo.py"))
+    monkeypatch.setattr(sb, "_djxl_on_path", lambda: None)
+    capsys.readouterr()
+    assert backup(env, "--tiff", "jxl", "--update-changed", "--no-convert") == 0
+    out = capsys.readouterr().out
+    assert len(encodes(env)) == 3                       # nothing converted
+    assert row_count(out, "TIFF: copied as they are (conversion off)") == "2"
+    assert row_count(out, "TIFF: already in the backup (JXL or not)") == "2"
+    assert "Conversion off: 2 TIFF/JPEG kept as they are" in out
+    kept = JXL - {"2025/scans/000037.tiff.jxl"}
+    assert backed(env.dest) == OTHERS | kept | {"2025/scans/000037.tiff", "2025/scans/000039.tif"}
+    assert "2025/scans/000037.tiff.jxl" in under(env.dest, VERSIONS)
+    assert (env.dest / "2025/scans/000037.tiff").read_bytes() == tiff.read_bytes()
+    assert {settings for *_rest, settings in converted(env.dest).values()} == {SETTINGS}
+    assert no_work_left(env)
+    # again with it: everything is there, nothing moves
+    assert backup(env, "--tiff", "jxl", "--update-changed", "--no-convert") == 0
+    out = capsys.readouterr().out
+    assert row_count(out, "TIFF: copied as they are (conversion off)") == "0"
+    assert row_count(out, "TIFF: already in the backup (JXL or not)") == "4"
+    assert under(env.dest, VERSIONS) == {"2025/scans/000037.tiff.jxl"}
+    # back home, without it: what was copied as it is becomes JXL, and the new
+    # profile makes the others again
+    monkeypatch.setattr(sb, "JXLPHOTO", str(env.tool))
+    monkeypatch.setattr(sb, "_djxl_on_path", lambda: "djxl")
+    assert backup(env, "--tiff", "jxl", "--update-changed") == 0
+    assert len(encodes(env)) == 3 + 4
+    assert backed(env.dest) == OTHERS | JXL | {"2025/scans/000039.tif.jxl"}
+    assert {"2025/scans/000037.tiff", "2025/scans/000039.tif"} <= under(env.dest, VERSIONS)
+    # the manifest and the mirror take it too, without jxl-photo
+    monkeypatch.setattr(sb, "JXLPHOTO", str(env.root / "no-jxl-photo.py"))
+    monkeypatch.setattr(sb, "_djxl_on_path", lambda: None)
+    man = write_manifest(env.root / "m.csv", (env.src / "2025", "6", "", "", "jxl"))
+    for main, dest in ((mb.main, env.root / "dest2"), (mir.main, env.root / "dest3")):
+        assert main(["--manifest", str(man), "--dest", str(dest), "--yes",
+                     "--jxlphoto", str(env.root / "no-jxl-photo.py"), "--no-convert"]) == 0
+        files = backed(dest)
+        assert not {name for name in files if name.endswith(".jxl")}
+        assert {name.rsplit("/", 1)[-1] for name in files} >= {
+            "DSC_0001.tif", "000037.tiff", "000038.tif", "000039.tif"}
+    assert len(encodes(env)) == 7

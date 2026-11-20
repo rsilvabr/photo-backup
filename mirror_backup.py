@@ -53,7 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 import manifest_backup as mb
 
-__version__ = "0.14.0-rc4"
+__version__ = "0.14.0-rc5"
 
 # ---- Settings -------------------------------------------------------------------
 MIRROR_KEEP_DAYS = 30               # days a file the mirror removed or replaced stays in the trash
@@ -250,12 +250,15 @@ def _plain_backend_args(args, extra):
         argv += ["--source", source]
     argv += ["--dest", os.path.abspath(args.dest),
              "--jxlphoto", args.jxlphoto,
+             "--work-dir", args.work_dir,
              "--export-formats", args.export_formats,
              "--verify-copy", args.verify_copy,
              "--space-margin-gb", str(args.space_margin_gb),
              "--update-changed"]
     if args.base:
         argv += ["--base", args.base]
+    if args.no_convert:
+        argv.append("--no-convert")
     if args.expect_backup_id:
         argv += ["--expect-backup-id", args.expect_backup_id]
     if args.dry_run:
@@ -1805,6 +1808,13 @@ def build_parser():
     parser.add_argument("--jxlphoto", default=sb.JXLPHOTO, metavar="PATH",
                         help="jxl-photo's jxl_photo.py or jxl-photo.exe, for TIFFs kept as JXL "
                              "(a manifest's Tiff column, or --tiff; default: JXLPHOTO)")
+    parser.add_argument("--work-dir", default=sb.JXL_WORK_DIR, metavar="PATH",
+                        help="where the conversions run, each in a folder of its own "
+                             "(default: JXL_WORK_DIR; empty = the system's temp folder)")
+    parser.add_argument("--no-convert", action="store_true",
+                        help="the conversion off for this run: what would be converted is "
+                             "copied as it is; the JXL already in the backup stay, unless "
+                             "their file changed")
     parser.add_argument("--expect-backup-id", default=None, metavar="ID",
                         help="abort unless the destination holds this backup ID")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -1812,10 +1822,8 @@ def build_parser():
 
 
 def main(argv=None):
-    try:                        # a cp1252 console cannot print the owner's ～ paths
-        sys.stdout.reconfigure(errors="replace")
-    except (AttributeError, OSError):
-        pass
+    sb._start_output()          # ～ paths on a cp1252 console; each line out at once
+    sb._STOPPING.clear()
     sb._set_console_title(sb._program_name("mirror_backup"))
     parser = build_parser()
     try:
@@ -1844,7 +1852,8 @@ def main(argv=None):
             return 2
         backend_args = _manifest_backend_args(args, rows)
         errors = mb._validate_rows(backend_args, rows)
-        errors += mb._tiff_rows_errors(rows, args.jxlphoto, args.dest)
+        if not args.no_convert:
+            errors += mb._tiff_rows_errors(rows, args.jxlphoto, args.dest, args.work_dir)
     else:
         rows = modes = None
         try:

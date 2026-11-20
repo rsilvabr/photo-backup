@@ -20,7 +20,14 @@ JXL without marks, and gives them back with --format jpeg. The environment
                          exit | none | mismatch (transcode): how it fails; verify:
                          page 1 fails the page check (JP-20) and the run ends the
                          way jxl-photo's does (ERROR line, then a summary), exit 1
-    FAKE_JXLPHOTO_ENVS   a folder: each call writes the JXLPHOTO_* variables it got
+    FAKE_JXLPHOTO_ENVS   a folder: each call writes the JXLPHOTO_* variables it got,
+                         TMPDIR, TEMP, TMP and Python's tempfile.gettempdir()
+    FAKE_JXLPHOTO_LEAK_TEMP  any value: a call leaves a file in its temp folder (as
+                         jxl-photo's exiftool argument files could)
+    FAKE_JXLPHOTO_SLEEP  seconds a call waits before it works (a long conversion);
+                         FAKE_JXLPHOTO_SLEEP_ONLY: only for a file (or a folder holding
+                         one) whose name holds this text; FAKE_JXLPHOTO_SLEEP_PIDS: a
+                         folder where each waiting call writes <its process id>.pid
 Like jxl-photo, every command writes a log in JXLPHOTO_LOG_DIR\\<backend>\\.
     FAKE_JXLPHOTO_ONLY   fail only for a file whose name holds this text
     FAKE_JXLPHOTO_DECODE_FAIL   any value: decode (and the JPEG rebuild) stop with exit 1
@@ -34,6 +41,7 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import time
 
 VERSION = os.environ.get("FAKE_JXLPHOTO_VERSION", "9.9.9")    # "none": no version said
@@ -214,8 +222,26 @@ def main(argv):
         os.makedirs(envs, exist_ok=True)
         name = f"{time.time_ns():020d}_{os.getpid()}.json"
         with open(os.path.join(envs, name), "w", encoding="utf-8") as handle:
-            json.dump({"argv": argv, **{key: value for key, value in os.environ.items()
-                                        if key.startswith("JXLPHOTO_")}}, handle)
+            json.dump({"argv": argv, "gettempdir": tempfile.gettempdir(),
+                       **{key: value for key, value in os.environ.items()
+                          if key.startswith("JXLPHOTO_") or key in ("TMPDIR", "TEMP", "TMP")}},
+                      handle)
+    if os.environ.get("FAKE_JXLPHOTO_LEAK_TEMP") and "--version" not in argv:
+        with tempfile.NamedTemporaryFile("w", prefix="fake_jxlphoto_", suffix=".args",
+                                         delete=False) as leaked:
+            leaked.write("left behind\n")
+    sleep = os.environ.get("FAKE_JXLPHOTO_SLEEP")
+    if sleep and "--version" not in argv and len(argv) > 1:
+        only = os.environ.get("FAKE_JXLPHOTO_SLEEP_ONLY", "")
+        target = argv[1]
+        names = os.listdir(target) if os.path.isdir(target) else [os.path.basename(target)]
+        if not only or any(only in name for name in names):
+            pids = os.environ.get("FAKE_JXLPHOTO_SLEEP_PIDS")
+            if pids:
+                os.makedirs(pids, exist_ok=True)
+                with open(os.path.join(pids, f"{os.getpid()}.pid"), "w") as handle:
+                    handle.write("waiting\n")
+            time.sleep(float(sleep))
     code = run(argv)
     write_log(argv, code)
     return code

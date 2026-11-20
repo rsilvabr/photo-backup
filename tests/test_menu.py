@@ -320,13 +320,15 @@ def test_settings_remember_jxlphoto_after_checking_it(tmp_path, monkeypatch, men
     tool.parent.mkdir()
     shutil.copy2(Path(__file__).with_name("fake_jxlphoto.py"), tool)
     monkeypatch.delenv("FAKE_JXLPHOTO_VERSION", raising=False)
-    script(monkeypatch, ["y", str(tmp_path / "missing.py"), "n"])
+    # answers: jxl-photo? its path; the work folder? (rc5) no; the conversion off? no;
+    # forget the choices? no
+    script(monkeypatch, ["y", str(tmp_path / "missing.py"), "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert "jxlphoto" not in menu.load_config()                 # not found: not saved
-    script(monkeypatch, ["y", f'"{tool}"', "n"])
+    script(monkeypatch, ["y", f'"{tool}"', "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["jxlphoto"] == str(tool)
-    script(monkeypatch, ["y", "-", "n"])
+    script(monkeypatch, ["y", "-", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["jxlphoto"] == ""
 
@@ -352,6 +354,78 @@ def test_the_scripts_get_the_remembered_jxlphoto(monkeypatch, menu_config):
     assert tails[2][-2:] == tails[3][-2:] == ["--jxlphoto", r"C:\jxl\jxl_photo.py"]
     assert tails[4] == ["--backup", "B", "--jxlphoto", r"C:\other.py"]
     assert tails[5] == ["--dest", "D"]
+
+
+# ---- v0.14.0-rc5: the menu remembers the conversions' work folder -------------------------------
+def test_settings_remember_the_work_folder_when_it_exists(tmp_path, monkeypatch, menu_config):
+    work = tmp_path / "TEMP"
+    work.mkdir()
+    # answers: jxl-photo? no; the work folder? yes, its path; the conversion off? no;
+    # forget the choices? no
+    script(monkeypatch, ["n", "y", str(tmp_path / "missing"), "n", "n"])
+    menu.settings_menu(menu.load_config())
+    assert "work_dir" not in menu.load_config()                 # not a folder: not saved
+    script(monkeypatch, ["n", "y", f'"{work}"', "n", "n"])
+    menu.settings_menu(menu.load_config())
+    assert menu.load_config()["work_dir"] == str(work)
+    script(monkeypatch, ["n", "y", "-", "n", "n"])
+    menu.settings_menu(menu.load_config())
+    assert menu.load_config()["work_dir"] == ""
+
+
+def test_the_backups_get_the_remembered_work_folder(monkeypatch, menu_config):
+    """Only the scripts that convert get it (the restore works next to its
+    target), and a --work-dir already given wins."""
+    commands = []
+
+    class Done:
+        returncode = 0
+    monkeypatch.setattr(menu.subprocess, "run", lambda command, **kwargs: commands.append(
+        command) or Done())
+    monkeypatch.setattr(menu, "_menu_title", lambda: None)
+    menu.run_backend(["--source", "S"])                         # nothing remembered
+    menu_config.write_text(json.dumps({"work_dir": r"E:\TEMP"}), encoding="utf-8")
+    menu.run_manifest(["--manifest", "m.csv"])
+    menu.run_mirror(["--dest", "D"])
+    menu.run_backend(["--source", "S", "--work-dir", r"F:\other"])  # named: kept
+    menu.run_restore(["--backup", "B"])
+    menu.run_captureone(["--dest", "D"])
+    tails = [command[2:] for command in commands]
+    assert tails[0] == ["--source", "S"]
+    assert tails[1] == ["--manifest", "m.csv", "--work-dir", r"E:\TEMP"]
+    assert tails[2] == ["--dest", "D", "--work-dir", r"E:\TEMP"]
+    assert tails[3] == ["--source", "S", "--work-dir", r"F:\other"]
+    assert tails[4] == ["--backup", "B"]
+    assert tails[5] == ["--dest", "D"]
+
+
+def test_the_conversion_off_on_this_computer(monkeypatch, menu_config):
+    """[4] Settings turns the conversion off (a trip with a slow computer): the
+    backups get --no-convert, a verify, the restore and Capture One never; the
+    menu says so on top; the same question turns it back on."""
+    # answers: jxl-photo? no; the work folder? no; the conversion off? yes; forget? no
+    script(monkeypatch, ["n", "n", "y", "n"])
+    menu.settings_menu(menu.load_config())
+    assert menu.load_config()["no_convert"] == "yes"
+    commands = []
+
+    class Done:
+        returncode = 0
+    monkeypatch.setattr(menu.subprocess, "run", lambda command, **kwargs: commands.append(
+        command) or Done())
+    monkeypatch.setattr(menu, "_menu_title", lambda: None)
+    menu.run_backend(["--source", "S"])
+    menu.run_manifest(["--manifest", "m.csv"])
+    menu.run_mirror(["--dest", "D"])
+    menu.run_manifest(["--manifest", "m.csv", "--verify", "quick"])
+    menu.run_restore(["--backup", "B"])
+    menu.run_captureone(["--dest", "D"])
+    tails = [command[2:] for command in commands]
+    assert [tail[-1] == "--no-convert" for tail in tails] == [True, True, True, False, False,
+                                                              False]
+    script(monkeypatch, ["n", "n", "y", "n"])
+    menu.settings_menu(menu.load_config())
+    assert menu.load_config()["no_convert"] == ""
 
 
 def test_the_hints_name_the_program_that_runs(monkeypatch):

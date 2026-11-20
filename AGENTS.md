@@ -25,8 +25,18 @@ from the command line. A future job (e.g. a full mirror) is a new
   physical core, `_physical_cores` — and a TIFF pool of `_jxl_tiff_workers()`,
   v0.14.0-rc4; a JPEG's proof is libjxl's djxl from stdin, `_rebuild_jpeg`,
   JP-18, jxl-photo when `DJXL` finds none). Since rc4 the conversions run in
-  `_work_root()` — `JXL_WORK_DIR` (default the system's temp folder) +
-  `JXL_WORK_FOLDER\<pid>` with `_WORK_MARK` in it; never inside or above a
+  `_work_root(work_dir)` — `--work-dir` (rc5; `None` = `JXL_WORK_DIR`, ""
+  = the system's temp folder; the menu remembers one per computer, `work_dir`
+  in its config, and `_run_child` passes it to the backup scripts) +
+  `JXL_WORK_FOLDER\<pid>` with `_WORK_MARK` in it; each conversion's folder
+  holds a `temp` folder (`_conversion_temp`) that `_jxlphoto_env(log_dir,
+  temp_dir)` gives jxl-photo as TMPDIR/TEMP/TMP (rc5: its own temp files never
+  reach the system's temp folder); `--no-convert` (rc5; the menu's
+  `no_convert` per computer) turns the conversion off for a run:
+  `_without_conversion` keeps a whole JXL group of an unchanged file
+  (`FileStatus.settings_only`) and a current copy as they are, and
+  `_copy_without_conversion` copies the rest with `_copy_as_is` (not a
+  failure, no jxl-photo, no work folder); never inside or above a
   source or the backup, the default too (`_work_dir_errors`, which also
   refuses a `JXL_WORK_FOLDER` that is not one plain name); a dead run's folder
   removed only when it carries the mark (`_ours_to_sweep`, `_pid_alive`); a

@@ -87,18 +87,32 @@ added the newer parts. The restore has its own guarantees
   catalog, to `versions\` (the mirror: its trash). A TIFF export is never
   converted ([tiff_to_jxl.md](tiff_to_jxl.md)).
 - **The conversions never run inside the backup or a source** *(v0.14.0-rc4)*:
-  each one has a folder of its own in `JXL_WORK_DIR` + `JXL_WORK_FOLDER` (the
-  system's temp folder by default; a work folder inside or above a source or
-  the backup is refused, exit 2 — the default one too), and one writer copies
+  each one has a folder of its own in `JXL_WORK_DIR` (or `--work-dir`,
+  *rc5*) + `JXL_WORK_FOLDER` (the system's temp folder by default; a work
+  folder inside or above a source or the backup is refused, exit 2 — the
+  default one too), jxl-photo's own temp files inside it *(rc5)*, and one writer copies
   each finished group into the backup: every file of the group is written next
   to its final name and checked by its SHA-256 before an old file leaves or any
   name changes. Should a name then fail to change (a file in the way that
-  another program holds open, Ctrl+C), the pages already renamed stay without a
-  catalog row; the next run moves them aside to `versions\` and makes the group
-  again — nothing is lost. The only folders removed there are this tool's own:
-  this run's `pbconv\<process number>` at its end, and the one of a backup that
-  no longer runs — only a folder that carries the run's mark file, never a link.
-  A work folder that cannot be made copies every file as it is (exit 1).
+  another program holds open, a power cut), the pages already renamed stay
+  without a catalog row; the next run moves them aside to `versions\` and makes
+  the group again — nothing is lost. Ctrl+C waits for a group's names and rows,
+  a matter of milliseconds *(rc5)*. The only folders removed there are this
+  tool's own: this run's `pbconv\<process number>` at its end, and the one of a
+  backup that no longer runs — only a folder that carries the run's mark file,
+  never a link; the mark goes last, so what could not be removed yet is removed
+  by a later run *(rc5)*. A work folder that cannot be made copies every file as
+  it is (exit 1).
+- **Ctrl+C stops at a safe point, in seconds, and says so** *(v0.14.0-rc5)*:
+  at once `Ctrl+C: stopping at a safe point...`; the conversions running are
+  ended (with what jxl-photo started), never waited for — their result would be
+  thrown away; the file being written into the backup is finished or removed; a
+  group's names and catalog rows go together; the catalog is written. A stop
+  that takes longer says `still stopping: ...` every few seconds. The last line,
+  `Stopped (Ctrl+C) ... the disk can be removed`, comes only once the catalog
+  is closed. A second Ctrl+C stops waiting (the next run removes what is left
+  in the work folder). A window closed or a power cut loses nothing either: the
+  next run finishes or redoes what was half done.
 - **A JPEG kept as JXL comes back byte for byte** *(v0.14.0-rc3)*: jxl-photo's
   lossless transcode only (`--force-transcode`), and the JXL is kept only after
   the JPEG rebuilt from it (by libjxl's djxl, *rc4*; without it by jxl-photo)

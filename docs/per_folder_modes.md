@@ -158,6 +158,8 @@ From the menu: `[7] Manifest` ([menu.md](menu.md)).
 | `--export-formats SPEC` | `all`, `a>b>c` fallback or `a+b` multiple (default: `jxl>tif>jpg`, from `selective_backup.py`) |
 | `--expect-backup-id ID` | abort (exit 2) unless the destination holds this backup ID |
 | `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, for the lines whose `Tiff` column names a profile or whose `Jpeg` column is `jxl` (default `JXLPHOTO`, from `selective_backup.py`). Such a line without jxl-photo is refused before anything is read, exit 2 *(v0.14.0-rc2)* |
+| `--no-convert` | the conversion off for this run: what the `Tiff` and `Jpeg` columns would convert is copied as it is; the JXL already in the backup stay *(v0.14.0-rc5; [the conversion off](tiff_to_jxl.md#the-conversion-off-a-trip-with-a-slow-computer))* |
+| `--work-dir PATH` | where those lines' conversions run, jxl-photo's temp files too (default `JXL_WORK_DIR`, from `selective_backup.py`; empty = the system's temp folder) *(v0.14.0-rc5)* |
 | `--verify {quick,full}` | verify the backup against what the manifest selects; copies nothing. Same statuses and exit codes as `selective_backup.py --verify` |
 | `--max-gb N` | with `--verify full`: verify at most N GB in this run, oldest verification first (default: `0.0` = everything, from `selective_backup.py`) |
 | `--version` | print the version and exit |

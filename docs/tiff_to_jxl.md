@@ -99,10 +99,13 @@ settings (`photo.tif.cos`) still say which photo it is.
 ## How a JXL is trusted
 
 jxl-photo converts each file in a folder of its own, outside the backup: in
-`JXL_WORK_DIR` (by default the system's temp folder), `pbconv\<process
-number>\` (`JXL_WORK_FOLDER`). photo-backup keeps the result only with proof,
-and then one writer copies it into the backup, each file read back and
-checked against its SHA-256 (`--verify-copy`) before it takes its name.
+`JXL_WORK_DIR` (by default the system's temp folder; `--work-dir` for one run,
+and the menu remembers one per computer, *v0.14.0-rc5*), `pbconv\<process
+number>\` (`JXL_WORK_FOLDER`). jxl-photo's own temp files go into that folder
+too (*rc5*), so a work folder on another disk spares the system's SSD
+completely. photo-backup keeps the result only with proof, and then one writer
+copies it into the backup, each file read back and checked against its SHA-256
+(`--verify-copy`) before it takes its name.
 
 **A TIFF**:
 
@@ -162,6 +165,27 @@ again and, once it works, that copy leaves (below).
   JXL was made with. Another `JPEG_JXL_EFFORT` is not a change: every effort
   gives the same JPEG back, so a JPEG already kept as JXL stays as it is.
 - **A page missing in the backup**: the group is made again.
+
+## The conversion off: a trip with a slow computer
+
+`--no-convert` (*v0.14.0-rc5*; in the menu, `[4] Settings` → "Turn the
+conversion off on this computer", which the menu then shows on its first
+screen) keeps your manifest as it is (`Tiff=jxl`, `Jpeg=jxl`) and converts
+nothing in this run: no jxl-photo, no djxl, no work folder needed.
+
+- **A JXL already in the backup stays** while its TIFF or JPEG did not
+  change, even when the profile's settings did (that waits for a run with the
+  conversion on).
+- **A new TIFF or JPEG is copied as it is**, under its own name, as a failed
+  conversion would be — but this is not a failure: exit 0, and the summary
+  says `TIFF: copied as they are (conversion off)`.
+- **A changed one** (with `--update-changed`, or in the mirror): the new
+  TIFF or JPEG is copied as it is, and only then does its outdated JXL go to
+  `versions\` (the mirror: to its trash).
+- **A second run with it** finds those copies current and leaves them.
+- **Back home, a run with the conversion on** converts what was copied as it
+  is, and the copy goes to `versions\` (the mirror: its trash) once its JXL is
+  in place — the same as [a backup that already holds the TIFF](#a-backup-that-already-holds-the-tiff-or-the-jpeg).
 
 ## A backup that already holds the TIFF or the JPEG
 
@@ -281,6 +305,8 @@ Python 3.12 with libjxl's `cjxl` / `djxl` and ExifTool on the other computer
 | `--tiff copy\|PROFILE` | `selective_backup.py`, `mirror_backup.py --source` | the TIFFs of this run: copied as they are (default) or kept as JXL with a profile |
 | `--jpeg copy\|jxl` | `selective_backup.py`, `mirror_backup.py --source` | the JPEGs of this run: copied as they are (default) or kept as JXL, byte for byte |
 | `--jxlphoto PATH` | every script but the menu | jxl-photo's `jxl_photo.py` or `jxl-photo.exe` (default `JXLPHOTO`) |
+| `--no-convert` | `selective_backup.py`, `manifest_backup.py`, `mirror_backup.py` | the conversion off for this run: what would be converted is copied as it is, the JXL already there stay ([above](#the-conversion-off-a-trip-with-a-slow-computer)); the menu passes it when the conversion is off on this computer *(v0.14.0-rc5)* |
+| `--work-dir PATH` | `selective_backup.py`, `manifest_backup.py`, `mirror_backup.py` | where this run's conversions run (default `JXL_WORK_DIR`; empty = the system's temp folder), checked as that setting is; the menu gives the one it remembers *(v0.14.0-rc5)* |
 | `--convert-back all\|lossless\|none` | `restore_backup.py` | which files kept as JXL come back in their own format (above) |
 | `--keep-jxl` | `restore_backup.py` | the same as `--convert-back none` |
 
@@ -300,7 +326,7 @@ At the top of `selective_backup.py`:
 | `JXL_TIFF_WORKERS` | `0` | of those, TIFFs at the same time (a TIFF takes GBs of memory); `0` = a quarter of the logical CPUs, at most one per 4 GB of free memory |
 | `DJXL` | `""` | libjxl's `djxl`, which proves and restores a JPEG ([JP-18](jxlphoto_contract.md#jp-18--djxl-gives-the-jpeg-back-from-its-jxl)); `""` = the one on PATH; `"none"` = always through jxl-photo (JP-16) |
 | `JXL_TIMEOUT_MIN` | `30` | a conversion longer than this is given up: the file is copied as it is |
-| `JXL_WORK_DIR` | `""` | where the conversions run, each in a folder of its own; `""` = the system's temp folder (an SSD on most computers). The work folder is never inside or above a source or the backup (refused, exit 2: a source that holds the temp folder needs another `JXL_WORK_DIR`). On another volume than the backup, each JXL is copied into it and checked; on the same one, renamed |
+| `JXL_WORK_DIR` | `""` | where the conversions run, each in a folder of its own, jxl-photo's temp files too; `""` = the system's temp folder (an SSD on most computers). `--work-dir` sets it for one run, and the menu remembers one per computer (`[4] Settings`). The work folder is never inside or above a source or the backup (refused, exit 2: a source that holds the temp folder needs another `JXL_WORK_DIR`). On another volume than the backup, each JXL is copied into it and checked; on the same one, renamed |
 | `JXL_WORK_FOLDER` | `"pbconv"` | photo-backup's folder inside `JXL_WORK_DIR` (one plain name): one folder per running backup, named by its process number and holding a mark file, removed at the end; a later run removes the marked ones of a backup that no longer runs |
 | `KEEP_TOOLS_IN_BACKUP` | `True` | keep photo-backup, jxl-photo and `KEEP_TOOLS_EXTRA` in the backup |
 | `KEEP_TOOLS_EXTRA` | `()` | more files or folders kept there |
@@ -310,7 +336,9 @@ The manifest's `Jpeg` column accepts the words of `JPEG_VALUES`
 (`manifest_backup.py`). jxl-photo runs with its log in the conversion's own
 folder (kept in photo-backup's `Logs\jxl-photo\` only when the conversion
 failed: a backup of a whole archive would leave one per photo; the restore's
-go there directly), with its own defaults and not the settings overlay of its
+go there directly), its temp files in that folder too (`TMPDIR`, `TEMP` and
+`TMP` point there, *v0.14.0-rc5*; the restore's in its own folder next to the
+target), removed with it, with its own defaults and not the settings overlay of its
 presets (`JXLPHOTO_SETTINGS` empty:
 [JP-21](jxlphoto_contract.md#jp-21--an-empty-jxlphoto_settings-turns-the-settings-overlay-off)),
 without its update check, and without writing anything next to itself: its

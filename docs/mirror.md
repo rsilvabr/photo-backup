@@ -248,6 +248,8 @@ mirror of its manifest with `--unattended` ([menu.md](menu.md#unattended-runs-ta
 | `--total` | also remove what came from folders that are not in this run (typed confirmation) |
 | `--allow-mass-delete` | let a line remove or replace more than `MIRROR_MAX_DELETE_PERCENT` of its files without typing the number |
 | `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, for the lines that keep TIFF or JPEG as JXL (default `JXLPHOTO`) *(v0.14.0-rc2)* |
+| `--no-convert` | the conversion off for this run: what would be converted is copied as it is; the JXL already in the backup stay, unless their file changed *(v0.14.0-rc5; [the conversion off](tiff_to_jxl.md#the-conversion-off-a-trip-with-a-slow-computer))* |
+| `--work-dir PATH` | where the conversions run (default `JXL_WORK_DIR`; empty = the system's temp folder) *(v0.14.0-rc5)* |
 | `--unattended` | nobody at the console: never ask; what needs a typed number stops the run (implies `--yes`) |
 | `--show-trash` | list what is in the trash of `--dest` and how to get it back; changes nothing |
 | `--empty-trash` | delete the trash of `--dest` for good, after the typed number of files |

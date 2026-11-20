@@ -4,7 +4,7 @@ You shoot 400 frames, the RAWs land in one folder, and the 30 you keep are expor
 
 A backup from the menu also keeps **Capture One itself**: the ICC profiles, film curves and styles your `.cos` edits only name, with your presets, recipes, shortcuts and workspaces. A double-click restore (no Python needed) puts them back on a new computer, so your photos open with the same look. [Details](docs/captureone.md).
 
-**Current version: v0.13.2** (2026-11-12) · [What's new](#whats-new-in-v0132) · [All releases](docs/version_history.md) · Test version: [v0.14.0-rc4](https://github.com/rsilvabr/photo-backup/releases/tag/v0.14.0-rc4), the mirror, TIFF and JPEG kept as JXL ([what's new](docs/whats_new.md#v0140-rc4-test-version-not-released-yet))
+**Current version: v0.13.2** (2026-11-12) · [What's new](#whats-new-in-v0132) · [All releases](docs/version_history.md) · Test version: [v0.14.0-rc5](https://github.com/rsilvabr/photo-backup/releases/tag/v0.14.0-rc5), the mirror, TIFF and JPEG kept as JXL ([what's new](docs/whats_new.md#v0140-rc5-test-version-not-released-yet))
 
 **Windows program, no Python needed:** [photo-backup-exe](https://github.com/rsilvabr/photo-backup-exe/releases/latest) — unzip and double-click.
 
@@ -80,7 +80,7 @@ A `--dry-run` on one of your folders shows what it would take before anything is
 - **Renamed folders are moved, not copied again**, once SHA-256 confirms the content; files whose original is gone are listed as orphans ([moves](docs/reruns_and_moves.md#moved-and-renamed-folders)).
 - **Restore** under a new folder or to the original places, never overwriting anything and never writing to the backup ([restore](docs/restoring.md)).
 - **Capture One on a new computer**: its profiles, styles and settings, with a double-click restore ([Capture One](docs/captureone.md)).
-- **Skips what jxl-photo can remake**: an sRGB or resized JXL that [jxl-photo](https://github.com/rsilvabr/jxl-photo) made from a master that is backed up ([derivatives](docs/how_it_selects.md#jxl-photo-derivatives---derivatives-v050)).
+- **Made to work with [jxl-photo](https://github.com/rsilvabr/jxl-photo)**: it turns 16-bit TIFF exports into JPEG XL masters at a fraction of the size, with their ICC profile and metadata, and makes the sRGB and resized copies from them; the backup keeps the masters and leaves out the copies jxl-photo can make again ([derivatives](docs/how_it_selects.md#jxl-photo-derivatives---derivatives-v050), [smaller with jxl-photo](#smaller-with-jxl-photo)).
 
 ### Smaller with jxl-photo
 
@@ -271,7 +271,7 @@ One line each; the detail is behind each link.
 All mine ([more on each](docs/related_projects.md)):
 
 - [photo-backup-exe](https://github.com/rsilvabr/photo-backup-exe) — this backup as a Windows program, no Python needed. The scripts inside are byte for byte those of a release; the Python version here is the one I run on my own archive and remains the more tested.
-- [jxl-photo](https://github.com/rsilvabr/jxl-photo) — TIFF and JPEG to JPEG XL and back; how the two make a backup smaller: [above](#smaller-with-jxl-photo).
+- [jxl-photo](https://github.com/rsilvabr/jxl-photo) — TIFF and JPEG to JPEG XL and back, for photographers: JXL masters with the ICC profile and metadata, sRGB and resized copies, thumbnails in Explorer with jxl-thumb. It makes the JXL this backup keeps and gives them back on restore; how much smaller: [above](#smaller-with-jxl-photo).
 
 ---
 

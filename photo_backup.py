@@ -28,7 +28,7 @@ import string
 import subprocess
 import sys
 
-__version__ = "0.14.0-rc4"
+__version__ = "0.14.0-rc5"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
@@ -120,26 +120,42 @@ def _menu_title():
         pass
 
 
-def _remembered_jxlphoto():
-    """The jxl-photo the menu remembers ([4] Settings, v0.14.0-rc4), or ""."""
+def _remembered(key):
+    """A path the menu remembers on this computer ([4] Settings), or ""."""
     try:
         with open(CONFIG_PATH, encoding="utf-8") as handle:
-            value = json.load(handle).get("jxlphoto", "")
+            value = json.load(handle).get(key, "")
         return value if isinstance(value, str) else ""
     except (OSError, ValueError, AttributeError):
         return ""
 
 
+def _remembered_jxlphoto():
+    """The jxl-photo the menu remembers ([4] Settings, v0.14.0-rc4), or ""."""
+    return _remembered("jxlphoto")
+
+
 def _run_child(script, argv):
     """Run one of the scripts with `argv`; its output (and its questions) go
     straight to the console. A script that converts or restores files kept as
-    JXL gets the jxl-photo the menu remembers (`--jxlphoto`), unless `argv`
-    names one: the path of your jxl-photo stays out of the scripts."""
+    JXL gets the jxl-photo the menu remembers (`--jxlphoto`), and a backup the
+    conversions' work folder it remembers (`--work-dir`, v0.14.0-rc5), unless
+    `argv` names one: the paths of this computer stay out of the scripts. With
+    the conversion off on this computer (`no_convert`, rc5) a backup gets
+    `--no-convert`."""
     argv = list(argv)
     remembered = _remembered_jxlphoto()
     if (remembered and "--jxlphoto" not in argv
             and script in (BACKEND, RESTORE, MANIFEST_BACKEND, MIRROR_BACKEND)):
         argv += ["--jxlphoto", remembered]
+    work_dir = _remembered("work_dir")
+    if (work_dir and "--work-dir" not in argv
+            and script in (BACKEND, MANIFEST_BACKEND, MIRROR_BACKEND)):
+        argv += ["--work-dir", work_dir]
+    if (_remembered("no_convert") == "yes" and "--no-convert" not in argv
+            and script in (BACKEND, MANIFEST_BACKEND, MIRROR_BACKEND)
+            and "--verify" not in argv):
+        argv.append("--no-convert")
     try:
         return subprocess.run([sys.executable, script, *argv]).returncode
     except KeyboardInterrupt:
@@ -1150,6 +1166,28 @@ def settings_menu(config):
             config["jxlphoto"] = path
             save_config(config)
             say(f"  Saved: {path}" if path else "  Forgotten: the scripts use JXLPHOTO.")
+    work_dir = config.get("work_dir") or ""
+    say(f"  Work folder of the conversions on this computer: "
+        f"{work_dir or '(none: JXL_WORK_DIR above; empty = the system temp folder)'}")
+    if yes_no("Set where the conversions run (each JXL is written there first)?", False):
+        path = ask("A folder that exists (type - for none)", work_dir)
+        path = "" if path.strip() == "-" else path.strip().strip('"')
+        if path and not os.path.isdir(path):
+            say(f"  Not saved: not a folder that exists: {path}", "yellow")
+        else:
+            config["work_dir"] = path
+            save_config(config)
+            say(f"  Saved: {path}" if path else "  Forgotten: the scripts use JXL_WORK_DIR.")
+    off = config.get("no_convert") == "yes"
+    say(f"  Conversion to JXL on this computer: "
+        f"{'OFF (TIFF and JPEG copied as they are)' if off else 'on'}")
+    say("    Off: for a slow computer (a trip). The JXL already in the backup stay; a new or "
+        "changed TIFF or JPEG is copied as it is, and a backup with it on converts it later.")
+    if yes_no(f"Turn the conversion {'back on' if off else 'off'} on this computer?", False):
+        config["no_convert"] = "" if off else "yes"
+        save_config(config)
+        say("  Conversion on: TIFF and JPEG are kept as JXL again." if off
+            else "  Conversion off: the backups copy TIFF and JPEG as they are.")
     say("  Defaults of mirror_backup.py (edit the top of that file to change them):")
     for name in ("MIRROR_KEEP_DAYS", "MIRROR_MAX_DELETE_PERCENT", "MIRROR_MAX_DELETE_MIN"):
         say(f"    {name:<26} {_mirror_setting(name)!r}")
@@ -1164,6 +1202,9 @@ def interactive():
     say(f"photo-backup menu {__version__}", "bold")
     while True:
         title("Menu")
+        if config.get("no_convert") == "yes":
+            say("  Conversion to JXL is OFF on this computer ([4] Settings to turn it on)",
+                "yellow")
         say("  [1] Back up (dry-run first, then copy)")
         say("  [2] Verify a backup")
         say("  [3] Presets")

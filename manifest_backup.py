@@ -36,7 +36,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc4"
+__version__ = "0.14.0-rc5"
 
 # ---- Settings -------------------------------------------------------------------
 MODES_FILE = "backup_modes.csv"     # next to this script; --modes reads another
@@ -283,10 +283,10 @@ def _row_rules(mode, originals, tiff="copy", jpeg="copy"):
                           tiff=tiff, jpeg=jpeg)
 
 
-def _tiff_rows_errors(rows, jxlphoto, dest=None):
+def _tiff_rows_errors(rows, jxlphoto, dest=None, work_dir=None):
     """Why the manifest's TIFFs or JPEGs kept as JXL cannot be made, or []:
-    jxl-photo, djxl for a TIFF (JP-20), JXL_WORK_DIR outside every line and
-    the destination."""
+    jxl-photo, djxl for a TIFF (JP-20), the work folder (`work_dir`:
+    --work-dir, None = JXL_WORK_DIR) outside every line and the destination."""
     using = [row for row in rows if row.tiff != "copy" or row.jpeg != "copy"]
     if not using:
         return []
@@ -302,7 +302,7 @@ def _tiff_rows_errors(rows, jxlphoto, dest=None):
                           f"{sb.DJXL_MISSING}")
     if dest is not None:
         errors += sb._work_dir_errors([os.path.abspath(row.folder) for row in rows],
-                                      os.path.abspath(dest))
+                                      os.path.abspath(dest), work_dir)
     return errors
 
 
@@ -389,14 +389,18 @@ def _backend_args(parsed, rows, dest):
     argv = []
     for row in rows:
         argv += ["--source", row.folder]
+    work_dir = getattr(parsed, "work_dir", None)
     argv += ["--dest", dest,
              "--jxlphoto", getattr(parsed, "jxlphoto", None) or "",
+             "--work-dir", sb.JXL_WORK_DIR if work_dir is None else work_dir,
              "--unselected", "skip",
              "--export-formats", parsed.export_formats,
              "--verify-copy", parsed.verify_copy,
              "--space-margin-gb", str(parsed.space_margin_gb)]
     if parsed.update_changed:
         argv.append("--update-changed")
+    if getattr(parsed, "no_convert", False):
+        argv.append("--no-convert")
     if not parsed.auto_update:
         argv.append("--no-auto-update")
     if parsed.expect_backup_id:
@@ -616,6 +620,13 @@ def build_parser():
     parser.add_argument("--jxlphoto", default=sb.JXLPHOTO, metavar="PATH",
                         help="jxl-photo's jxl_photo.py or jxl-photo.exe, for the lines whose "
                              "Tiff column keeps TIFF as JXL (default: JXLPHOTO)")
+    parser.add_argument("--work-dir", default=sb.JXL_WORK_DIR, metavar="PATH",
+                        help="where the conversions run, each in a folder of its own "
+                             "(default: JXL_WORK_DIR; empty = the system's temp folder)")
+    parser.add_argument("--no-convert", action="store_true",
+                        help="the conversion off for this run: what the Tiff and Jpeg columns "
+                             "would convert is copied as it is; the JXL already in the backup "
+                             "stay, unless their file changed")
     parser.add_argument("--verify", choices=("quick", "full"), default=None,
                         help="verify the backup against what the manifest selects (no copy)")
     parser.add_argument("--max-gb", type=float, default=sb.VERIFY_MAX_GB, metavar="N",
@@ -626,10 +637,8 @@ def build_parser():
 
 
 def main(argv=None):
-    try:                        # a cp1252 console cannot print the owner's ～ paths
-        sys.stdout.reconfigure(errors="replace")
-    except (AttributeError, OSError):
-        pass
+    sb._start_output()          # ～ paths on a cp1252 console; each line out at once
+    sb._STOPPING.clear()
     sb._set_console_title(sb._program_name("manifest_backup"))
     parser = build_parser()
     try:
@@ -661,8 +670,8 @@ def main(argv=None):
         return _analyze(args, rows, modes, stamp, argv)
     backend_args = _backend_args(args, rows, os.path.abspath(args.dest))
     errors = _validate_rows(backend_args, rows)
-    if not args.verify:
-        errors += _tiff_rows_errors(rows, args.jxlphoto, args.dest)
+    if not args.verify and not args.no_convert:
+        errors += _tiff_rows_errors(rows, args.jxlphoto, args.dest, args.work_dir)
     if errors:
         for error in errors:
             print(error, file=sys.stderr)

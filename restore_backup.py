@@ -39,7 +39,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc4"
+__version__ = "0.14.0-rc5"
 
 # ---- Settings -------------------------------------------------------------------
 SPACE_MARGIN_GB = 5.0     # free space kept on each restore target drive (default --space-margin-gb)
@@ -157,15 +157,18 @@ def _restore_group(group, backup, target, jxlphoto, work):
     """Turn a TIFF kept as JXL back into a TIFF at the target: the JXL files
     are copied (hash checked against the catalog) under jxl-photo's own names
     into the work folder -- a folder of this restore next to the target,
-    never in the backup --, jxl-photo decodes them there, and the one TIFF it
-    makes takes the target's name, never replacing a file. (status, detail)."""
+    never in the backup --, jxl-photo decodes them there (its own temp files
+    in there too, v0.14.0-rc5), and the one TIFF it makes takes the target's
+    name, never replacing a file. (status, detail)."""
     folder = os.path.dirname(os.path.abspath(target))
     os.makedirs(sb._io(folder), exist_ok=True)
     if os.path.lexists(sb._io(work)):
         return "ERROR", f"something is in the way of the restore's own folder: {work}"
     work_in, work_out = os.path.join(work, "jxl"), os.path.join(work, "tiff")
+    work_temp = os.path.join(work, "temp")      # jxl-photo's own temp files (v0.14.0-rc5)
     os.makedirs(sb._io(work_in))
     os.makedirs(sb._io(work_out))
+    os.makedirs(sb._io(work_temp))
     ext = os.path.splitext(group.rel)[1]
     try:
         if group.kind == "jpeg" and sb._djxl_path() is not None:
@@ -197,7 +200,8 @@ def _restore_group(group, backup, target, jxlphoto, work):
             arguments = sb._jxlphoto_decode_args(work_in, work_out)
             wanted, item = (".tif", ".tiff"), "JP-10"
         try:
-            run = sb._run_jxlphoto(jxlphoto, arguments, max(sb.JXL_TIMEOUT_MIN, 1) * 60)
+            run = sb._run_jxlphoto(jxlphoto, arguments, max(sb.JXL_TIMEOUT_MIN, 1) * 60,
+                                   temp_dir=work_temp)
         except subprocess.TimeoutExpired:
             return "ERROR", f"jxl-photo took more than {sb.JXL_TIMEOUT_MIN} min"
         said = sb._jxlphoto_said(run)
@@ -264,6 +268,11 @@ def _rebuild_jpeg_with_djxl(group, backup, target, work_out):
                         "(SHA-256 checked)")
 
 
+RESTORE_STOPPED_SAYING = ("Stopped (Ctrl+C). {count} files came back and are in place (the list: "
+                          "{csv}); a file being made when you pressed it was not left at its "
+                          "target. The backup was only read. Nothing is being written now.")
+
+
 def _run_group(group, backup, target, jxlphoto, work):
     """_restore_group on a worker thread: every error becomes a status."""
     try:
@@ -327,10 +336,8 @@ def main(argv=None):
 
 
 def _main(argv):
-    try:                        # a cp1252 console cannot print the owner's ～ paths
-        sys.stdout.reconfigure(errors="replace")
-    except (AttributeError, OSError):
-        pass
+    sb._start_output()          # ～ paths on a cp1252 console; each line out at once
+    sb._STOPPING.clear()
     parser = _build_parser()
     try:
         args = parser.parse_args(argv)
@@ -681,15 +688,24 @@ def _main(argv):
                 collect(future)
                 report()
         except KeyboardInterrupt:
+            # what came back before Ctrl+C is kept; the files being made now are
+            # ended, not waited for, and leave nothing at their targets (v0.14.0-rc5)
+            sb._say_stopping(log)
+            finished = [future for future in pending if future.done() and not future.cancelled()]
+            sb._stop_converters()
             for pool in (jpeg_pool, tiff_pool):
-                pool.shutdown(wait=True, cancel_futures=True)
-            for future in [future for future in pending if future.done()
-                           and not future.cancelled()]:
+                pool.shutdown(wait=False, cancel_futures=True)
+            sb._wait_ending(list(pending), "restores")
+            for future in finished:
                 collect(future)
             print("Interrupted.", file=sys.stderr)
             log.log("Interrupted.")
             log.csv(".csv", ["status", "rel", "target", "detail"],
                     [item for item in results if item is not None])
+            sb._tell(RESTORE_STOPPED_SAYING.format(
+                count=sb._num(sum(1 for item in results if item is not None
+                                  and item[0].startswith("RESTORED"))),
+                csv=log.prefix + ".csv"))
             return 130
         finally:
             for pool in (jpeg_pool, tiff_pool):
