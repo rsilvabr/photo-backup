@@ -58,7 +58,7 @@ It fits when:
 
 It falls short when:
 
-- **exports are renamed** (`Flores_001.jpg`): they are copied, but their originals are not found (they are listed in `_unmatched.csv`);
+- **an export's name no longer starts with its original's** (`Flores_001.jpg`, `Final_DSC_9360.jpg`): it is copied, but its original is not found (it is listed in `_unmatched.csv`). Adding to the end is fine (`DSC_9360_Flores.jpg`);
 - **exports are not inside the originals' folder** (one `Pictures\Exports\` for everything, or an export folder beside the originals' folder): no original is selected;
 - **the choice lives only in a catalog** (Lightroom stars or collections, never exported): photo-backup reads folders, not catalogs. A per-folder mode that also keeps the originals that were not exported still backs these photos up.
 
