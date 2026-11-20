@@ -84,16 +84,29 @@ A `--dry-run` on one of your folders shows what it would take before anything is
 
 ### Smaller with jxl-photo
 
-photo-backup and [jxl-photo](https://github.com/rsilvabr/jxl-photo) are made to work together; four things, each one optional, make the backup smaller without losing a photo:
+[jxl-photo](https://github.com/rsilvabr/jxl-photo) turns TIFF and JPEG into JPEG XL and back, keeping the ICC profile and the metadata. The two are made to work together:
+
+```
+you export a 16-bit TIFF  ->  jxl-photo makes its JXL master (+ sRGB and phone copies)
+photo-backup              ->  backs up the master and the photo's originals, not the copies
+                              (optional) keeps your TIFFs and JPEGs as JXL in the backup
+restore                   ->  the original TIFF or JPEG back, with the jxl-photo the backup keeps
+```
+
+Four things, each one optional, make the backup smaller without losing a photo:
 
 | | What | Measured on the archive this was built for |
 |---|---|---|
-| 1 | **Exports as JXL masters**: jxl-photo turns the 16-bit TIFF exports into JXL, and `jxl>tif>jpg` backs up that master instead of the TIFF | one year: 76 GB of JXL instead of 426 GB of TIFF |
+| 1 | **Exports as JXL masters**: `jxl>tif>jpg` (the default) backs up the JXL master instead of the TIFF | one year: 76 GB of JXL instead of 426 GB of TIFF |
 | 2 | **Derivatives left out**: the sRGB or resized JXL jxl-photo can make again from a master in the backup | |
 | 3 | **TIFF kept as JXL** (`Tiff` column): a developed TIFF or a film scan stays TIFF on your disk, JXL in the backup | NX Studio 45 MP: 218 MB → 34 MB; scans, lossless: 59–71%, the same pixels |
 | 4 | **JPEG kept as JXL** (`Jpeg` column): every JPEG, exports too, by a lossless transcode | 146 real JPEGs: 81% of their size, every one back byte for byte |
 
-Each JXL counts only after it is proven (every TIFF page decoded and compared with the TIFF's, the TIFF's mark, the JPEG rebuilt byte for byte); anything else is copied as it is. The restore gives the original formats back — all of them, only the lossless ones, or none — and the backup keeps the jxl-photo that does it. In detail: [TIFF and JPEG as JXL](docs/tiff_to_jxl.md); what jxl-photo must keep doing for all this: [the contract](docs/jxlphoto_contract.md).
+**Turning it on.** 1 and 2 need nothing: they follow what jxl-photo left in your export folders. For 3 and 4: jxl-photo 2.31.0-rc1 or newer and libjxl's `djxl` on PATH; tell the menu where jxl-photo is (`[4] Settings`, also where the conversions run, say another disk); put `jxl` in the manifest's `Tiff` or `Jpeg` column. On a slow computer, the conversion can be turned off for a while: new files go as they are, and are converted later.
+
+**Nothing is lost on the way.** Each JXL counts only after it is proven (every TIFF page decoded and compared with the TIFF's, the JPEG rebuilt byte for byte); anything else is copied as it is. The restore gives back all the original formats, only the lossless ones, or none. In detail: [TIFF and JPEG as JXL](docs/tiff_to_jxl.md), [jxl-photo and photo-backup](docs/related_projects.md#jxl-photo), and what jxl-photo must keep doing for all this: [the contract](docs/jxlphoto_contract.md).
+
+### The scripts
 
 | Script | What it does |
 |---|---|
