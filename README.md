@@ -90,7 +90,9 @@ A `--dry-run` on one of your folders shows what it would take before anything is
 you export a 16-bit TIFF  ->  jxl-photo makes its JXL master (+ sRGB and phone copies)
 photo-backup              ->  backs up the master and the photo's originals, not the copies
                               (optional) keeps your TIFFs and JPEGs as JXL in the backup
-restore                   ->  the original TIFF or JPEG back, with the jxl-photo the backup keeps
+restore                   ->  the TIFF or JPEG back, with the jxl-photo the backup keeps
+                              (a JPEG byte for byte; a TIFF with its JXL's pixels: the same
+                              for scans and 8-bit TIFFs, near-identical at distance 0.05)
 ```
 
 Four things, each one optional, make the backup smaller without losing a photo:
