@@ -21,6 +21,7 @@ import hashlib
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import signal
@@ -37,7 +38,7 @@ from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor, TimeoutErro
 from dataclasses import dataclass, field, replace as _replace_fields
 from datetime import datetime, timedelta
 
-__version__ = "0.14.0-rc6"
+__version__ = "0.14.0-rc7"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -164,6 +165,11 @@ DJXL = ""                           # libjxl's djxl: rebuilds a JPEG from its JX
                                     # restore, 3x faster than through jxl-photo; "" = found on PATH,
                                     # "none" = always through jxl-photo
 JXL_TIMEOUT_MIN = 30                # a conversion that takes longer is given up: the file is copied as is
+JXLPHOTO_SERVE = True               # jxl-photo runs as one process per worker that converts file after
+                                    # file (its --serve mode, 2.31.0-rc3 and newer; docs/jxlphoto_contract.md,
+                                    # JP-23): Python, its imports and ExifTool start once per worker, not once
+                                    # per file. False = one jxl-photo per file, as up to v0.14.0-rc6. A
+                                    # jxl-photo without it (the restore runs 2.30.0 and newer) runs one per file
 CONVERT_GIVE_UP_AFTER = 2           # a TIFF or JPEG jxl-photo could not convert in this many runs in a
                                     # row (the same file, jxl-photo and settings) stays the copy as it is,
                                     # not tried again: no longer a failure of the run ("not converted
@@ -3257,19 +3263,29 @@ def _tiff_lossless(profile, tokens):
     return None
 
 
+_TEST_KINDS = {"alpha": 0, "a": 0, "beta": 1, "b": 1, "rc": 2}
+_TEST_SUFFIX = re.compile(r"^[-_.]?(alpha|a|beta|b|rc)\.?(\d+)", re.IGNORECASE)
+
+
 def _version_key(text):
-    """(major, minor, patch, final, test number) of the first X.Y.Z in `text`,
+    """(major, minor, patch, final, kind, number) of the first X.Y.Z in `text`,
     or None. A test version of X.Y.Z (2.30.0-rc1, 2.17.0_beta1) comes before
     X.Y.Z itself: it may not hold what X.Y.Z holds. Test versions of one number
-    are in order of their own number (2.31.0-rc1 < 2.31.0-rc3: a minimum that is
-    a test version refuses the earlier ones, v0.14.0-rc6)."""
+    go alpha < beta < rc, then by their own number (2.31.0_beta4 < 2.31.0-rc1 <
+    2.31.0-rc3 < 2.31.0; v0.14.0-rc7: before, any suffix's number counted, and
+    beta4 passed for rc3). A suffix that is none of them is the oldest of its
+    X.Y.Z: the conservative answer."""
     match = re.search(r"(\d+)\.(\d+)\.(\d+)(\S*)", str(text or ""))
     if not match:
         return None
     major, minor, patch, rest = match.groups()
-    number = re.search(r"\d+", rest)
-    return (int(major), int(minor), int(patch), 0 if rest else 1,
-            int(number.group()) if rest and number else 0)
+    numbers = (int(major), int(minor), int(patch))
+    if not rest:
+        return numbers + (1, 0, 0)
+    suffix = _TEST_SUFFIX.match(rest)
+    if not suffix:
+        return numbers + (0, 0, 0)
+    return numbers + (0, _TEST_KINDS[suffix.group(1).casefold()], int(suffix.group(2)))
 
 
 def _jxlphoto_problem(path, minimum=None):
@@ -3542,12 +3558,14 @@ def _djxl_path():
     return _DJXL_FOUND["path"]
 
 
-def _rebuild_jpeg(jxl, jxlphoto, folder, timeout_s, data=None, log_dir=None, temp_dir=None):
+def _rebuild_jpeg(jxl, jxlphoto, folder, timeout_s, data=None, log_dir=None, temp_dir=None,
+                  servers=None):
     """The bytes of the JPEG rebuilt from `jxl` (a JPEG kept as JXL): libjxl's
     djxl reading the JXL from stdin and writing the JPEG to stdout (JP-18: no
     path is ever given to it, no file is written), else jxl-photo into
     `folder` (JP-16; its log in `log_dir` and its temp files in `temp_dir`,
-    see _jxlphoto_env). Raises _ConvertFailed."""
+    see _jxlphoto_env; a job of `servers` when given, _jxlphoto_call). Raises
+    _ConvertFailed."""
     djxl = _djxl_path()
     if djxl is not None:
         if data is None:                # `data`: the JXL's bytes, read already
@@ -3568,10 +3586,12 @@ def _rebuild_jpeg(jxl, jxlphoto, folder, timeout_s, data=None, log_dir=None, tem
         return run.stdout
     os.makedirs(_io(folder), exist_ok=True)
     try:
-        run = _run_jxlphoto(jxlphoto, _jxlphoto_rebuild_args(jxl, folder), timeout_s, log_dir,
-                            temp_dir)
+        run = _jxlphoto_call(servers, jxlphoto, _jxlphoto_rebuild_args(jxl, folder), timeout_s,
+                             log_dir, temp_dir)
     except subprocess.TimeoutExpired:
         raise _ConvertFailed(f"jxl-photo took more than {timeout_s // 60} min")
+    except OSError as exc:
+        raise _ConvertFailed(f"jxl-photo could not be started: {exc}", counts=False)
     with os.scandir(_io(folder)) as listing:
         made = [entry.name for entry in listing if entry.is_file(follow_symlinks=False)
                 and entry.name.casefold().endswith((".jpg", ".jpeg"))]
@@ -3830,12 +3850,424 @@ def _jxlphoto_said(run):
         usage = [line.strip() for line in text.splitlines()
                  if _JXLPHOTO_USAGE_ERROR.match(line.strip())]
         result = usage[-1] if usage else _tail(text)
-    if len(result) > _JXLPHOTO_SAID_CHARS:
-        result = result[:_JXLPHOTO_SAID_CHARS - 3] + "..."
-    return result
+    return _cap_said(result)
 
 
-def _convert_one(status, work_root, stamp, index, jxlphoto, flush=True):
+# ---- jxl-photo's serve mode (v0.14.0-rc7, JP-23) -------------------------------------------------
+_JXLPHOTO_SERVE_SINCE = "2.31.0-rc3"    # the first jxl-photo with --serve (JP-23)
+_SERVE_PROTOCOL = 1                     # the "serve" number its first line says
+_SERVE_START_S = 120                    # it says it serves within this, or it is not used
+_SERVE_END_S = 30                       # it ends within this once its stdin is closed, or is ended
+_SERVE_JOBS_MAX = 2000                  # a process that ran this many files is ended; the next file
+                                        # starts a new one (whatever one could keep, it keeps for a while)
+
+
+def _serve_wanted(tool):
+    """Whether jxl-photo `tool` ('jxl-photo 2.31.0-rc3', _jxlphoto_version)
+    runs in serve mode: JXLPHOTO_SERVE, and a version that has it."""
+    key = _version_key(tool)
+    return bool(JXLPHOTO_SERVE and key is not None
+                and key >= _version_key(_JXLPHOTO_SERVE_SINCE))
+
+
+def _jxl_timeout_s():
+    """JXL_TIMEOUT_MIN in seconds (at least one minute)."""
+    return max(JXL_TIMEOUT_MIN, 1) * 60
+
+
+def _cap_said(text):
+    """What jxl-photo said about a failure, at most _JXLPHOTO_SAID_CHARS."""
+    text = str(text or "").strip()
+    if len(text) > _JXLPHOTO_SAID_CHARS:
+        text = text[:_JXLPHOTO_SAID_CHARS - 3] + "..."
+    return text
+
+
+@dataclass
+class _JxlRun:
+    """What one jxl-photo command did: its exit code and what it said about a
+    failure (_jxlphoto_said of a single call, the answer's error of a job)."""
+    returncode: int
+    said: str
+
+
+class _ServeUnavailable(Exception):
+    """jxl-photo's serve process could not start or does not speak the protocol:
+    the run goes on with one jxl-photo per file."""
+
+
+class _ServeLost(Exception):
+    """The job could not be handed to the serve process (it had ended): nothing
+    of the job was done."""
+
+
+class _JxlServer:
+    """One jxl-photo serve process (JP-23), used by one thread at a time: it
+    converts file after file, so Python, its imports and ExifTool start once."""
+
+    def __init__(self, jxlphoto, command, options, folder, log_dir=None):
+        self.jxlphoto, self.command, self.options = jxlphoto, command, list(options)
+        self.folder = folder            # its own folder: temp\ (its TEMP), stderr.txt
+        self.log_dir = log_dir or os.path.join(folder, "log")   # its JXLPHOTO_LOG_DIR
+        self.process = None
+        self.lines = queue.SimpleQueue()    # its stdout lines (bytes); None: it ended
+        self.jobs = 0
+        self.log_file = None
+        self.reader = None
+
+    def _stderr_text(self):
+        try:
+            with open(_io(os.path.join(self.folder, "stderr.txt")), "rb") as handle:
+                return _tail(handle.read().decode("utf-8", "replace"))
+        except OSError:
+            return ""
+
+    def _next(self, timeout):
+        return self.lines.get(timeout=timeout)
+
+    def _read_lines(self):
+        try:
+            for line in self.process.stdout:
+                self.lines.put(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.lines.put(None)
+
+    def _unregister(self):
+        with _CONVERTERS_LOCK:
+            _CONVERTERS.discard(self.process)
+
+    def start(self):
+        """Start it and read its first line. Raises OSError (could not be
+        started, or the run is stopping) and _ServeUnavailable."""
+        if _STOPPING.is_set():
+            raise OSError("not started: the run is stopping (Ctrl+C)")
+        temp = os.path.join(self.folder, "temp")
+        os.makedirs(_io(temp))
+        os.makedirs(_io(self.log_dir), exist_ok=True)
+        stderr = open(_io(os.path.join(self.folder, "stderr.txt")), "wb")
+        try:
+            self.process = subprocess.Popen(
+                _jxlphoto_argv(self.jxlphoto, [self.command, "--serve", *self.options]),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+                env=_jxlphoto_env(self.log_dir, temp))
+        finally:
+            stderr.close()
+        with _CONVERTERS_LOCK:
+            _CONVERTERS.add(self.process)
+            stopping = _STOPPING.is_set()
+        if stopping:                    # Ctrl+C came while it started
+            _kill_tree(self.process)
+        self.reader = threading.Thread(target=self._read_lines, name="jxl-photo serve",
+                                       daemon=True)
+        self.reader.start()
+        try:
+            line = self._next(_SERVE_START_S)
+        except queue.Empty:
+            self.kill()
+            raise _ServeUnavailable(f"it did not say it serves within {_SERVE_START_S} s")
+        if line is None:
+            try:                        # never a wait without an end: its stdout may have
+                code = self.process.wait(5)     # failed while it still waits for jobs
+            except subprocess.TimeoutExpired:
+                code = None
+            self.kill()
+            if _STOPPING.is_set():      # ended by Ctrl+C: not a jxl-photo that cannot serve
+                raise OSError("not started: the run is stopping (Ctrl+C)")
+            tail = self._stderr_text()
+            raise _ServeUnavailable(f"it ended before it said it serves (exit {code})"
+                                    + (f": {tail}" if tail else ""))
+        try:
+            first = json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            first = None
+        script = (os.path.splitext(os.path.basename(str(first.get("script") or "")))[0].casefold()
+                  if isinstance(first, dict) else "")
+        if (not isinstance(first, dict) or first.get("serve") != _SERVE_PROTOCOL
+                or script != _JXLPHOTO_BACKENDS[self.command].casefold()):
+            self.kill()
+            raise _ServeUnavailable(f"its first line is not the serve protocol {_SERVE_PROTOCOL} "
+                                    f"of {self.command}: {line[:200]!r}")
+        self.log_file = self._find_log()
+
+    def _find_log(self):
+        """Its log: <log_dir>\\<backend>\\..._<pid>.log, or None."""
+        folder = os.path.join(self.log_dir, _JXLPHOTO_BACKENDS[self.command])
+        pid = self.process.pid
+        found = []
+        try:
+            with os.scandir(_io(folder)) as listing:
+                for entry in listing:
+                    stem, extension = os.path.splitext(entry.name)
+                    if extension.casefold() != ".log":
+                        continue
+                    if stem.endswith(f"_{pid}"):
+                        rank = 0
+                    elif f"_{pid}_" in stem:
+                        rank = 1
+                    else:
+                        continue
+                    try:
+                        found.append((rank, -entry.stat().st_mtime_ns, entry.name))
+                    except OSError:
+                        continue
+        except OSError:
+            return None
+        return os.path.join(folder, min(found)[2]) if found else None
+
+    def alive(self):
+        return self.process is not None and self.process.poll() is None
+
+    def _log_size(self):
+        try:
+            return os.path.getsize(_io(self.log_file)) if self.log_file else 0
+        except OSError:
+            return 0
+
+    def _keep_log(self, start, folder, job_id):
+        """The log's lines of the job (from `start` to its end) and, once the
+        process has ended, what it wrote on stderr, into `folder`."""
+        if not folder or not self.log_file:
+            return
+        try:
+            with open(_io(self.log_file), "rb") as handle:
+                handle.seek(start)
+                data = handle.read()
+            if self.process.poll() is not None:
+                with open(_io(os.path.join(self.folder, "stderr.txt")), "rb") as handle:
+                    err = handle.read()
+                if err:
+                    data += b"\n--- stderr ---\n" + err
+            os.makedirs(_io(folder), exist_ok=True)
+            number = 0
+            while True:
+                name = (f"jxl-photo serve job {job_id}" + (f" ({number})" if number else "")
+                        + ".log")
+                try:
+                    with open(_io(os.path.join(folder, name)), "xb") as handle:
+                        handle.write(data)
+                    break
+                except FileExistsError:
+                    number += 1
+        except OSError:
+            pass
+
+    def run(self, source, output, timeout_s, keep_log_in=None):
+        """One file: _JxlRun. Raises _ServeLost (the process had ended: nothing
+        was done), subprocess.TimeoutExpired, OSError (the run is stopping) and
+        _ConvertFailed (it ended without answering, or answered something else).
+        A job that failed ends its process: whatever it left half done never
+        reaches another file."""
+        if _STOPPING.is_set():
+            raise OSError("not started: the run is stopping (Ctrl+C)")
+        if not self.alive():
+            raise _ServeLost()
+        self.jobs += 1
+        job_id = str(self.jobs)
+        start = self._log_size()
+        job = json.dumps({"id": job_id, "input": source, "output": output}, ensure_ascii=True)
+        try:
+            self.process.stdin.write((job + "\n").encode("ascii"))
+            self.process.stdin.flush()
+        except (OSError, ValueError):
+            raise _ServeLost()
+        try:
+            line = self._next(timeout_s)
+        except queue.Empty:
+            self.kill()
+            self._keep_log(start, keep_log_in, job_id)
+            raise subprocess.TimeoutExpired(self.command, timeout_s)
+        if line is None:
+            try:
+                code = self.process.wait(5)
+            except subprocess.TimeoutExpired:
+                self.kill()
+                code = None
+            self._keep_log(start, keep_log_in, job_id)
+            tail = self._stderr_text()
+            self.kill()
+            raise _ConvertFailed(f"jxl-photo's serve process ended without answering (exit {code}, "
+                                 f"JP-23)" + (f": {tail}" if tail else ""))
+        try:
+            answer = json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            answer = None
+        if not (isinstance(answer, dict) and answer.get("id") == job_id
+                and isinstance(answer.get("exit"), int) and not isinstance(answer.get("exit"), bool)
+                and isinstance(answer.get("error"), str)):
+            self.kill()
+            raise _ConvertFailed("jxl-photo's serve process answered something else than its "
+                                 f"file (JP-23): {line[:200]!r}", counts=False)
+        result = _JxlRun(answer["exit"], _cap_said(answer["error"]))
+        if result.returncode != 0:
+            self._keep_log(start, keep_log_in, job_id)
+            self.close()
+        elif self.jobs >= _SERVE_JOBS_MAX:
+            self.close()
+        return result
+
+    def close_input(self):
+        try:
+            if self.process is not None and self.process.stdin is not None:
+                self.process.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+    def finish(self, wait_s=None):
+        """Wait for it to end (it does when its stdin is closed); still there
+        after `wait_s`: ended."""
+        if self.process is None:
+            return
+        try:
+            self.process.wait(_SERVE_END_S if wait_s is None else wait_s)
+        except subprocess.TimeoutExpired:
+            self.kill()
+        finally:
+            self._unregister()
+        if self.reader is not None:
+            self.reader.join(5)
+
+    def close(self):
+        self.close_input()
+        self.finish()
+
+    def kill(self):
+        if self.process is None:
+            return
+        _kill_tree(self.process)
+        try:
+            self.process.wait(10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        self._unregister()
+
+    def release(self):
+        """Once it has ended: its reader thread, its pipe and its own folder
+        (temp files, stderr.txt, and in a backup its log -- a failed job's part
+        is kept before). A long run starts a process every _SERVE_JOBS_MAX files
+        and one after each failed file: each kept a pipe and a folder until the
+        run's end."""
+        if self.process is not None and self.process.poll() is None:
+            return                      # still running: nothing of it is released
+        if self.reader is not None:
+            self.reader.join(5)
+        try:
+            if self.process is not None and self.process.stdout is not None:
+                self.process.stdout.close()
+        except (OSError, ValueError):
+            pass
+        _remove_own_folder(self.folder)
+
+
+class _JxlServers:
+    """The serve processes of one run (JP-23): one per worker thread and command
+    line, started at its first file, ended by close(). `root`: each one's folder
+    goes there (s1, s2, ...); `log_dir`: where their logs go (None: in each one's
+    folder -- the backup keeps a failed job's part only; the restore gives
+    LOG_DIR\\jxl-photo)."""
+
+    def __init__(self, jxlphoto, root, log_dir=None):
+        self.jxlphoto, self.root, self.log_dir = jxlphoto, root, log_dir
+        self.local = threading.local()
+        self.lock = threading.Lock()
+        self.started = []           # the processes not ended yet (an ended one is
+                                    # forgotten at once: _forget), for close()
+        self.count = 0
+        self.unavailable = None     # why serve is not used any more: one call per file
+
+    def _forget(self, server):
+        """A process that has ended: no longer one of this run's, its pipe,
+        thread and folder released at once."""
+        with self.lock:
+            if server in self.started:
+                self.started.remove(server)
+        server.release()
+
+    def _start(self, command, options):
+        with self.lock:
+            self.count += 1
+            number = self.count
+            server = _JxlServer(self.jxlphoto, command, options,
+                                os.path.join(self.root, f"s{number}"), self.log_dir)
+            self.started.append(server)
+        try:
+            server.start()
+        except _ServeUnavailable as exc:
+            with self.lock:
+                self.unavailable = self.unavailable or str(exc)
+            self._forget(server)
+            raise
+        except BaseException:
+            server.kill()
+            self._forget(server)
+            raise
+        return server
+
+    def run(self, arguments, timeout_s, keep_log_in=None):
+        """One command line, as a single call takes it: _JxlRun (see
+        _JxlServer.run). Raises _ServeUnavailable when serve is not used."""
+        mine = self.local.__dict__.setdefault("servers", {})
+        if self.unavailable:
+            for server in list(mine.values()):     # this thread's: idle from now on
+                server.close()
+                self._forget(server)
+            mine.clear()
+            raise _ServeUnavailable(self.unavailable)
+        command, source, output = arguments[0], arguments[1], arguments[2]
+        options = tuple(arguments[3:])
+        key = (command, options)
+        for _attempt in range(2):
+            server = mine.pop(key, None)
+            if server is not None and not server.alive():
+                self._forget(server)
+                server = None
+            if server is None:
+                server = self._start(command, options)
+            mine[key] = server
+            try:
+                return server.run(source, output, timeout_s, keep_log_in)
+            except _ServeLost:
+                server.kill()
+            finally:
+                if not server.alive():  # ended: a failed file, killed, or its last file
+                    mine.pop(key, None)
+                    self._forget(server)
+        raise _ConvertFailed("jxl-photo's serve process could not take the file (JP-23)",
+                             counts=False)
+
+    def close(self):
+        """End every process: all their inputs are closed first, so they end together."""
+        with self.lock:
+            servers = list(self.started)
+        for server in servers:
+            server.close_input()
+        for server in servers:
+            server.finish()
+        for server in servers:
+            self._forget(server)
+
+
+def _jxlphoto_call(servers, jxlphoto, arguments, timeout_s, log_dir=None, temp_dir=None):
+    """One jxl-photo command line (`arguments`, as a single call takes it): a job
+    of this run's serve processes (`servers`, JP-23) when there are and they work,
+    else one call (`log_dir`, `temp_dir`: see _jxlphoto_env; `temp_dir` is made
+    here, only then). _JxlRun. Raises subprocess.TimeoutExpired, OSError (could
+    not be started) and _ConvertFailed (a serve process that ended or answered
+    something else). `log_dir` also gets a failed job's part of its serve
+    process's log."""
+    if servers is not None:
+        try:
+            return servers.run(arguments, timeout_s, keep_log_in=log_dir)
+        except _ServeUnavailable:
+            pass
+    if temp_dir:
+        os.makedirs(_io(temp_dir), exist_ok=True)
+    run = _run_jxlphoto(jxlphoto, arguments, timeout_s, log_dir, temp_dir)
+    return _JxlRun(run.returncode, _jxlphoto_said(run))
+
+
+def _convert_one(status, work_root, stamp, index, jxlphoto, flush=True, servers=None):
     """Keep one TIFF or JPEG as JXL with jxl-photo, in a folder of its own
     (work_root\\<index>, with jxl-photo's log of this call inside), and prove
     what came out (on a worker thread: no catalog here). Raises _ConvertFailed,
@@ -3844,8 +4276,8 @@ def _convert_one(status, work_root, stamp, index, jxlphoto, flush=True):
     work = os.path.join(work_root, str(index))
     try:
         if status.planned.convert == JPEG_CONVERT:
-            return _transcode_one(status, work, jxlphoto, flush)
-        return _encode_one(status, work, jxlphoto, flush)
+            return _transcode_one(status, work, jxlphoto, flush, servers)
+        return _encode_one(status, work, jxlphoto, flush, servers)
     except _ConvertFailed as exc:
         if _STOPPING.is_set():          # ended by Ctrl+C: not a failure, no log to keep
             raise
@@ -3853,16 +4285,6 @@ def _convert_one(status, work_root, stamp, index, jxlphoto, flush=True):
         if kept:
             raise _ConvertFailed(f"{exc}; jxl-photo's log: {kept}", exc.counts) from None
         raise
-
-
-def _conversion_temp(work):
-    """Make a conversion's folder (`work`) and, inside it, the folder for
-    jxl-photo's own temp files (`temp`, see _jxlphoto_env): its path. A folder
-    jxl-photo writes no JXL into -- only the .jxl files directly in `work` are
-    read -- and removed with `work`, whatever happened."""
-    temp = os.path.join(work, "temp")
-    os.makedirs(_io(temp))
-    return temp
 
 
 def _keep_jxlphoto_log(work, stamp, index, src):
@@ -3890,7 +4312,7 @@ def _keep_jxlphoto_log(work, stamp, index, src):
     return kept
 
 
-def _transcode_one(status, work, jxlphoto, flush=True):
+def _transcode_one(status, work, jxlphoto, flush=True, servers=None):
     """A JPEG: jxl-photo's lossless transcode (JP-15), then the JPEG rebuilt
     from that JXL (JP-16) must have the SHA-256 this run took of the JPEG --
     the same bytes, proven before the JXL counts --, and the JPEG must be the
@@ -3905,16 +4327,17 @@ def _transcode_one(status, work, jxlphoto, flush=True):
         raise _ConvertFailed(f"the JPEG cannot be read: {exc}", counts=False)
     read = time.monotonic()
     rebuilt = os.path.join(work, "rebuilt")             # jxl-photo's rebuild, without djxl
-    temp = _conversion_temp(work)
-    timeout_s = max(JXL_TIMEOUT_MIN, 1) * 60
+    os.makedirs(_io(work))
+    temp = os.path.join(work, "temp")       # a single call's own (made by _jxlphoto_call)
+    timeout_s = _jxl_timeout_s()
     try:
-        run = _run_jxlphoto(jxlphoto, _jxlphoto_transcode_args(jpeg, work), timeout_s,
-                            os.path.join(work, "log"), temp)
+        run = _jxlphoto_call(servers, jxlphoto, _jxlphoto_transcode_args(jpeg, work), timeout_s,
+                             os.path.join(work, "log"), temp)
     except subprocess.TimeoutExpired:
         raise _ConvertFailed(f"jxl-photo took more than {JXL_TIMEOUT_MIN} min")
     except OSError as exc:
         raise _ConvertFailed(f"jxl-photo could not be started: {exc}", counts=False)
-    said = _jxlphoto_said(run)
+    said = run.said
     if run.returncode != 0:
         raise _ConvertFailed(f"jxl-photo stopped with exit {run.returncode} (JP-15): {said}")
     with os.scandir(_io(work)) as listing:
@@ -3922,11 +4345,13 @@ def _transcode_one(status, work, jxlphoto, flush=True):
                        if entry.is_file(follow_symlinks=False)
                        and entry.name.casefold().endswith(".jxl"))
     if len(names) != 1:
-        raise _ConvertFailed(f"jxl-photo wrote {len(names)} JXL for one JPEG (JP-15): {said}")
+        raise _ConvertFailed(f"jxl-photo wrote {len(names)} JXL for one JPEG (JP-15)"
+                             + (f": {said}" if said else ""))
     jxl = os.path.join(work, names[0])
     converted = time.monotonic()
     rebuilt_jpeg = _rebuild_jpeg(jxl, jxlphoto, rebuilt, timeout_s,
-                                 log_dir=os.path.join(work, "log"), temp_dir=temp)
+                                 log_dir=os.path.join(work, "log"), temp_dir=temp,
+                                 servers=servers)
     proven = time.monotonic()
     if hashlib.sha256(rebuilt_jpeg).hexdigest() != source_sha:
         item = "JP-18" if _djxl_path() is not None else "JP-16"      # who rebuilt it
@@ -3947,7 +4372,7 @@ def _transcode_one(status, work, jxlphoto, flush=True):
                                 "proof": proven - converted})
 
 
-def _encode_one(status, work, jxlphoto, flush=True):
+def _encode_one(status, work, jxlphoto, flush=True, servers=None):
     """A TIFF: jxl-photo checked every page against the TIFF (JP-20: else it
     exits with an error), every JXL must carry the jxlphoto-srcsum of the bytes
     this run hashed, a group must be whole, and the TIFF must be the same at
@@ -3961,17 +4386,18 @@ def _encode_one(status, work, jxlphoto, flush=True):
     except OSError as exc:
         raise _ConvertFailed(f"the TIFF cannot be read: {exc}", counts=False)
     read = time.monotonic()
-    temp = _conversion_temp(work)
+    os.makedirs(_io(work))
+    temp = os.path.join(work, "temp")       # a single call's own (made by _jxlphoto_call)
     profile = TIFF_JXL_PROFILES[planned.convert]
     command = _jxlphoto_encode_args(tiff, work, profile)
     try:
-        run = _run_jxlphoto(jxlphoto, command, max(JXL_TIMEOUT_MIN, 1) * 60,
-                            os.path.join(work, "log"), temp)
+        run = _jxlphoto_call(servers, jxlphoto, command, _jxl_timeout_s(),
+                             os.path.join(work, "log"), temp)
     except subprocess.TimeoutExpired:
         raise _ConvertFailed(f"jxl-photo took more than {JXL_TIMEOUT_MIN} min")
     except OSError as exc:
         raise _ConvertFailed(f"jxl-photo could not be started: {exc}", counts=False)
-    said = _jxlphoto_said(run)
+    said = run.said
     if run.returncode != 0:
         item = "JP-20" if "round-trip verification" in said else "JP-2"
         raise _ConvertFailed(f"jxl-photo stopped with exit {run.returncode} ({item}): {said}")
@@ -3981,7 +4407,7 @@ def _encode_one(status, work, jxlphoto, flush=True):
                        if entry.is_file(follow_symlinks=False)
                        and entry.name.casefold().endswith(".jxl"))
     if not names:
-        raise _ConvertFailed(f"jxl-photo wrote no JXL (JP-3): {said}")
+        raise _ConvertFailed("jxl-photo wrote no JXL (JP-3)" + (f": {said}" if said else ""))
     want = _jxlphoto_srcsum(source_sha)
     stem = os.path.splitext(os.path.basename(tiff))[0].casefold()
     files = []
@@ -4457,8 +4883,9 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
         pace.append(f"{workers} JPEG" + (" (djxl proves)" if _djxl_path() else ""))
     if kinds.get("TIFF"):
         pace.append(f"{min(workers, tiff_workers)} TIFF")
+    serving = problem is None and _serve_wanted(tool)
     log.out(f"Converting to JXL: {', '.join(f'{_num(count)} {kind}' for kind, count in sorted(kinds.items()))} "
-            f"({tool}; {' and '.join(pace)} at a time; "
+            f"({tool}{', serve mode' if serving else ''}; {' and '.join(pace)} at a time; "
             f"{_gb(sum(status.planned.size for status in todo))})")
     started = time.monotonic()
     progress = {"finished": 0, "bytes": 0, "last_report": started}
@@ -4468,9 +4895,12 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
     # where rc2 and rc3 converted, inside the backup: what an interrupted run left
     _remove_own_folder(os.path.join(dest, CATALOG_FOLDER, _OLD_WORK_FOLDER))
     work_root, copy = None, False
+    servers = None
     try:
         work_root = _work_root(getattr(args, "work_dir", None))
         copy = _jxl_copy_needed(work_root, dest)
+        if problem is None and serving:
+            servers = _JxlServers(jxlphoto, work_root)
         log.log(f"Work folder of the conversions: {work_root} (each finished JXL "
                 f"{'copied into the backup and checked' if copy else 'renamed into the backup'})")
     except OSError as exc:
@@ -4490,18 +4920,23 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
     planned_keys = {status.planned.rel.casefold() for status in statuses}   # S1
     failures = []       # (status, why): what may count towards CONVERT_GIVE_UP_AFTER (M2)
     timing = collections.Counter()      # seconds, for the TIMING line (P0)
+    serve_said = []                     # JXL-PHOTO SERVE NOT USED is said once
 
     def submit_more():
         for queue in queues:
             while queue[1] and queue[3] < queue[2]:
                 index, status = queue[1].popleft()
                 future = queue[0].submit(_convert_one, status, work_root, stamp, index,
-                                         jxlphoto, not copy)
+                                         jxlphoto, not copy, servers)
                 pending[future] = (index, status, queue)
                 queue[3] += 1
 
     def finish(index, status, future):
         conversion, why = None, problem
+        if servers is not None and servers.unavailable and not serve_said:
+            serve_said.append(True)
+            log.out(f"JXL-PHOTO SERVE NOT USED: {servers.unavailable}; one jxl-photo per file "
+                    f"from now on")
         recordable = False
         if future is not None:
             try:
@@ -4602,6 +5037,8 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
             for pool in (jpeg_pool, tiff_pool):
                 pool.shutdown(wait=False, cancel_futures=True)
             _wait_ending(list(pending), "conversions")
+        if servers is not None:         # open logs and ExifTools hold files in the work folder
+            servers.close()
         with _ctrl_c_after():
             _record_not_converted(failures, info, catalog, log, tool)
             catalog.commit()
@@ -4610,6 +5047,9 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
             _remove_empty_work_parent(work_root)
     if work_root is not None and progress["finished"]:
         log.log(_timing_line(timing, progress["finished"], time.monotonic() - started))
+        if servers is not None and servers.count:
+            log.log(f"jxl-photo serve: {servers.count} processes for "
+                    f"{_num(progress['finished'])} files")
     return interrupted
 
 

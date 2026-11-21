@@ -3,6 +3,16 @@
 The short notes of each recent release, newest first; the README keeps the
 current one. Every release in detail: [version_history.md](version_history.md).
 
+## v0.14.0-rc7 (test version, not released yet)
+
+2026-11-22. jxl-photo's `--serve` mode: one jxl-photo process per worker converts file after file, instead of one process per file. Needs jxl-photo 2.31.0-rc3 (unchanged). Everything of rc6 and below holds.
+
+- **Serve mode** ([JP-23](jxlphoto_contract.md#jp-23--serve-mode-one-process-file-after-file)): Python, its imports and ExifTool start once per worker, not once per photo. Measured with the CPU as the limit (16 cores, NVMe): JPEGs about 9 % faster, TIFFs 9 %, a restore of many TIFFs 34 %; nothing changes when a hard disk is the limit. A failed file ends its process (the next starts a new one) and keeps its part of the log; a process that cannot serve is `JXL-PHOTO SERVE NOT USED` and the run goes on with one jxl-photo per file. `JXLPHOTO_SERVE = False` gives the old way. The restore does the same for its TIFFs. [How](tiff_to_jxl.md#how-the-conversions-run-serve-mode)
+- **Test versions are compared by kind**: `2.31.0_beta4` is older than `2.31.0-rc1` (alpha < beta < rc, then their number); before, any suffix's number counted.
+- **A JPEG restored by djxl makes no work folder**: four folder operations less per JPEG on the target's disk.
+- The contract has a new item, JP-23 (the serve mode), and its test: jxl-photo 2.31.0-rc3 23 of 23, rc1 and rc2 20 of 23 (the minimum does not move).
+- **From the review before release**, each with a test that fails without it: a serve process whose output ends is never waited for without an end; a Ctrl+C while a process starts is not taken for a jxl-photo that cannot serve; a process that ended leaves nothing behind until the run's end (a long run starts one every 2000 files and one after each failed file); once serve is given up no process waits idle; the restore of a JPEG removes only the file it made.
+
 ## v0.14.0-rc6 (test version, not released yet)
 
 2026-11-22. jxl-photo 2.31.0-rc3, a backup that stops failing on the same files

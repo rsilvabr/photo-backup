@@ -32,6 +32,17 @@ a folder of their own in the system's temp folder, removed after
 and Windows hangs a program whose temp folder has 260 characters when it
 starts another one: a TIFF there waited `JXL_TIMEOUT_MIN` and failed.
 
+*(v0.14.0-rc7)* With jxl-photo 2.31.0-rc3 or newer (and `JXLPHOTO_SERVE`) the
+TIFFs (and the JPEGs when there is no djxl) are made by one jxl-photo process
+per worker that takes file after file ([how](tiff_to_jxl.md#how-the-conversions-run-serve-mode)):
+their temp folder is a `pbrestore_serve_...` folder in the system's temp folder,
+removed when the restore ends (so a target with a `%` needs nothing else), and
+their logs are in `Logs\jxl-photo`, one per process. A system temp folder with a
+`%`, too deep, or inside the backup: one jxl-photo per file, as before. An older
+jxl-photo (the restore accepts 2.30.0) runs one per file too. A JPEG rebuilt by
+djxl makes no work folder at all: it is written to one file next to the target,
+which takes the target's name or is removed.
+
 Exactly one of `--to` and `--to-original` is required. Outcomes per file, in
 the console, in the log and in `<log>_restore.csv`:
 

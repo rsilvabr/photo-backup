@@ -8,7 +8,7 @@ work: change anything else in jxl-photo freely; change one of these items and
 photo-backup breaks — safely (it stops, or keeps the TIFF as it is), but it
 breaks.
 
-Each item has a number, **JP-1** to **JP-22**, used in three places:
+Each item has a number, **JP-1** to **JP-23**, used in three places:
 
 - here: the rule, where it lives in each program, what breaks;
 - in photo-backup's messages: `CONVERT FAILED <file>: ... (JP-5)`, a restore's
@@ -44,9 +44,9 @@ jxl-photo's git tags (`set PHOTOBACKUP_JXLPHOTO=...`, below):
 | v2.29.1 (`jxl_photo.py`) | 3 of 17 | `jxl_photo.py encode` / `decode` / `transcode` did not exist yet: exit 2, `usage: ...` (2026-11-19) |
 | v2.30.0_beta1 | 16 of 17 | everything worked; JP-1 refused a test version of 2.30.0 (2026-11-19) |
 | v2.30.0, v2.30.1, v2.30.2 | 17 of 17 (2026-11-19); v2.30.2 with rc4's test: 19 of 21 (2026-11-20) | the first release whose `jxl_photo.py` runs its backends by name, and still the restore's minimum; for a backup JP-1 refuses it, and JP-20 fails: no page is checked, and without djxl it still writes the JXL |
-| v2.31.0-rc1 | 21 of 21 (2026-11-20); with rc6's test: 20 of 22 (2026-11-22) | the first that checks every page of an encode (JP-20); JP-1 refuses it now, and JP-22 fails: with a `%` temp folder the encode exits 0 |
-| v2.31.0-rc2 | 20 of 22 (2026-11-22) | as rc1 for photo-backup: JP-1 refuses it, JP-22 fails (exit 0) |
-| **v2.31.0-rc3** | **22 of 22** (2026-11-22) | refuses a temp folder with a `%` (JP-22) |
+| v2.31.0-rc1 | 21 of 21 (2026-11-20); with rc6's test: 20 of 22, with rc7's: 20 of 23 (2026-11-22) | the first that checks every page of an encode (JP-20); JP-1 refuses it now, JP-22 fails (with a `%` temp folder the encode exits 0) and JP-23 (no `--serve`: photo-backup would run it one call per file) |
+| v2.31.0-rc2 | 20 of 22; with rc7's test: 20 of 23 (2026-11-22) | as rc1 for photo-backup: JP-1 refuses it, JP-22 fails (exit 0), JP-23 fails (no `--serve`) |
+| **v2.31.0-rc3** | **22 of 22**; with rc7's test: **23 of 23** (2026-11-22) | refuses a temp folder with a `%` (JP-22); the first with `--serve` (JP-23) |
 | `jxl-photo.exe` 2.29.0_beta1 | 16 of 17 | the exe had its backends by name before the script did; JP-1 refused it (one minimum for both) |
 
 (JP-15 to JP-17 were added with photo-backup v0.14.0-rc3 and measured the same
@@ -54,7 +54,9 @@ day: the minimum did not move. JP-18 and JP-19, v0.14.0-rc4, are faster routes
 photo-backup takes when it can — without djxl it uses JP-16, without a
 command's own script it goes through `jxl_photo.py` — so they move nothing
 either. JP-20 and JP-21, also v0.14.0-rc4, moved it to 2.31.0-rc1. JP-22,
-v0.14.0-rc6, moved it to 2.31.0-rc3.)
+v0.14.0-rc6, moved it to 2.31.0-rc3. JP-23, v0.14.0-rc7, is the serve mode that
+2.31.0-rc3 already had: photo-backup falls back to one call per file without
+it, so the minimum did not move.)
 
 ## When you change jxl-photo
 
@@ -70,7 +72,7 @@ v0.14.0-rc6, moved it to 2.31.0-rc3.)
    Without `PHOTOBACKUP_JXLPHOTO` the test is skipped, so photo-backup's own
    suite never needs jxl-photo. On a version older than
    `JXLPHOTO_MIN_VERSION`, JP-1 fails by definition: read the others.
-2. **21 passed**: photo-backup keeps working with that version. (Without djxl
+2. **Everything passed** (every test, no failure): photo-backup keeps working with that version. (Without djxl
    on PATH every encode fails: since 2.31.0-rc1 jxl-photo needs it to check
    the pages, JP-20.)
 3. **A failure names its item** (`AssertionError: JP-6: multi.jxl: ...`): read
@@ -100,7 +102,7 @@ It fails closed; nothing is ever left without a copy:
   or an older one, is refused — exit 2, nothing read, nothing written; so is a
   backup with a `Tiff` profile when djxl is not on PATH (jxl-photo needs it to
   check the pages).
-- **During a backup** (JP-2 to JP-9, JP-15, JP-16, JP-18, JP-20): a conversion whose result fails a check is
+- **During a backup** (JP-2 to JP-9, JP-15, JP-16, JP-18, JP-20, JP-23): a conversion whose result fails a check is
   `CONVERT FAILED <file>: <why> (JP-n)` in the log — for a jxl-photo error,
   its own ERROR line, and the path of its log of that conversion, kept in
   `Logs\jxl-photo` —; that TIFF is copied as it is, the run exits 1, and the
@@ -494,6 +496,44 @@ changing the encoder.
   ExifTool cannot write one by one (a SilverFast scan's settings), and other
   steps failed file by file. The contract test runs an encode and a transcode
   with a `%` temp folder: exit 2, no file written, the source unchanged.
+
+### JP-23 — Serve mode: one process, file after file
+
+- **Rule:** `<command> --serve <options>` (the options a single call takes
+  after its input and output: JP-2 for `encode`, JP-10 for `decode`, JP-15 for
+  `transcode`, JP-16 for the rebuild) starts one process that converts the
+  files it is given, one after the other. Its first stdout line is
+  `{"serve": 1, ..., "script": "<backend>.py"}`. photo-backup hands it a file
+  as one line of JSON on stdin, `{"id": "...", "input": "<absolute path>",
+  "output": "<absolute folder that exists>"}` (exactly these three string
+  keys), and reads one line back with the same id: `{"id": ..., "exit": N,
+  "outputs": [...], "error": "..."}`. `exit` is the exit code the single call
+  would have had; `error` names the cause when `exit` is not 0 (the first ERROR
+  messages: cjxl's reason, the page that failed its check, JP-20; at most 1000
+  characters, empty when `exit` is 0). What a job writes in its output folder
+  is what the single call writes: every other item (JP-3 to JP-9, JP-15 to
+  JP-17, JP-20) holds for a job as for a call. The process ends by itself
+  (exit 0) when its stdin is closed. It keeps one log,
+  `JXLPHOTO_LOG_DIR\<backend>\..._<pid>.log`, and a job's lines are in it
+  before its answer: photo-backup keeps a failed job's part.
+- **photo-backup:** `_JxlServer` (one process: first line, a job, the log's
+  part of a failed job), `_JxlServers` (one process per worker thread and
+  command line, started at its first file, ended with the run) and
+  `_jxlphoto_call`, which every conversion and the restore go through;
+  `JXLPHOTO_SERVE` turns it off. A job that failed ends its process (what it
+  left half done never reaches another file; the next file starts a new
+  one), as does a process that ran `_SERVE_JOBS_MAX` files. A process that
+  does not start, or does not say the protocol, is `JXL-PHOTO SERVE NOT USED`
+  in the log and the run goes on with one jxl-photo per file; one that ends or
+  answers something else is `CONVERT FAILED ... (JP-23)` for that file.
+- **jxl-photo (since 2.31.0-rc3):** `_serve` and `_serve_job` in
+  `jxl_photo_common.py`, in every backend.
+- **If it breaks:** the conversions fall back to one call per file (slower:
+  Python, its imports and ExifTool start for each file), or a file fails with
+  `(JP-23)`. photo-backup does not need `outputs`, the end line's numbers, a
+  malformed line's answer or a process that goes on after a failed job. The
+  contract test runs every command through photo-backup's own client on a real
+  jxl-photo.
 
 ## What jxl-photo may change freely
 

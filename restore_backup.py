@@ -41,7 +41,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc6"
+__version__ = "0.14.0-rc7"
 
 # ---- Settings -------------------------------------------------------------------
 SPACE_MARGIN_GB = 5.0     # free space kept on each restore target drive (default --space-margin-gb)
@@ -155,7 +155,7 @@ def _resolve_group_exists(group, target):
                         "earlier is never the same bytes either); left as it was")
 
 
-def _restore_group(group, backup, target, jxlphoto, work):
+def _restore_group(group, backup, target, jxlphoto, work, servers=None):
     """Turn a TIFF kept as JXL back into a TIFF at the target: the JXL files
     are copied (hash checked against the catalog) under jxl-photo's own names
     into the work folder -- a folder of this restore next to the target,
@@ -165,11 +165,16 @@ def _restore_group(group, backup, target, jxlphoto, work):
     folder has one, JP-22) or a work folder too deep for a temp folder (240
     characters or more: Windows hangs a program whose temp folder has 260)
     gives jxl-photo a temp folder of its own in the system's temp folder
-    instead, removed after (v0.14.0-rc6). (status, detail)."""
+    instead, removed after (v0.14.0-rc6). `servers`: jxl-photo's serve processes
+    of this restore (sb._JxlServers, JP-23), else one call per group. A JPEG
+    rebuilt by djxl makes no folder: `work` is the one file it is written to
+    (v0.14.0-rc7). (status, detail)."""
     folder = os.path.dirname(os.path.abspath(target))
     os.makedirs(sb._io(folder), exist_ok=True)
     if os.path.lexists(sb._io(work)):
         return "ERROR", f"something is in the way of the restore's own folder: {work}"
+    if group.kind == "jpeg" and sb._djxl_path() is not None:
+        return _rebuild_jpeg_with_djxl(group, backup, target, work)
     work_in, work_out = os.path.join(work, "jxl"), os.path.join(work, "tiff")
     work_temp = os.path.join(work, "temp")      # jxl-photo's own temp files (v0.14.0-rc5)
     os.makedirs(sb._io(work_in))
@@ -178,8 +183,6 @@ def _restore_group(group, backup, target, jxlphoto, work):
     ext = os.path.splitext(group.rel)[1]
     own_temp = None
     try:
-        if group.kind == "jpeg" and sb._djxl_path() is not None:
-            return _rebuild_jpeg_with_djxl(group, backup, target, work_out)
         if "%" in work_temp or len(work_temp) >= sb._JXL_TEMP_MAX_CHARS:
             # a '%' (JP-22), or a deep target: Windows hangs a program whose temp
             # folder has 260 characters or more (v0.14.0-rc6 review, M1)
@@ -220,11 +223,13 @@ def _restore_group(group, backup, target, jxlphoto, work):
             arguments = sb._jxlphoto_decode_args(work_in, work_out)
             wanted, item = (".tif", ".tiff"), "JP-10"
         try:
-            run = sb._run_jxlphoto(jxlphoto, arguments, max(sb.JXL_TIMEOUT_MIN, 1) * 60,
-                                   temp_dir=own_temp or work_temp)
+            run = sb._jxlphoto_call(servers, jxlphoto, arguments, sb._jxl_timeout_s(), None,
+                                    own_temp or work_temp)
         except subprocess.TimeoutExpired:
             return "ERROR", f"jxl-photo took more than {sb.JXL_TIMEOUT_MIN} min"
-        said = sb._jxlphoto_said(run)
+        except sb._ConvertFailed as exc:
+            return "ERROR", str(exc)
+        said = run.said
         if run.returncode != 0:
             return "ERROR", f"jxl-photo stopped with exit {run.returncode} ({item}): {said}"
         with os.scandir(sb._io(work_out)) as listing:
@@ -256,12 +261,15 @@ def _restore_group(group, backup, target, jxlphoto, work):
             sb._remove_own_folder(own_temp)
 
 
-def _rebuild_jpeg_with_djxl(group, backup, target, work_out):
+def _rebuild_jpeg_with_djxl(group, backup, target, work):
     """A JPEG kept as JXL, the fast way (v0.14.0-rc4): its JXL is read once from
     the backup (never written there) and checked against its catalog SHA-256;
     libjxl's djxl rebuilds the JPEG in memory (JP-18), which must have the
     original's SHA-256; it is written next to the target and takes its name,
-    never replacing a file. (status, detail)."""
+    never replacing a file. `work` is the file it is written to, next to the
+    target (no folder: four folder operations less per JPEG, v0.14.0-rc7),
+    created here ("xb": a file already there is someone else's and stays) and
+    removed when it does not take the target's name. (status, detail)."""
     row, _conv = group.members[0]
     with open(sb._io(os.path.join(backup, row.rel)), "rb") as handle:
         data = handle.read()
@@ -269,23 +277,32 @@ def _rebuild_jpeg_with_djxl(group, backup, target, work_out):
         return ("CORRUPT_IN_BACKUP", f"{row.rel}: the backup copy is not the one the catalog "
                                      f"recorded (size or SHA-256)")
     try:
-        jpeg = sb._rebuild_jpeg(None, None, work_out, max(sb.JXL_TIMEOUT_MIN, 1) * 60, data=data)
+        jpeg = sb._rebuild_jpeg(None, None, work, sb._jxl_timeout_s(), data=data)
     except sb._ConvertFailed as exc:
         return "ERROR", f"{exc}; nothing was written at the target"
     if hashlib.sha256(jpeg).hexdigest() != group.sha256:
         return "ERROR", ("the JPEG rebuilt from its JXL is not the original's bytes (JP-18); "
                          "nothing was written at the target")
-    result = os.path.join(work_out, "rebuilt.jpg")
-    with open(sb._io(result), "wb") as handle:
-        handle.write(jpeg)
-        handle.flush()
-        os.fsync(handle.fileno())
-    mtime_ns = group.conv.source_mtime_ns
-    os.utime(sb._io(result), ns=(mtime_ns, mtime_ns))       # the original's date
     try:
-        sb._rename_no_clobber(result, target)
+        handle = open(sb._io(work), "xb")
     except FileExistsError:
-        return "CONFLICT", "the target appeared during the restore; left as it was"
+        return "ERROR", f"something is in the way of the restore's own file: {work}"
+    renamed = False
+    try:
+        with handle:
+            handle.write(jpeg)
+            handle.flush()
+            os.fsync(handle.fileno())
+        mtime_ns = group.conv.source_mtime_ns
+        os.utime(sb._io(work), ns=(mtime_ns, mtime_ns))     # the original's date
+        try:
+            sb._rename_no_clobber(work, target)
+        except FileExistsError:
+            return "CONFLICT", "the target appeared during the restore; left as it was"
+        renamed = True
+    finally:
+        if not renamed:                 # this restore's own file, never the target's
+            sb._remove_temp(work)
     return ("RESTORED", "rebuilt from its JXL by djxl: the original JPEG's bytes "
                         "(SHA-256 checked)")
 
@@ -295,10 +312,10 @@ RESTORE_STOPPED_SAYING = ("Stopped (Ctrl+C). {count} files came back and are in 
                           "target. The backup was only read. Nothing is being written now.")
 
 
-def _run_group(group, backup, target, jxlphoto, work):
+def _run_group(group, backup, target, jxlphoto, work, servers=None):
     """_restore_group on a worker thread: every error becomes a status."""
     try:
-        return _restore_group(group, backup, target, jxlphoto, work)
+        return _restore_group(group, backup, target, jxlphoto, work, servers)
     except Exception as exc:
         return "ERROR", str(exc)
 
@@ -598,6 +615,28 @@ def _main(argv):
         workers = sb._jxl_workers()
         jpeg_pool = ThreadPoolExecutor(max_workers=workers)
         tiff_pool = ThreadPoolExecutor(max_workers=min(workers, sb._jxl_tiff_workers()))
+        servers, serve_root = None, None
+        needs_jxlphoto = any(
+            isinstance(row, _JxlGroup) and status not in ("MISSING_IN_BACKUP", "REFUSED",
+                                                          "NEEDS_JXLPHOTO")
+            and (row.kind == "tiff" or sb._djxl_path() is None)
+            for status, row, _src, _target in items)
+        if needs_jxlphoto and jxlphoto and sb._serve_wanted(sb._jxlphoto_version(jxlphoto)):
+            system_temp = tempfile.gettempdir()
+            if ("%" in system_temp
+                    or len(system_temp) >= sb._JXL_TEMP_MAX_CHARS - sb._WORK_TEMP_EXTRA - 30
+                    or sb._is_under(system_temp, backup)
+                    or sb._is_under(sb._real(system_temp), sb._real(backup))):
+                log.log("jxl-photo serve not used: the system's temp folder has a '%' in its "
+                        "path, is too deep or is inside the backup; one jxl-photo per file")
+            else:
+                try:
+                    serve_root = tempfile.mkdtemp(prefix="pbrestore_serve_")
+                    servers = sb._JxlServers(jxlphoto, serve_root,
+                                             log_dir=os.path.join(os.path.abspath(sb.LOG_DIR),
+                                                                  "jxl-photo"))
+                except OSError as exc:
+                    log.log(f"jxl-photo serve not used: {exc}; one jxl-photo per file")
         pending = {}
         # each group's future lands here when it is done: the main thread takes
         # the finished ones from the queue instead of asking every pending group
@@ -677,7 +716,7 @@ def _main(argv):
                                         f"{os.path.basename(target)}.restoring_{stamp}_{index}"
                                         f"{sb.TEMP_SUFFIX}")
                     pool = jpeg_pool if row.kind == "jpeg" else tiff_pool
-                    future = pool.submit(_run_group, row, backup, target, jxlphoto, work)
+                    future = pool.submit(_run_group, row, backup, target, jxlphoto, work, servers)
                     pending[future] = (index, row, target)
                     future.add_done_callback(finished_queue.put)
                     continue
@@ -752,6 +791,14 @@ def _main(argv):
         finally:
             for pool in (jpeg_pool, tiff_pool):
                 pool.shutdown(wait=True, cancel_futures=True)
+            if servers is not None:
+                servers.close()
+                sb._remove_own_folder(serve_root)
+                if servers.unavailable:
+                    log.log(f"JXL-PHOTO SERVE NOT USED: {servers.unavailable}; one jxl-photo per "
+                            f"file")
+            elif serve_root:
+                sb._remove_own_folder(serve_root)
         result_rows = [item for item in results if item is not None]
         log.csv(".csv", ["status", "rel", "target", "detail"], result_rows)
         result_counts = {}

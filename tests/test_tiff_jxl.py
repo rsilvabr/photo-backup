@@ -672,6 +672,7 @@ def test_j15_the_restore_never_runs_an_old_kept_jxlphoto(env, monkeypatch, capsy
 # ---- J27-J35 the conversions outside the backup, jxl-photo 2.31 (v0.14.0-rc4) --------------------
 def test_j27_conversions_run_outside_the_backup_with_their_own_logs(env, monkeypatch,
                                                                     photobackup_log_dir):
+    monkeypatch.setattr(sb, "JXLPHOTO_SERVE", False)    # a single call's own shape (rc7: serve has its own tests)
     envs = env.root / "envs"
     monkeypatch.setenv("FAKE_JXLPHOTO_ENVS", str(envs))
     assert backup(env, "--tiff", "jxl") == 0
@@ -935,6 +936,7 @@ def test_j44_jxlphotos_own_temp_files_stay_in_the_conversions_folder(env, monkey
     """TMPDIR, TEMP and TMP of each jxl-photo call are its conversion's own
     folder: nothing of a conversion goes to the system's temp folder (the
     owner's SSD), and what jxl-photo leaves there leaves with the folder."""
+    monkeypatch.setattr(sb, "JXLPHOTO_SERVE", False)    # a single call's own shape (rc7: serve has its own tests)
     envs = env.root / "envs"
     monkeypatch.setenv("FAKE_JXLPHOTO_ENVS", str(envs))
     monkeypatch.setenv("FAKE_JXLPHOTO_LEAK_TEMP", "1")      # a temp file it never removes

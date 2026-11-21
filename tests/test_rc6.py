@@ -91,6 +91,7 @@ def test_6_a_percent_temp_folder_is_refused_and_said(tmp_path):
 
 def test_7_the_restore_into_a_percent_folder_gets_a_temp_folder_of_its_own(
         env, tmp_path, monkeypatch, photobackup_log_dir):
+    monkeypatch.setattr(sb, "JXLPHOTO_SERVE", False)    # a single call's own shape (rc7: serve has its own tests)
     assert backup(env, "--tiff", "jxl") == 0
     envs = tmp_path / "envs"
     monkeypatch.setenv("FAKE_JXLPHOTO_ENVS", str(envs))

@@ -5,7 +5,7 @@ one (its jxl_photo.py or jxl-photo.exe):
     set PHOTOBACKUP_JXLPHOTO=C:\\path\\to\\jxl-photo\\jxl_photo.py
     python -m pytest tests/test_jxlphoto_contract.py -v
 
-Each test is one item of the contract (JP-1 ... JP-22): a failure names the
+Each test is one item of the contract (JP-1 ... JP-23): a failure names the
 item, and the document says where that item lives in both programs. Needs
 numpy and tifffile (jxl-photo needs them too), and djxl on PATH (jxl-photo
 checks every page of an encode with it: JP-20). About a minute: every call is
@@ -513,3 +513,166 @@ def test_jp22_a_temp_folder_with_a_percent_is_refused(check, tmp_path):
             f"JP-22: {item}: files in the output folder: {[p.name for p in out.rglob('*')]}")
         assert "%" in (run.stderr or ""), f"JP-22: {item}: stderr says nothing of the '%'"
         assert _stat(source) == before, f"JP-22: {item}: the source changed"
+
+
+# ---- serve mode (v0.14.0-rc7, jxl-photo 2.31.0-rc3) ----
+def _serve_options(command):
+    """What follows input and output on a single call's command line (what
+    photo-backup gives `--serve`)."""
+    arguments = {"encode": sb._jxlphoto_encode_args("in", "out", PROFILE),
+                 "decode": sb._jxlphoto_decode_args("in", "out"),
+                 "transcode": sb._jxlphoto_transcode_args("in", "out")}[command]
+    return arguments[3:]
+
+
+def _first_line(process, seconds=120):
+    """The first stdout line of a process, or b'' when it ends without one."""
+    import queue
+    import threading
+    lines = queue.Queue()
+    threading.Thread(target=lambda: lines.put(process.stdout.readline()), daemon=True).start()
+    return lines.get(timeout=seconds)
+
+
+def _serving(tmp_path, command, temp=None):
+    temp = temp or tmp_path / "serve_temp"
+    temp.mkdir(exist_ok=True)
+    return subprocess.Popen(
+        sb._jxlphoto_argv(JXLPHOTO, [command, "--serve", *_serve_options(command)]),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=sb._jxlphoto_env(str(tmp_path / "serve_log"), str(temp)))
+
+
+@pytest.fixture
+def servers(tmp_path):
+    """photo-backup's own serve client on a real jxl-photo."""
+    made = sb._JxlServers(JXLPHOTO, str(tmp_path / "serve"))
+    yield made
+    made.close()
+
+
+def test_jp23_serve_says_its_protocol(tmp_path):
+    for command in ("encode", "decode", "transcode"):
+        process = _serving(tmp_path, command)
+        try:
+            first = json.loads(_first_line(process))
+            assert first.get("serve") == 1, f"JP-23: {command}: {first}"
+            assert os.path.splitext(first.get("script", ""))[0] == sb._JXLPHOTO_BACKENDS[command], (
+                f"JP-23: {command}: script {first.get('script')}")
+            process.stdin.close()
+            assert process.wait(60) == 0, f"JP-23: {command}: did not end with its stdin"
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.stdout.close()
+            process.stderr.close()
+
+
+def test_jp23_transcode_job_is_a_single_call(check, servers, tmp_path):
+    if shutil.which("djxl") is None:
+        pytest.skip("JP-23: no djxl on PATH to rebuild the JPEG with")
+    for name in ("camera", "progressive"):
+        jpeg, before = check.jpegs[name], _stat(check.jpegs[name])
+        out = tmp_path / f"job_{name}"
+        out.mkdir()
+        run = servers.run(sb._jxlphoto_transcode_args(str(jpeg), str(out)), TIMEOUT_S)
+        assert run.returncode == 0, f"JP-23: {name}: exit {run.returncode}: {run.said}"
+        jxl = [path for path in out.iterdir() if path.suffix.casefold() == ".jxl"]
+        assert len(jxl) == 1, f"JP-23: {name}: {[path.name for path in jxl]}"
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(sb, "DJXL", "")
+            sb._DJXL_FOUND.clear()
+            rebuilt = sb._rebuild_jpeg(str(jxl[0]), None, str(tmp_path / "unused"), TIMEOUT_S)
+        sb._DJXL_FOUND.clear()
+        assert _sha256(rebuilt) == before[2], f"JP-23: {name}: not the JPEG's bytes"
+        assert _stat(jpeg) == before, f"JP-23: {name}: the source changed"
+    assert servers.count == 1, "JP-23: one process takes file after file"
+
+
+def test_jp23_rebuild_job(check, servers, tmp_path):
+    result = check.transcoded["camera"]
+    if not result.jxl:
+        pytest.skip("JP-23: JP-15 failed first")
+    alone = tmp_path / "alone"
+    alone.mkdir()
+    shutil.copy2(check.root / "jpg_camera" / result.jxl[0], alone / result.jxl[0])
+    back = tmp_path / "back"
+    back.mkdir()
+    run = servers.run(sb._jxlphoto_rebuild_args(str(alone / result.jxl[0]), str(back)), TIMEOUT_S)
+    assert run.returncode == 0, f"JP-23: exit {run.returncode}: {run.said}"
+    made = [path for path in back.iterdir() if path.suffix.casefold() in (".jpg", ".jpeg")]
+    assert len(made) == 1 and _sha256(made[0].read_bytes()) == check.before["camera"][2], (
+        "JP-23: the rebuild job did not give the JPEG's bytes")
+
+
+def test_jp23_encode_job_is_a_single_call(check, servers, tmp_path):
+    for name in ("photo8", "multi"):
+        out = tmp_path / f"job_{name}"
+        out.mkdir()
+        run = servers.run(sb._jxlphoto_encode_args(str(check.tiffs[name]), str(out), PROFILE),
+                          TIMEOUT_S)
+        assert run.returncode == 0, f"JP-23: {name}: exit {run.returncode}: {run.said}"
+        names = sorted(path.name for path in out.iterdir() if path.suffix.casefold() == ".jxl")
+        assert names and names == check.encoded[name].jxl, (
+            f"JP-23: {name}: {names} != the single call's {check.encoded[name].jxl}")
+        want = sb._jxlphoto_srcsum(check.before[name][2])
+        for jxl in names:
+            assert sb._jxl_tokens(str(out / jxl)).get("jxlphoto-srcsum") == [want], (
+                f"JP-23: {name}: {jxl}: jxlphoto-srcsum")
+    assert servers.count == 1
+
+
+def test_jp23_decode_job(check, servers, tmp_path):
+    folder = tmp_path / "dec_in"
+    shutil.copytree(check.encoded["photo8"].out, folder)
+    out = tmp_path / "dec_out"
+    out.mkdir()
+    run = servers.run(sb._jxlphoto_decode_args(str(folder), str(out)), TIMEOUT_S)
+    assert run.returncode == 0, f"JP-23: exit {run.returncode}: {run.said}"
+    made = [path for path in out.iterdir() if path.suffix.casefold() in (".tif", ".tiff")]
+    assert len(made) == 1, f"JP-23: {[path.name for path in out.iterdir()]}"
+
+
+def test_jp23_failed_job_says_why(check, servers, tmp_path):
+    truncated = tmp_path / "truncated.jpg"
+    truncated.write_bytes(check.jpegs["camera"].read_bytes()[:300])
+    out = tmp_path / "bad"
+    out.mkdir()
+    run = servers.run(sb._jxlphoto_transcode_args(str(truncated), str(out)), TIMEOUT_S)
+    assert run.returncode != 0 and run.said, f"JP-23: exit {run.returncode}, said {run.said!r}"
+    assert len(run.said) <= sb._JXLPHOTO_SAID_CHARS
+    good = tmp_path / "good"
+    good.mkdir()
+    run = servers.run(sb._jxlphoto_transcode_args(str(check.jpegs["camera"]), str(good)),
+                      TIMEOUT_S)                                # the next file: a new process
+    assert run.returncode == 0 and [p for p in good.iterdir() if p.suffix == ".jxl"], (
+        f"JP-23: the file after a failed one: exit {run.returncode}: {run.said}")
+    assert servers.count == 2
+
+
+def test_jp23_job_lines_in_the_log_before_the_answer(check, servers, tmp_path):
+    out = tmp_path / "logged"
+    out.mkdir()
+    run = servers.run(sb._jxlphoto_transcode_args(str(check.jpegs["camera"]), str(out)), TIMEOUT_S)
+    assert run.returncode == 0
+    server = servers.started[0]
+    assert server.log_file and os.path.isfile(server.log_file), "JP-23: no log of the process"
+    assert f"_{server.process.pid}" in os.path.basename(server.log_file), "JP-23: the log's name"
+    assert str(check.jpegs["camera"]) in Path(server.log_file).read_text(
+        encoding="utf-8", errors="replace"), "JP-23: the job's input is not in the log yet"
+
+
+def test_jp22_serve_refuses_a_percent_temp_folder(tmp_path):
+    temp = tmp_path / "te%mp"
+    process = _serving(tmp_path, "transcode", temp)
+    try:
+        assert _first_line(process) == b"", "JP-22: it said it serves with a '%' temp folder"
+        assert process.wait(60) == 2, "JP-22: --serve with a '%' temp folder must exit 2"
+        said = process.stderr.read().decode("utf-8", "replace")
+        assert "%" in said, (f"JP-22: --serve refused, but not for the '%' (a jxl-photo "
+                             f"without --serve?): {said.strip()[-300:]}")
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.stdout.close()
+        process.stderr.close()

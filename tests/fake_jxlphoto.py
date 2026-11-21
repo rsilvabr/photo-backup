@@ -38,8 +38,25 @@ Python's tempfile.gettempdir()) has a '%' in its path prints a usage line and on
     FAKE_JXLPHOTO_REBUILD_WRONG  any value: a rebuilt JPEG is not the original's bytes
     FAKE_JXLPHOTO_CALLS  a folder: each call writes its arguments there (one JSON file)
     FAKE_JXLPHOTO_VERSION  what `encode --version` says (default 9.9.9; "none": no number)
+
+Serve mode (jxl-photo 2.31.0-rc3, JP-23): `fake_jxlphoto.py <command> --serve <options>`
+reads one JSON job per line on stdin ({"id", "input", "output"}), does what ONE call
+does for `<command> <input> <output> <options>` (the same CALLS, ENVS, LEAK_TEMP, SLEEP
+and failure knobs; FAKE_JXLPHOTO_SLEEP_PIDS writes the server's pid), and answers one JSON
+line on stdout ({"id", "exit", "outputs", "error"}); its first line says
+{"serve": 1, "version", "script"}; at the end of stdin it says {"end": true, ...}. One log
+for all jobs, JXLPHOTO_LOG_DIR\\<backend>\\<time>_<pid>.log. Knobs:
+    FAKE_JXLPHOTO_SERVE_PIDS  a folder: each server writes <pid>.json (pid, command, options)
+    FAKE_JXLPHOTO_SERVE  refuse (an old jxl-photo: argparse's error, exit 2) | garbage (a
+                         first line that is not the protocol) | die (a job's process ends
+                         without answering) | wrongid (the answer has another id) | fatal (a
+                         job that raised: answered with exit 2, then the process ends);
+                         die, wrongid and fatal for a file whose name holds
+                         FAKE_JXLPHOTO_ONLY (every job when it is not set)
 """
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -208,36 +225,43 @@ def write_log(argv, code):
         return
     folder = os.path.join(folder, BACKENDS[argv[0]])
     os.makedirs(folder, exist_ok=True)
-    with open(os.path.join(folder, f"{time.time_ns():020d}_{os.getpid()}.log"), "w",
+    with open(os.path.join(folder, f"{stamp():020d}_{os.getpid()}.log"), "w",
               encoding="utf-8") as handle:
         handle.write("\n".join([f"fake jxl-photo {' '.join(argv)}"] + LOG
                                + [f"exit {code}"]) + "\n")
 
 
-def main(argv):
+_LAST_STAMP = [0]
+
+
+def stamp():
+    """time.time_ns(), never the same twice in this process: the clock ticks
+    in steps, and a serve job follows the one before it within one tick."""
+    _LAST_STAMP[0] = max(time.time_ns(), _LAST_STAMP[0] + 1)
+    return _LAST_STAMP[0]
+
+
+def record_call(argv):
+    """The CALLS and ENVS files of one call (a serve job too)."""
     calls = os.environ.get("FAKE_JXLPHOTO_CALLS")
     if calls:                           # a folder: one file per call (calls run at once)
         os.makedirs(calls, exist_ok=True)
-        name = f"{time.time_ns():020d}_{os.getpid()}.json"
+        name = f"{stamp():020d}_{os.getpid()}.json"
         with open(os.path.join(calls, name), "w", encoding="utf-8") as handle:
             json.dump(argv, handle)
     envs = os.environ.get("FAKE_JXLPHOTO_ENVS")
     if envs:
         os.makedirs(envs, exist_ok=True)
-        name = f"{time.time_ns():020d}_{os.getpid()}.json"
+        name = f"{stamp():020d}_{os.getpid()}.json"
         with open(os.path.join(envs, name), "w", encoding="utf-8") as handle:
             json.dump({"argv": argv, "gettempdir": tempfile.gettempdir(),
                        **{key: value for key, value in os.environ.items()
                           if key.startswith("JXLPHOTO_") or key in ("TMPDIR", "TEMP", "TMP")}},
                       handle)
-    temp = tempfile.gettempdir()
-    if "--version" not in argv and "%" in temp:       # JP-22: refused before anything is written
-        print("usage: fake_jxlphoto.py [-h] ...", file=sys.stderr)
-        print(f"fake_jxlphoto.py: error: the temp folder has a '%' in its path ({temp}): "
-              f"ExifTool reads a '%' in a file name as a format code, so it cannot keep its "
-              f"files there. Set TEMP_DIR at the top of the script (or the TEMP and TMP "
-              f"variables) to a folder without '%'.", file=sys.stderr)
-        return 2
+
+
+def leak_and_sleep(argv):
+    """LEAK_TEMP and SLEEP of one call (a serve job too)."""
     if os.environ.get("FAKE_JXLPHOTO_LEAK_TEMP") and "--version" not in argv:
         with tempfile.NamedTemporaryFile("w", prefix="fake_jxlphoto_", suffix=".args",
                                          delete=False) as leaked:
@@ -254,9 +278,144 @@ def main(argv):
                 with open(os.path.join(pids, f"{os.getpid()}.pid"), "w") as handle:
                     handle.write("waiting\n")
             time.sleep(float(sleep))
+
+
+def percent_refusal():
+    """JP-22: a temp folder with a '%' is refused before anything is written."""
+    temp = tempfile.gettempdir()
+    if "%" not in temp:
+        return None
+    return temp
+
+
+def main(argv):
+    if "--serve" in argv:
+        return serve(argv[0], [item for item in argv[1:] if item != "--serve"])
+    record_call(argv)
+    temp = percent_refusal()
+    if "--version" not in argv and temp:       # JP-22: refused before anything is written
+        print("usage: fake_jxlphoto.py [-h] ...", file=sys.stderr)
+        print(f"fake_jxlphoto.py: error: the temp folder has a '%' in its path ({temp}): "
+              f"ExifTool reads a '%' in a file name as a format code, so it cannot keep its "
+              f"files there. Set TEMP_DIR at the top of the script (or the TEMP and TMP "
+              f"variables) to a folder without '%'.", file=sys.stderr)
+        return 2
+    leak_and_sleep(argv)
     code = run(argv)
     write_log(argv, code)
     return code
+
+
+ERROR_PREFIX = re.compile(r"^(?:\d\d:\d\d:\d\d \| )?ERROR(?: \| |:\s*)?")
+
+
+def serve(command, options):
+    """The serve mode: see the module docstring."""
+    temp = percent_refusal()
+    if temp:
+        print(f"--serve cannot start: the temp folder has a '%' in its path ({temp})",
+              file=sys.stderr)
+        return 2
+    mode = os.environ.get("FAKE_JXLPHOTO_SERVE", "")
+    if mode == "refuse":
+        print("usage: fake_jxlphoto.py [-h] ...", file=sys.stderr)
+        print("fake_jxlphoto.py: error: unrecognized arguments: --serve", file=sys.stderr)
+        return 2
+    out = sys.stdout.buffer
+
+    def answer(payload):
+        out.write((json.dumps(payload, ensure_ascii=True) + "\n").encode("ascii"))
+        out.flush()
+
+    if mode == "garbage":
+        out.write(b"hello\n")
+        out.flush()
+        sys.stdin.buffer.read()
+        return 0
+    pids = os.environ.get("FAKE_JXLPHOTO_SERVE_PIDS")
+    if pids:
+        os.makedirs(pids, exist_ok=True)
+        with open(os.path.join(pids, f"{os.getpid()}.json"), "w", encoding="utf-8") as handle:
+            json.dump({"pid": os.getpid(), "command": command, "options": options}, handle)
+    log = None
+    folder = os.environ.get("JXLPHOTO_LOG_DIR")
+    if folder:
+        folder = os.path.join(folder, BACKENDS[command])
+        os.makedirs(folder, exist_ok=True)
+        log = open(os.path.join(folder, f"{stamp():020d}_{os.getpid()}.log"), "a",
+                   encoding="utf-8")
+
+    def write(text):
+        if log is not None:
+            log.write(text + "\n")
+            log.flush()
+
+    answer({"serve": 1, "version": VERSION, "script": BACKENDS[command] + ".py"})
+    jobs = failed = 0
+    only = os.environ.get("FAKE_JXLPHOTO_ONLY", "")
+    for raw in sys.stdin.buffer:
+        text = raw.decode("utf-8-sig").strip()
+        if not text:
+            continue
+        jobs += 1
+        try:
+            job = json.loads(text)
+        except ValueError:
+            failed += 1
+            answer({"id": None, "exit": 2, "outputs": [], "error": "bad job: not JSON"})
+            continue
+        job_id = job.get("id") if isinstance(job, dict) else None
+        job_id = job_id if isinstance(job_id, str) else None
+        problem = None
+        if (not isinstance(job, dict) or set(job) != {"id", "input", "output"}
+                or not all(isinstance(job[key], str) for key in job)):
+            problem = "bad job: it needs exactly the string keys id, input, output"
+        elif not (os.path.isabs(job["input"]) and os.path.isabs(job["output"])):
+            problem = "bad job: input and output must be absolute paths"
+        elif not os.path.exists(job["input"]):
+            problem = f"bad job: input does not exist: {job['input']}"
+        elif not os.path.isdir(job["output"]):
+            problem = f"bad job: output is not a folder: {job['output']}"
+        if problem:
+            failed += 1
+            answer({"id": job_id, "exit": 2, "outputs": [], "error": problem})
+            continue
+        argv = [command, job["input"], job["output"], *options]
+        record_call(argv)
+        leak_and_sleep(argv)
+        write(f"serve job {job_id}: {job['input']} -> {job['output']}")
+        picked = not only or only in os.path.basename(job["input"])
+        if mode == "die" and picked:
+            os._exit(3)
+        before = set(os.listdir(job["output"]))
+        del LOG[:]
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+            code = run(argv)
+        for line in LOG:
+            write(line)
+        for line in captured.getvalue().splitlines():
+            write(line)
+        write(f"serve job {job_id}: exit {code}")
+        outputs = sorted(set(os.listdir(job["output"])) - before)
+        lines = [line.strip() for line in captured.getvalue().splitlines() if line.strip()]
+        if code == 0:
+            error = ""
+        else:
+            failed += 1
+            errors = [ERROR_PREFIX.sub("", line, count=1) for line in lines
+                      if "ERROR" in line][:2]
+            error = " | ".join(errors) if errors else (lines[-1] if lines else "see the log")
+        if mode == "wrongid" and picked:
+            answer({"id": "x", "exit": code, "outputs": outputs, "error": error})
+            continue
+        if mode == "fatal" and picked:
+            answer({"id": job_id, "exit": 2, "outputs": [], "error":
+                    "RuntimeError: the fake was told to"})
+            return 2
+        answer({"id": job_id, "exit": code, "outputs": outputs, "error": error})
+    answer({"end": True, "jobs": jobs, "failed": failed})
+    return 0
 
 
 def run(argv):

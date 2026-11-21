@@ -76,6 +76,7 @@ def test_m2_two_runs_where_nothing_converts_count_nothing(env, monkeypatch, phot
 
 
 def test_m2_a_failure_that_says_nothing_of_the_file_never_counts(env, monkeypatch):
+    monkeypatch.setattr(sb, "JXLPHOTO_SERVE", False)    # a single call's own shape (rc7: serve has its own tests)
     real = sb._run_jxlphoto
 
     def cannot_start_for_one(path, arguments, *rest, **kwargs):

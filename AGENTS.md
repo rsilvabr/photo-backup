@@ -29,7 +29,7 @@ from the command line. A future job (e.g. a full mirror) is a new
   = the system's temp folder; the menu remembers one per computer, `work_dir`
   in its config, and `_run_child` passes it to the backup scripts) +
   `JXL_WORK_FOLDER\<pid>` with `_WORK_MARK` in it; each conversion's folder
-  holds a `temp` folder (`_conversion_temp`) that `_jxlphoto_env(log_dir,
+  holds a `temp` folder (made by `_jxlphoto_call`) that `_jxlphoto_env(log_dir,
   temp_dir)` gives jxl-photo as TMPDIR/TEMP/TMP (rc5: its own temp files never
   reach the system's temp folder); `--no-convert` (rc5; the menu's
   `no_convert` per computer) turns the conversion off for a run:
@@ -64,7 +64,7 @@ from the command line. A future job (e.g. a full mirror) is a new
   JP-19: its bytecode is kept, a start is 0.08 s instead of 0.3-0.5 s) and
   `jxl_photo.py` with `-B` only when that script is not there. **What
   photo-backup needs from jxl-photo is a contract,
-  `docs/jxlphoto_contract.md` (仕様書, JP-1 to JP-22):**
+  `docs/jxlphoto_contract.md` (仕様書, JP-1 to JP-23):**
   the two command lines live once, in `_jxlphoto_encode_args` and
   `_jxlphoto_decode_args`; `_jxlphoto_problem` refuses a jxl-photo older than
   `JXLPHOTO_MIN_VERSION` (2.31.0-rc3: refuses a `%` temp folder, JP-22; 2.31.0-rc1
@@ -108,6 +108,39 @@ from the command line. A future job (e.g. a full mirror) is a new
   in its changed loop, its "retire" item covers it); `_convert_all` logs one
   `TIMING conversions:` line (`_Conversion.seconds`, `_place_group(...,
   timing=)`).
+  **v0.14.0-rc7 (jxl-photo's `--serve`, JP-23):** `JXLPHOTO_SERVE` (setting;
+  `_serve_wanted(tool)`: the setting and `_JXLPHOTO_SERVE_SINCE`, 2.31.0-rc3)
+  makes `_convert_all` build one `_JxlServers(jxlphoto, work_root)`: one
+  `_JxlServer` (a process `<command> --serve <options>`, its folder
+  `<work>\s<n>` with `temp\` and `stderr.txt`, jobs as JSON lines, one
+  answer per job) per worker thread and command line (`threading.local`),
+  started at the thread's first file; every conversion goes through
+  `_jxlphoto_call(servers, ...)` -> `_JxlRun(returncode, said)` (a job's
+  `error` is capped by `_cap_said`; without servers, or after
+  `_ServeUnavailable`, one `_run_jxlphoto` per file as rc6). **A failed job
+  ends its process** (`_JxlServer.run` closes it; the next file starts a new
+  one), as does `_SERVE_JOBS_MAX` jobs; a timeout, a death or a wrong answer
+  kills it (`_ConvertFailed`, `counts=False` for a wrong answer, JP-23); a
+  failed job's part of the process's log goes to the conversion's `log\`
+  (`_keep_log`), so `_keep_jxlphoto_log` keeps it as before; a process that
+  does not start or speak the protocol sets `servers.unavailable`
+  (`JXL-PHOTO SERVE NOT USED`, once; the rest runs one call per file; each
+  thread closes its own processes at its next file) -- but not one ended by
+  Ctrl+C while it started (`OSError`, stopping). A process that has ended is
+  forgotten at once (`_JxlServers._forget` -> `_JxlServer.release`: its reader
+  joined, its pipe closed, its folder removed): a long run starts one every
+  `_SERVE_JOBS_MAX` files and one after each failed file (review before rc7,
+  `AI_tools/261122_Claude_review_rc7.md`, `test_r1`-`test_r5`).
+  `servers.close()` runs in `_convert_all`'s `finally`, before
+  `_remove_work_root`; every process is in `_CONVERTERS`, so Ctrl+C ends them.
+  `_jxl_timeout_s()` is the one place JXL_TIMEOUT_MIN becomes seconds (tests
+  patch it). `_version_key` orders test versions alpha < beta < rc, then by
+  their number (`2.31.0_beta4` < `2.31.0-rc1`; an unknown suffix is the
+  oldest). `_conversion_temp` is gone (a single call's temp folder is made in
+  `_jxlphoto_call`). The fake (`tests/fake_jxlphoto.py`) has a serve mode and
+  knobs (`FAKE_JXLPHOTO_SERVE`, `FAKE_JXLPHOTO_SERVE_PIDS`); a test of one
+  call's own shape pins `JXLPHOTO_SERVE = False`, its serve counterpart is in
+  `tests/test_rc7_serve.py`.
 - `manifest_backup.py` — per-folder modes, read from `backup_manifest.csv`
   (gitignored; `backup_manifest.example.csv` is versioned) and
   `backup_modes.csv` (versioned, UTF-8; `--modes` reads another). The code
@@ -185,6 +218,17 @@ from the command line. A future job (e.g. a full mirror) is a new
   its `lossless` flag is 1 (every JPEG; a TIFF per JP-17), the others are
   restored as their JXL (`RESTORED_AS_JXL`). `_find_jxlphoto` falls back to
   the newest jxl-photo kept in the backup.
+  **v0.14.0-rc7:** the restore starts `sb._JxlServers` (root `pbrestore_serve_`
+  in the system's temp folder, `log_dir` = `Logs\jxl-photo`) when a TIFF (or a
+  JPEG without djxl) needs jxl-photo and `sb._serve_wanted` says the jxl-photo
+  serves (the system's temp folder must have no `%`, be short and be outside the
+  backup: else one call per file, logged); `_restore_group(..., servers=)` goes
+  through `sb._jxlphoto_call`; the servers are closed and the folder removed in
+  `_main`'s `finally`. A JPEG rebuilt by djxl (P5) makes no work folder: `work`
+  is the one file `_rebuild_jpeg_with_djxl` creates (`open(..., "xb")`: a file
+  already there is someone else's, `ERROR`, left alone) and renames to the
+  target; it removes that file, and only that one, when the rename did not
+  happen.
 - `captureone_backup.py` — keeps what Capture One itself holds (profiles,
   styles, defaults, ...) in `<dest>\_captureone`, a backup root with its own
   catalog, so `selective_backup.py`'s orphan logic never sees those rows. Rows
@@ -646,7 +690,7 @@ Same as the sibling repo `jxl-photo`. Documents live in `AI_tools/`
 - `docs/captureone.md` — `captureone_backup.py`: what is kept, the restore,
   force and undo, its options and settings.
 - `docs/jxlphoto_contract.md` — the contract with jxl-photo (仕様書): every
-  item JP-1 to JP-22 with its rule, where it lives in both programs and what
+  item JP-1 to JP-23 with its rule, where it lives in both programs and what
   breaks; the minimum version and how it was measured; how to run the
   contract test against any jxl-photo or an old tag.
 - `docs/tiff_to_jxl.md` — a TIFF or JPEG kept as JXL in the backup (the file
