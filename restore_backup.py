@@ -578,15 +578,15 @@ def _main(argv):
         tiff_pool = ThreadPoolExecutor(max_workers=min(workers, sb._jxl_tiff_workers()))
         pending = {}
 
+        speed = sb._Speed()
+
         def report(force=False):
             nonlocal last_report
             now = time.monotonic()
             if force or now - last_report >= sb.PROGRESS_EVERY_S:
-                speed = done_bytes / max(now - started, 1e-6)
-                eta = (total_bytes - done_bytes) / speed if speed > 0 else 0
                 finished = sum(1 for item in results if item is not None)
-                print(f"[{finished}/{len(items)}] {sb._gb(done_bytes)}/"
-                      f"{sb._gb(total_bytes)}  {speed / 1e6:.0f} MB/s  ETA {sb._hms(eta)}")
+                print(f"[{finished}/{len(items)}] {sb._gb(done_bytes)}/{sb._gb(total_bytes)}  "
+                      f"{speed.text(done_bytes, total_bytes)}")
                 last_report = now
 
         def collect(future):

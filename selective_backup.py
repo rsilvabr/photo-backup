@@ -108,8 +108,9 @@ DEST_CHECK_AFTER_ERRORS = 20        # backup: after this many failed copies in a
                                     # (write and remove a temp file in CATALOG_FOLDER); it fails = stop; 0 = never
 CATALOG_FOLDER = "_photo_backup"    # under the destination: catalog.sqlite + versions\
 PROGRESS_EVERY_S = 5.0
-PROGRESS_RECENT_S = 120.0           # the progress line's "last 2 min" speed, which the ETA follows (the average
-                                    # since the start reacts slowly: RAW to small JPEGs, an SMR disk slowing down)
+PROGRESS_RECENT_S = 600.0           # the progress's "last 10 min": its speed and its ETA, beside the whole run's
+                                    # (which reacts slowly: RAW to small JPEGs, an SMR disk slowing down); long
+                                    # enough that 16 conversions finishing in bursts do not make it jump
 AUTO_UPDATE = True                  # default: changed edit settings/sidecars are updated without --update-changed
 AUTO_UPDATE_EXTENSIONS = (".xmp", ".dop", ".pp3", ".cos", ".comask", ".nksc")  # small files rewritten by every edit
 
@@ -567,31 +568,35 @@ def _hms(seconds):
 
 
 class _Speed:
-    """The speed of a long copy or verify: since the start, and over the last
-    PROGRESS_RECENT_S, which the ETA follows once it is known (v0.14.0-rc4)."""
+    """The speed and the time left of a long run (copy, verify, conversion,
+    restore): over the whole run and over the last PROGRESS_RECENT_S once that
+    much has passed, each with its own ETA (v0.14.0-rc4; both ETAs since rc6:
+    one ETA alone said 16 h, then 3 h, in a conversion that took 22 h -- the
+    two side by side show when the pace is changing)."""
 
     def __init__(self):
         self.started = time.monotonic()
         self.samples = collections.deque([(self.started, 0)])   # (time, bytes done)
 
     def text(self, done_bytes, total_bytes):
-        """'85 MB/s, last 2 min 40 MB/s  ETA 2h10m'."""
+        """'whole run 85 MB/s (ETA 2h10m), last 10 min 40 MB/s (ETA 3h05m)';
+        ETA ? = nothing done (in the window)."""
         now = time.monotonic()
         self.samples.append((now, done_bytes))
         while len(self.samples) > 2 and self.samples[1][0] <= now - PROGRESS_RECENT_S:
             self.samples.popleft()          # the oldest kept is just outside the window
-        average = done_bytes / max(now - self.started, 1e-6)
+        left = max(total_bytes - done_bytes, 0)
+
+        def pace(name, moved, seconds):
+            rate = moved / seconds if seconds > 0 else 0
+            return f"{name} {rate / 1e6:.0f} MB/s (ETA {_hms(left / rate) if rate > 0 else '?'})"
+
+        text = pace("whole run", done_bytes, now - self.started)
         then, then_bytes = self.samples[0]
-        recent = None
-        if now - then >= min(30.0, PROGRESS_RECENT_S) and now > then:
-            recent = (done_bytes - then_bytes) / (now - then)
-        speed = recent if recent else average
-        eta = (total_bytes - done_bytes) / speed if speed > 0 else 0
-        text = f"{average / 1e6:.0f} MB/s"
-        if recent is not None and now - self.started > PROGRESS_RECENT_S:
-            minutes = PROGRESS_RECENT_S / 60
-            text += f", last {minutes:g} min {recent / 1e6:.0f} MB/s"
-        return f"{text}  ETA {_hms(eta)}"
+        if PROGRESS_RECENT_S > 0 and now - self.started >= PROGRESS_RECENT_S and now > then:
+            text += ", " + pace(f"last {PROGRESS_RECENT_S / 60:g} min", done_bytes - then_bytes,
+                                now - then)
+        return text
 
 
 def _stderr_is_console():
@@ -3959,9 +3964,10 @@ def _copy_without_conversion(todo, args, dest, stamp, catalog, log, keep_old_fil
     owner's choice for this run. Returns True when interrupted (Ctrl+C)."""
     total, started = len(todo), time.monotonic()
     last_report = started
+    total_bytes, done_bytes = sum(status.planned.size for status in todo), 0
+    speed = _Speed()
     log.out(f"Conversion off (--no-convert): {_num(total)} TIFF/JPEG copied as they are "
-            f"({_gb(sum(status.planned.size for status in todo))}); the JXL already in "
-            f"the backup stay")
+            f"({_gb(total_bytes)}); the JXL already in the backup stay")
     interrupted = False
     try:
         for finished, status in enumerate(todo, 1):
@@ -3976,12 +3982,12 @@ def _copy_without_conversion(todo, args, dest, stamp, catalog, log, keep_old_fil
             if finished % max(FLUSH_BATCH_FILES, 1) == 0:
                 with _ctrl_c_after():
                     catalog.commit()
+            done_bytes += status.planned.size
             now = time.monotonic()
             if now - last_report >= PROGRESS_EVERY_S or finished == total:
-                elapsed = max(now - started, 1e-6)
                 print(f"[{finished}/{total}] as they are (conversion off): "
-                      f"{_gb(info['bytes_as_is'])}  "
-                      f"ETA {_hms(elapsed / finished * (total - finished))}", flush=True)
+                      f"{_gb(info['bytes_as_is'])}  {speed.text(done_bytes, total_bytes)}",
+                      flush=True)
                 last_report = now
     except KeyboardInterrupt:
         interrupted = True
@@ -4168,7 +4174,9 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
             f"({tool}; {' and '.join(pace)} at a time; "
             f"{_gb(sum(status.planned.size for status in todo))})")
     started = time.monotonic()
-    progress = {"finished": 0, "last_report": started}
+    progress = {"finished": 0, "bytes": 0, "last_report": started}
+    total_bytes = sum(status.planned.size for status in todo)
+    speed = _Speed()
     interrupted = False
     # where rc2 and rc3 converted, inside the backup: what an interrupted run left
     _remove_own_folder(os.path.join(dest, CATALOG_FOLDER, _OLD_WORK_FOLDER))
@@ -4246,13 +4254,12 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
         finished = progress["finished"]
         if finished % max(FLUSH_BATCH_FILES, 1) == 0:
             catalog.commit()
+        progress["bytes"] += status.planned.size     # converted or kept as it is
         now = time.monotonic()
         if now - progress["last_report"] >= PROGRESS_EVERY_S or finished == total:
-            elapsed = max(now - started, 1e-6)
-            eta = elapsed / finished * (total - finished)
             print(f"[{finished}/{total}] to JXL: {_gb(info['bytes_in'])} -> "
                   f"{_gb(info['bytes_out'])}, {info['failed']} kept as they are  "
-                  f"ETA {_hms(eta)}")
+                  f"{speed.text(progress['bytes'], total_bytes)}")
             progress["last_report"] = now
 
     ended = False

@@ -82,6 +82,8 @@ def test_j17_jpegs_become_jxl_proven_by_their_rebuild(env, capsys, monkeypatch):
     assert all(call[3:] == ["--mode", "0", "--workers", "1", "--effort", str(sb.JPEG_JXL_EFFORT),
                             "--force-transcode"] for call in made)
     out = capsys.readouterr().out
+    last = [line for line in out.splitlines() if line.startswith("[4/4] to JXL: ")][-1]
+    assert "kept as they are  whole run " in last and " MB/s (ETA " in last   # rc6
     assert row_count(out, "JPEG kept as JXL: to convert") == "4"
     assert "lossless: the same bytes back" in out
     assert "Kept as JXL: 4 converted (4 JPEG)" in out
