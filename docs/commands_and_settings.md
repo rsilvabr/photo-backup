@@ -52,6 +52,7 @@ selective_backup.py --source PATH [--source PATH ...] --dest PATH [options]
 | `--tiff {copy,PROFILE}` | the TIFFs outside export folders: copied as they are (`copy`, default) or kept as JXL with a profile of `TIFF_JXL_PROFILES`, made by jxl-photo *(v0.14.0-rc2; [TIFF kept as JXL](tiff_to_jxl.md))* |
 | `--jpeg {copy,jxl}` | the JPEGs (exports too): copied as they are (`copy`, default) or kept as JXL by jxl-photo's lossless transcode, proven byte for byte *(v0.14.0-rc3)* |
 | `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, for `--tiff` and `--jpeg` (default `JXLPHOTO`). A run that asks for either without jxl-photo is refused before anything is read, exit 2 |
+| `--retry-conversions` | try again the TIFFs and JPEGs jxl-photo could not convert in `CONVERT_GIVE_UP_AFTER` runs in a row (after a new libjxl, say) *(v0.14.0-rc6; [a file jxl-photo cannot convert](tiff_to_jxl.md#a-file-jxl-photo-cannot-convert))* |
 | `--no-convert` | the conversion off for this run (a slow computer, a trip): a TIFF or JPEG that `--tiff`/`--jpeg` would convert is copied as it is, not a failure; the JXL already in the backup stay unless their file changed; no jxl-photo needed *(v0.14.0-rc5; [the conversion off](tiff_to_jxl.md#the-conversion-off-a-trip-with-a-slow-computer))* |
 | `--work-dir PATH` | where the conversions of `--tiff` and `--jpeg` run, jxl-photo's temp files too (default `JXL_WORK_DIR`; empty = the system's temp folder); never inside or above a source or the backup, exit 2 *(v0.14.0-rc5)* |
 | `--expect-backup-id ID` | abort (exit 2) unless the destination holds this backup ID; also applies to `--verify` and `--dry-run` |
@@ -131,7 +132,7 @@ TIFF and JPEG kept as JXL in the backup, and the programs kept in it
 | Constant | Default | Meaning |
 |---|---|---|
 | `JXLPHOTO` | `""` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe` (default `--jxlphoto`); `""` = no conversion |
-| `JXLPHOTO_MIN_VERSION` | `2.31.0-rc1` | the oldest jxl-photo a backup runs: [the contract](jxlphoto_contract.md) between the two programs (2.31.0-rc1 checks every page it converts) |
+| `JXLPHOTO_MIN_VERSION` | `2.31.0-rc3` | the oldest jxl-photo a backup runs: [the contract](jxlphoto_contract.md) between the two programs (2.31.0-rc3 refuses a temp folder with a `%`, JP-22; 2.31.0-rc1 checks every page it converts) |
 | `JXLPHOTO_RESTORE_MIN_VERSION` | `2.30.0` | the oldest jxl-photo the restore runs (the one an older backup keeps still brings its files back) |
 | `TIFF_JXL_PROFILES` | `{"jxl": {"distance": 0.05, "scan_distance": 0, "eight_bit_distance": 0}}` | the profiles a manifest's `Tiff` column (or `--tiff`) names; jxl-photo picks the distance per TIFF (0 = lossless) |
 | `TIFF_EXTENSIONS` | `.tif`, `.tiff` | what a profile converts (never in an export folder) |
@@ -142,6 +143,7 @@ TIFF and JPEG kept as JXL in the backup, and the programs kept in it
 | `JXL_TIFF_WORKERS` | `0` | of those, TIFFs at the same time; `0` = a quarter of the logical CPUs, at most one per 4 GB of free memory |
 | `DJXL` | `""` | libjxl's `djxl` for the proof and the restore of a JPEG; `""` = PATH; `"none"` = through jxl-photo |
 | `JXL_TIMEOUT_MIN` | `30` | a conversion longer than this is given up: the file is copied as it is |
+| `CONVERT_GIVE_UP_AFTER` | `2` | a TIFF or JPEG jxl-photo could not convert in this many runs in a row (the same file, jxl-photo and settings) stays the copy as it is and is not tried again, no longer a failure of the run; `0` = always try again *(v0.14.0-rc6; [a file jxl-photo cannot convert](tiff_to_jxl.md#a-file-jxl-photo-cannot-convert))* |
 | `JXL_WORK_DIR` | `""` | where the conversions run, jxl-photo's temp files too; `""` = the system's temp folder (`--work-dir` for one run; the menu remembers one per computer). One writer then copies each finished JXL into the backup |
 | `JXL_WORK_FOLDER` | `pbconv` | photo-backup's folder inside `JXL_WORK_DIR`: one per running backup (its process number), removed at the end |
 | `KEEP_TOOLS_IN_BACKUP` | `True` | every real run keeps photo-backup and jxl-photo in the backup, one folder per version |

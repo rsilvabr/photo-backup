@@ -19,6 +19,6 @@ This Python version, the one I run on my own archive, remains by far the more te
 
 The restore chooses what comes back in its own format: everything, only what is lossless (every JPEG, the lossless TIFFs), or nothing (the JXL as it is). Every backup keeps a copy of the jxl-photo that wrote it (`_photo_backup\tools\`), so a restore on another computer has it. All of it: [TIFF and JPEG as JXL](tiff_to_jxl.md).
 
-What photo-backup needs from jxl-photo — the commands, the marks in the files, the page check, the version (2.31.0-rc1 or newer for a backup, 2.30.0 for a restore) — is written down item by item in [the contract](jxlphoto_contract.md), with a test that checks any jxl-photo against it: edit jxl-photo freely, run the test, and a failure names what broke.
+What photo-backup needs from jxl-photo — the commands, the marks in the files, the page check, the version (2.31.0-rc3 or newer for a backup, 2.30.0 for a restore) — is written down item by item in [the contract](jxlphoto_contract.md), with a test that checks any jxl-photo against it: edit jxl-photo freely, run the test, and a failure names what broke.
 
 One `.cmd` can run both every night ([Run it after jxl-photo](menu.md#run-it-after-jxl-photo)).

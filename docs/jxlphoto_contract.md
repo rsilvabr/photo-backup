@@ -8,7 +8,7 @@ work: change anything else in jxl-photo freely; change one of these items and
 photo-backup breaks — safely (it stops, or keeps the TIFF as it is), but it
 breaks.
 
-Each item has a number, **JP-1** to **JP-21**, used in three places:
+Each item has a number, **JP-1** to **JP-22**, used in three places:
 
 - here: the rule, where it lives in each program, what breaks;
 - in photo-backup's messages: `CONVERT FAILED <file>: ... (JP-5)`, a restore's
@@ -18,12 +18,18 @@ Each item has a number, **JP-1** to **JP-21**, used in three places:
 
 ## The minimum version
 
-A backup refuses a jxl-photo older than **`JXLPHOTO_MIN_VERSION` = 2.31.0-rc1**
+A backup refuses a jxl-photo older than **`JXLPHOTO_MIN_VERSION` = 2.31.0-rc3**
 (top of `selective_backup.py`): a backup with a `Tiff` or `Jpeg` profile stops
-before reading anything (exit 2). It is the first jxl-photo that checks every
-page it converts (JP-20). A test version counts as older than its release
-(`2.31.0` without a suffix would refuse `2.31.0-rc1`), but every test version
-of the minimum's own number counts as the minimum (`2.31.0-rc2` passes).
+before reading anything (exit 2). Why: it refuses a temp folder with a `%`
+(JP-22), and an ExifTool step that cannot open its file is an error there
+(#686: a file held for an instant by an antivirus, an indexer or a backup agent
+made a master without its XMP block or its EXIF and said OK; an error since
+2.31.0-rc3). 2.31.0-rc1 was the first that checks every page it converts
+(JP-20). A test version counts as older than its release
+(`2.31.0` without a suffix would refuse `2.31.0-rc1`); test versions of one
+number are in order of their own number: the minimum, itself a test version,
+refuses `2.31.0-rc1` and `2.31.0-rc2` and passes `2.31.0-rc3`, `2.31.0-rc4`
+and `2.31.0`.
 
 The restore has a minimum of its own, **`JXLPHOTO_RESTORE_MIN_VERSION` =
 2.30.0**: making a file back (JP-10, JP-11, JP-13, JP-16, JP-18) did not change
@@ -38,14 +44,17 @@ jxl-photo's git tags (`set PHOTOBACKUP_JXLPHOTO=...`, below):
 | v2.29.1 (`jxl_photo.py`) | 3 of 17 | `jxl_photo.py encode` / `decode` / `transcode` did not exist yet: exit 2, `usage: ...` (2026-11-19) |
 | v2.30.0_beta1 | 16 of 17 | everything worked; JP-1 refused a test version of 2.30.0 (2026-11-19) |
 | v2.30.0, v2.30.1, v2.30.2 | 17 of 17 (2026-11-19); v2.30.2 with rc4's test: 19 of 21 (2026-11-20) | the first release whose `jxl_photo.py` runs its backends by name, and still the restore's minimum; for a backup JP-1 refuses it, and JP-20 fails: no page is checked, and without djxl it still writes the JXL |
-| **v2.31.0-rc1** | **21 of 21** (2026-11-20) | the first that checks every page of an encode (JP-20) |
+| v2.31.0-rc1 | 21 of 21 (2026-11-20); with rc6's test: 20 of 22 (2026-11-22) | the first that checks every page of an encode (JP-20); JP-1 refuses it now, and JP-22 fails: with a `%` temp folder the encode exits 0 |
+| v2.31.0-rc2 | 20 of 22 (2026-11-22) | as rc1 for photo-backup: JP-1 refuses it, JP-22 fails (exit 0) |
+| **v2.31.0-rc3** | **22 of 22** (2026-11-22) | refuses a temp folder with a `%` (JP-22) |
 | `jxl-photo.exe` 2.29.0_beta1 | 16 of 17 | the exe had its backends by name before the script did; JP-1 refused it (one minimum for both) |
 
 (JP-15 to JP-17 were added with photo-backup v0.14.0-rc3 and measured the same
 day: the minimum did not move. JP-18 and JP-19, v0.14.0-rc4, are faster routes
 photo-backup takes when it can — without djxl it uses JP-16, without a
 command's own script it goes through `jxl_photo.py` — so they move nothing
-either. JP-20 and JP-21, also v0.14.0-rc4, moved it to 2.31.0-rc1.)
+either. JP-20 and JP-21, also v0.14.0-rc4, moved it to 2.31.0-rc1. JP-22,
+v0.14.0-rc6, moved it to 2.31.0-rc3.)
 
 ## When you change jxl-photo
 
@@ -111,7 +120,8 @@ It fails closed; nothing is ever left without a copy:
 Four items cannot be seen at run time — only the contract test sees them:
 **JP-7** (a lossless class that became lossy), **JP-9** (a bad JXL that claims
 its TIFF), **JP-17** (a class mark that changed) and **JP-21** (a settings
-overlay that a backup no longer turns off). Since JP-20 a JXL that decodes to
+overlay that a backup no longer turns off). JP-22 is seen at run time (exit 2,
+nothing converted). Since JP-20 a JXL that decodes to
 something else than its TIFF page is seen when it is made. Run the test after
 changing the encoder.
 
@@ -463,6 +473,28 @@ changing the encoder.
   contract test puts an overlay beside a copy of the scripts and checks that it
   is read without the variable and not with it.
 
+### JP-22 — The temp folder never has a `%`
+
+- **Rule:** jxl-photo never gets a temp folder (TMPDIR/TEMP/TMP; `TEMP_DIR` is
+  empty without the overlay, JP-21) with a `%` in its path.
+- **photo-backup:** `_work_dir_errors` refuses a work folder whose path has a
+  `%` (exit 2, before anything is read), `_work_folder_name_problem` refuses a
+  `%` in `JXL_WORK_FOLDER`, `_work_root` refuses one too; the restore gives
+  jxl-photo a folder of its own in the system's temp folder when its own
+  folder, next to the target, has a `%`. The same paths also keep the temp
+  folder under 240 characters (`_JXL_TEMP_MAX_CHARS`, photo-backup's own rule,
+  not jxl-photo's): Windows hangs a program whose temp folder has 260 when it
+  starts another one (measured, build 26300).
+- **jxl-photo (since 2.31.0-rc3):** every backend checks its effective temp
+  folder at the start and exits 2 before touching any file (argparse's usage
+  and `error: the temp folder has a '%' ...` on stderr; no ERROR line in its
+  log).
+- **If it breaks:** ExifTool reads a `%` in a file name as a format code:
+  before 2.31.0-rc3 the encoder silently wrote masters without the XMP fields
+  ExifTool cannot write one by one (a SilverFast scan's settings), and other
+  steps failed file by file. The contract test runs an encode and a transcode
+  with a `%` temp folder: exit 2, no file written, the source unchanged.
+
 ## What jxl-photo may change freely
 
 Everything else: the menu and presets, the other modes and backends
@@ -470,7 +502,13 @@ Everything else: the menu and presets, the other modes and backends
 not pass (the compression of a decoded TIFF, workers, buffering), its speed,
 its logs' content, the names of pages after page 0, more marks in the XMP,
 files in the output folder that do not end in `.jxl`, which non-zero exit code
-a failure has.
+a failure has. Two things that changed in 2.31.0-rc3 and cost nothing: its
+end-of-run recap (WARNING lines `Errors (N):` and `  -> <file>: <reason>`:
+`_jxlphoto_said` reads ERROR lines and the lines under them, never a WARNING
+line), and the bytes of its EXIF (copied by value, `-exif:all#`: a master
+differs in bytes from one an older jxl-photo made from the same TIFF;
+photo-backup never compares a JXL's bytes with a new encode, only the marks of
+JP-4 and JP-5, which did not change).
 
 ## Changing this contract
 

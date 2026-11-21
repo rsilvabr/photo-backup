@@ -25,6 +25,13 @@ restore_backup.py --backup PATH (--to PATH | --to-original) [options]
 | `--version` | print the version and exit |
 | `--help` | print the usage and exit |
 
+A target folder with a `%` in its path, or one so deep that jxl-photo's temp
+folder beside it would be 240 characters or more: jxl-photo's temp files go to
+a folder of their own in the system's temp folder, removed after
+(*v0.14.0-rc6*). ExifTool reads a `%` in a file name as a format code (JP-22),
+and Windows hangs a program whose temp folder has 260 characters when it
+starts another one: a TIFF there waited `JXL_TIMEOUT_MIN` and failed.
+
 Exactly one of `--to` and `--to-original` is required. Outcomes per file, in
 the console, in the log and in `<log>_restore.csv`:
 

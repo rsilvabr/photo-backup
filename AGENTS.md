@@ -64,11 +64,11 @@ from the command line. A future job (e.g. a full mirror) is a new
   JP-19: its bytecode is kept, a start is 0.08 s instead of 0.3-0.5 s) and
   `jxl_photo.py` with `-B` only when that script is not there. **What
   photo-backup needs from jxl-photo is a contract,
-  `docs/jxlphoto_contract.md` (仕様書, JP-1 to JP-21):**
+  `docs/jxlphoto_contract.md` (仕様書, JP-1 to JP-22):**
   the two command lines live once, in `_jxlphoto_encode_args` and
   `_jxlphoto_decode_args`; `_jxlphoto_problem` refuses a jxl-photo older than
-  `JXLPHOTO_MIN_VERSION` (2.31.0-rc1, the first that checks every page it
-  encodes, JP-20; the restore passes its own `JXLPHOTO_RESTORE_MIN_VERSION`,
+  `JXLPHOTO_MIN_VERSION` (2.31.0-rc3: refuses a `%` temp folder, JP-22; 2.31.0-rc1
+  was the first that checks every page it encodes, JP-20; the restore passes its own `JXLPHOTO_RESTORE_MIN_VERSION`,
   2.30.0, so a backup comes back with the jxl-photo it keeps) or one that
   does not say its version; a `Tiff` profile without djxl on PATH
   (`_djxl_on_path`) is refused before reading, exit 2; each failure message
@@ -77,7 +77,37 @@ from the command line. A future job (e.g. a full mirror) is a new
   `JXLPHOTO_MIN_VERSION` raised to the first jxl-photo that passes (measured
   by running `tests/test_jxlphoto_contract.py` on jxl-photo's tags). The
   contract test runs only with `PHOTOBACKUP_JXLPHOTO` set (a real jxl-photo;
-  numpy + tifffile; djxl on PATH).
+  numpy + tifffile; djxl on PATH). **v0.14.0-rc6:** `_work_dir_errors` refuses
+  a `%` in the work folder's path (`_work_folder_name_problem` and `_work_root`
+  too: JP-22, ExifTool reads a `%` in a file name as a format code);
+  `_jxlphoto_said` adds the continuation lines under an ERROR line (cjxl's own
+  message; no time) or argparse's `error:` line, at most
+  `_JXLPHOTO_SAID_CHARS`, never the WARNING recap; a TIFF or JPEG that
+  jxl-photo could not convert in `CONVERT_GIVE_UP_AFTER` runs in a row (catalog
+  table `not_converted`, no new schema version; `_Catalog.record_not_converted`
+  / `forget_not_converted`; same size, date, jxl-photo and settings) stays its
+  copy as it is: `_not_converted_again` (`FileStatus.given_up`, `NOT CONVERTED
+  AGAIN`, not a failure; `--retry-conversions` in the three scripts turns it
+  off); `_remove_empty_work_parent` removes the empty `JXL_WORK_FOLDER` itself
+  (`os.rmdir`, never a link); `_start_output` writes UTF-8 into a pipe or a
+  file (unless `PYTHONIOENCODING` is set), and every script uses it. From the
+  review before rc6 (`AI_tools/261122_Fable_review_rc6.md`,
+  `tests/test_rc6_review.py`): a failure counts towards `CONVERT_GIVE_UP_AFTER`
+  only with proof it is the file's — `_ConvertFailed.counts` (False: a source
+  that cannot be read or changed meanwhile, a converter not started) and
+  `_record_not_converted` at the end of `_convert_all`, only for a kind (JPEG,
+  TIFF) this run converted at least one of (`NOT COUNTED` else); jxl-photo's
+  temp folder stays under `_JXL_TEMP_MAX_CHARS` (240: Windows hangs a program
+  whose TEMP is 260+ characters when it starts a child) — `_work_dir_errors`
+  / `_work_root` refuse a work folder that deep, the restore takes its own
+  temp folder beside a deep target; `_copy_as_is` retires the old copy in
+  `before_final`, never before the copy; `_place_group(..., taken=)` refuses a
+  page whose name is another planned file's or another source's JXL
+  (`_Catalog.converted_source`); `_convert_status` makes our copy as it is of
+  a changed source `ST_CHANGED` (with `replaces`; the mirror's review skips it
+  in its changed loop, its "retire" item covers it); `_convert_all` logs one
+  `TIMING conversions:` line (`_Conversion.seconds`, `_place_group(...,
+  timing=)`).
 - `manifest_backup.py` — per-folder modes, read from `backup_manifest.csv`
   (gitignored; `backup_manifest.example.csv` is versioned) and
   `backup_modes.csv` (versioned, UTF-8; `--modes` reads another). The code
@@ -127,7 +157,15 @@ from the command line. A future job (e.g. a full mirror) is a new
   `tests/test_docs.py::test_docs_cover_the_settings` (v0.13.2), with
   `NOT_SETTINGS` for the constants that are not settings.
 - `restore_backup.py` — restores files out of a backup (`--to` /
-  `--to-original`). A backend may import the catalog and the copier from
+  `--to-original`). A `%` in the restore's folder next to the target gives
+  jxl-photo a temp folder of its own in the system's temp folder (`pbrestore_`,
+  JP-22, removed after; refused when that one has a `%` too or is inside the
+  backup); so does a work folder of 240+ characters (`_JXL_TEMP_MAX_CHARS`).
+  The groups' results reach the main thread through a queue fed by
+  `add_done_callback` (rc6 review, S2: no scan of every pending future per
+  item). The menu's "try them again" is a marker file beside its config
+  (`photo_backup._retry_marker`), never a config key: the menu writes its
+  config from memory. A backend may import the catalog and the copier from
   `selective_backup.py` (`import selective_backup as sb`); never duplicate
   the catalog format or the copy routine — they exist once. A TIFF or JPEG
   kept as JXL is one entry (`_JxlGroup`): its JXL files are copied (hash
@@ -302,7 +340,8 @@ from the command line. A future job (e.g. a full mirror) is a new
   longer runs (`_pid_alive`; only a name that is digits AND holds
   `_WORK_MARK`), rc2/rc3's `_photo_backup\converting`, and `.pbtmp` folders
   under `tools` are the only folders this removes (`_remove_own_folder`,
-  never a link). Nothing in `tools` is replaced or deleted otherwise.
+  never a link), plus the empty `JXL_WORK_FOLDER` itself
+  (`_remove_empty_work_parent`: `os.rmdir`, never a link). Nothing in `tools` is replaced or deleted otherwise.
 - **The restore never writes to the backup.** `restore_backup.py` opens the
   catalog read-only, never writes, moves or deletes anything under `--backup`,
   and never overwrites a target file that already exists. An empty `--to` or
@@ -607,7 +646,7 @@ Same as the sibling repo `jxl-photo`. Documents live in `AI_tools/`
 - `docs/captureone.md` — `captureone_backup.py`: what is kept, the restore,
   force and undo, its options and settings.
 - `docs/jxlphoto_contract.md` — the contract with jxl-photo (仕様書): every
-  item JP-1 to JP-21 with its rule, where it lives in both programs and what
+  item JP-1 to JP-22 with its rule, where it lives in both programs and what
   breaks; the minimum version and how it was measured; how to run the
   contract test against any jxl-photo or an old tag.
 - `docs/tiff_to_jxl.md` — a TIFF or JPEG kept as JXL in the backup (the file

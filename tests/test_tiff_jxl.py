@@ -819,7 +819,8 @@ def test_j34_what_jxlphoto_said():
 
 def test_j35_the_minimum_is_a_jxlphoto_that_checks_every_page():
     key = sb._version_key
-    assert key("jxl-photo 2.31.0-rc1") >= key(sb.JXLPHOTO_MIN_VERSION)
+    assert key("jxl-photo 2.31.0-rc3") >= key(sb.JXLPHOTO_MIN_VERSION)
+    assert key("jxl-photo 2.31.0-rc1") < key(sb.JXLPHOTO_MIN_VERSION)
     assert key("jxl-photo 2.31.0") >= key(sb.JXLPHOTO_MIN_VERSION)
     assert key("jxl-photo 2.30.2") < key(sb.JXLPHOTO_MIN_VERSION)
     assert key("jxl-photo 2.30.2") >= key(sb.JXLPHOTO_RESTORE_MIN_VERSION)
@@ -949,12 +950,13 @@ def test_j44_jxlphotos_own_temp_files_stay_in_the_conversions_folder(env, monkey
         assert Path(call["gettempdir"]) == temp             # what jxl-photo's tempfile uses
     assert no_work_left(env)
     monkeypatch.setenv("FAKE_JXLPHOTO_ENVS", str(envs / "restore"))   # the restore's own folder
-    assert restore(env, "--to", env.out) == 0
+    plain = env.root.parent / "restored_plain"          # no '%' in its path (JP-22: tests/test_rc6.py)
+    assert restore(env, "--to", plain) == 0
     for call in env_calls(envs / "restore", "decode"):
         work = Path(call["argv"][1]).parent             # <restore folder>\jxl -> the folder
         assert Path(call["gettempdir"]) == work / "temp"
         assert not work.exists()
-    assert not [path for path in env.out.rglob("*") if "fake_jxlphoto_" in path.name]
+    assert not [path for path in plain.rglob("*") if "fake_jxlphoto_" in path.name]
 
 
 def test_j45_work_dir_says_where_the_conversions_run(env, monkeypatch, capsys):

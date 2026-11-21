@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc5"
+__version__ = "0.14.0-rc6"
 
 # ---- Settings -------------------------------------------------------------------
 BACKUP_SUBFOLDER = "_captureone"            # under --dest: this script's own backup root
@@ -1479,10 +1479,7 @@ def main(argv=None):
 
 
 def _main(argv):
-    try:                        # a cp1252 console cannot print the owner's ～ paths
-        sys.stdout.reconfigure(errors="replace")
-    except (AttributeError, OSError):
-        pass
+    sb._start_output()          # a cp1252 console cannot print the owner's ～ paths
     parser = build_parser()
     try:
         args = parser.parse_args(argv)

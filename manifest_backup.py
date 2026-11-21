@@ -36,7 +36,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc5"
+__version__ = "0.14.0-rc6"
 
 # ---- Settings -------------------------------------------------------------------
 MODES_FILE = "backup_modes.csv"     # next to this script; --modes reads another
@@ -401,6 +401,8 @@ def _backend_args(parsed, rows, dest):
         argv.append("--update-changed")
     if getattr(parsed, "no_convert", False):
         argv.append("--no-convert")
+    if getattr(parsed, "retry_conversions", False):
+        argv.append("--retry-conversions")
     if not parsed.auto_update:
         argv.append("--no-auto-update")
     if parsed.expect_backup_id:
@@ -627,6 +629,9 @@ def build_parser():
                         help="the conversion off for this run: what the Tiff and Jpeg columns "
                              "would convert is copied as it is; the JXL already in the backup "
                              "stay, unless their file changed")
+    parser.add_argument("--retry-conversions", action="store_true",
+                        help="try again the TIFFs and JPEGs jxl-photo could not convert in "
+                             "CONVERT_GIVE_UP_AFTER runs in a row (after a new libjxl, say)")
     parser.add_argument("--verify", choices=("quick", "full"), default=None,
                         help="verify the backup against what the manifest selects (no copy)")
     parser.add_argument("--max-gb", type=float, default=sb.VERIFY_MAX_GB, metavar="N",

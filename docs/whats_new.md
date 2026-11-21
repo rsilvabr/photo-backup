@@ -3,6 +3,29 @@
 The short notes of each recent release, newest first; the README keeps the
 current one. Every release in detail: [version_history.md](version_history.md).
 
+## v0.14.0-rc6 (test version, not released yet)
+
+2026-11-22. jxl-photo 2.31.0-rc3, a backup that stops failing on the same files
+every night, and a failed conversion that says why. Needs jxl-photo 2.31.0-rc3.
+Everything of rc5 to rc1 below holds.
+
+- **jxl-photo 2.31.0-rc3, and the `%`**: it is the new minimum (test versions of one number are now compared by their own number, so 2.31.0-rc1 and -rc2 are refused: point `[4] Settings` at a 2.31.0-rc3). An ExifTool step that cannot open its file is an error there: before, a TIFF's JXL could, rarely, lose its EXIF or its XMP and still be OK (jxl-photo's known issue #686). It refuses a temp folder with a `%` (ExifTool reads a `%` in a file name as a format code), so a work folder with a `%` is refused before anything is read (exit 2, [JP-22](jxlphoto_contract.md#jp-22--the-temp-folder-never-has-a-)), and a restore into a folder with a `%` gives jxl-photo a temp folder of its own in the system's temp folder.
+- **A file that never converts is not tried on every run**: a JPEG cjxl cannot read (19 old ones in a real archive made every run end with exit 1) or a `._` file of macOS fails the first runs as before (`CONVERT FAILED`, copied as it is), then, after `CONVERT_GIVE_UP_AFTER` runs in a row (default 2), stays the copy as it is: `NOT CONVERTED AGAIN` in the log, a row `JPEG: not converted again` in the summary, exit 0. A changed file, another jxl-photo, other settings or `--retry-conversions` try again ([tiff_to_jxl.md](tiff_to_jxl.md#a-file-jxl-photo-cannot-convert)).
+- **A failed conversion says cjxl's reason**: `CONVERT FAILED` now holds the lines under jxl-photo's ERROR line (`Error while decoding the JPEG image ...`, `Try using --allow_jpeg_reconstruction 0`), not only the end of cjxl's banner.
+- **Both paces, each with its ETA**: `whole run 13 MB/s (ETA 5h05m), last 10 min 11 MB/s (ETA 4h50m)` in the copy, the conversion, the full verify and the restore; when they disagree, the pace is changing (`PROGRESS_RECENT_S` is 10 minutes).
+- **A log in a file keeps the names**: output into a file or a pipe is UTF-8, so `～` and Japanese folder names are no longer `?` in a scheduled run's log.
+- **No empty `pbconv` left** in the work folder after a run.
+- **A restored TIFF has its master's EXIF exactly** (jxl-photo 2.31.0-rc3 copies the EXIF by value: an f/2.83 stays f/2.83).
+- **The log says where the conversion time went**: one `TIMING conversions:` line at the end — the writer (waiting, putting each JXL in place, old copies aside) and the workers' sums (reading the sources, jxl-photo, the proof). The next long run on a hard disk says which disk holds it back.
+- **From an independent review before release** (each with a test that fails without it):
+  - a restore into a deep folder no longer waits 30 minutes per TIFF: Windows hangs a program whose temp folder has 260 characters when it starts another one, so jxl-photo's temp folder is kept under 240 (beside a deep target it goes to the system's temp folder; a work folder that deep is refused, exit 2);
+  - two runs with a broken tool (cjxl gone from PATH, the work disk full) no longer give up every file: a failure counts only in a run that converted another file of its kind, and never one that says nothing of the file (unreadable, changed meanwhile, the converter not started);
+  - a copy as it is keeps its name until the new copy as it is is on the disk (before, it left first, and a copy that then failed left nothing under that name);
+  - a source edited after its copy as it is was made is a changed file: only `--update-changed` (or the mirror) replaces it, and the summary counts it there;
+  - a page of a multipage TIFF never takes the name of another TIFF of the folder (`x_page1.tif.jxl`); that TIFF is copied as it is (exit 1) instead of the two pushing each other into `versions\` on every run;
+  - the menu can ask the next backup to try the failed conversions again (`[4] Settings`);
+  - a restore of many files kept as JXL no longer spends minutes of CPU looking at every waiting file for each new one.
+
 ## v0.14.0-rc5 (test version, not released yet)
 
 2026-11-20. A summary you read at a glance, the conversions where you want

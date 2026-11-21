@@ -48,9 +48,13 @@ the original's), and close to them at a distance above 0.
 1. Tell photo-backup where jxl-photo is: `JXLPHOTO` at the top of
    `selective_backup.py` (`jxl_photo.py` of a jxl-photo folder, or
    `jxl-photo.exe`), or `--jxlphoto PATH` on the command line. It must be
-   jxl-photo 2.31.0-rc1 or newer (`JXLPHOTO_MIN_VERSION`: the first that checks
-   every page it converts), and a TIFF needs libjxl's `djxl` on PATH (jxl-photo
+   jxl-photo 2.31.0-rc3 or newer (`JXLPHOTO_MIN_VERSION`: it refuses a temp
+   folder with a `%`, JP-22, and checks every page it converts), and a TIFF needs libjxl's `djxl` on PATH (jxl-photo
    checks the pages with it; without it a `Tiff` profile is refused, exit 2).
+   A TIFF kept as JXL by a jxl-photo before 2.31.0-rc3 could, rarely, lack its
+   EXIF or its XMP (#686: an antivirus holding a temp file at that very
+   moment); jxl-photo's docs/known_issues.md says how to tell. Its pixels are
+   not affected.
    What photo-backup needs from jxl-photo is [its contract](jxlphoto_contract.md),
    checked by a test you can run against any jxl-photo.
 2. Choose per manifest line, in the optional columns `Tiff` and `Jpeg`
@@ -153,6 +157,41 @@ own ERROR line and the path of jxl-photo's log of that conversion, kept in
 it, and the run exits 1. Nothing is left without a copy; the next run tries
 again and, once it works, that copy leaves (below).
 
+## A file jxl-photo cannot convert
+
+*(v0.14.0-rc6)* Some files never convert: a JPEG cjxl cannot read losslessly
+(an old camera's, a CMYK one, one with too much tail data), a `._DSC0001.JPG`
+that macOS left (a resource file, not a JPEG). On a run that first meets one,
+the log says `CONVERT FAILED <file>: <cjxl's own reason>`, the file is copied
+as it is and the run exits 1, as above. The catalog (table `not_converted`)
+counts the runs in a row that failed it, for that size and date, that
+jxl-photo and those settings.
+
+A failure counts only with proof that it is the file's, not the computer's:
+- only in a run that converted at least one other file of its kind (a JPEG for
+  a JPEG, a TIFF for a TIFF): jxl-photo, cjxl and djxl work there. A run where
+  every conversion fails (cjxl gone from PATH, the work disk full) counts
+  nothing; the log says `NOT COUNTED: N JPEG conversions failed and none worked`;
+- never a failure that says nothing of the file: a source that cannot be read
+  or that changed while it was converted, a converter that could not be
+  started, Ctrl+C, a work folder that cannot be made, a JXL that could not be
+  put in place.
+
+After `CONVERT_GIVE_UP_AFTER` such runs (default 2) it is **not tried again**:
+the copy as it is stays, the log says `NOT CONVERTED AGAIN <file>`, the summary
+has a row `JPEG: not converted again` (or `TIFF`), and the run no longer fails
+because of it (exit 0). What tries again: the file edited (new size or date),
+another jxl-photo, other settings, `--retry-conversions` (after a new libjxl,
+say; in the menu: `[4] Settings` → "Try them again in the next backup"),
+`CONVERT_GIVE_UP_AFTER = 0`. When a conversion works, its row goes and the copy
+as it is leaves as above.
+
+Its source edited later is a **changed file**, as any other original: the
+summary counts it under "replace (changed)", and only `--update-changed` (the
+mirror always) converts the new version or copies it as it is; the old copy
+keeps its name until the new one is on the disk, then goes to `versions\` (the
+mirror: its trash).
+
 ## A second run
 
 - **Nothing changed**: the JXL is up to date (`N up to date` in the summary),
@@ -243,7 +282,9 @@ and jxl-photo rebuilds it there (`transcode --format jpeg`, JP-16). A TIFF's
 JXL files are copied next to the target the same way (each one checked
 against its catalog SHA-256) and decoded by jxl-photo (`decode --mode 0
 --depth-policy preserve_original --no-preview`: its own pages and bit depths,
-no preview page added): `RESTORED_FROM_JXL`. A JXL kept as it is:
+no preview page added): `RESTORED_FROM_JXL`. Since jxl-photo 2.31.0-rc3 a
+TIFF's EXIF goes into its JXL and back by value: the restored TIFF has the
+master's EXIF exactly (an f/2.83 stays f/2.83). A JXL kept as it is:
 `RESTORED_AS_JXL`. Every file gets the original's date and never replaces a
 file that is there.
 
@@ -305,6 +346,7 @@ Python 3.12 with libjxl's `cjxl` / `djxl` and ExifTool on the other computer
 | `--tiff copy\|PROFILE` | `selective_backup.py`, `mirror_backup.py --source` | the TIFFs of this run: copied as they are (default) or kept as JXL with a profile |
 | `--jpeg copy\|jxl` | `selective_backup.py`, `mirror_backup.py --source` | the JPEGs of this run: copied as they are (default) or kept as JXL, byte for byte |
 | `--jxlphoto PATH` | every script but the menu | jxl-photo's `jxl_photo.py` or `jxl-photo.exe` (default `JXLPHOTO`) |
+| `--retry-conversions` | `selective_backup.py`, `manifest_backup.py`, `mirror_backup.py` | try again the TIFFs and JPEGs jxl-photo could not convert in `CONVERT_GIVE_UP_AFTER` runs in a row ([above](#a-file-jxl-photo-cannot-convert)) *(v0.14.0-rc6)* |
 | `--no-convert` | `selective_backup.py`, `manifest_backup.py`, `mirror_backup.py` | the conversion off for this run: what would be converted is copied as it is, the JXL already there stay ([above](#the-conversion-off-a-trip-with-a-slow-computer)); the menu passes it when the conversion is off on this computer *(v0.14.0-rc5)* |
 | `--work-dir PATH` | `selective_backup.py`, `manifest_backup.py`, `mirror_backup.py` | where this run's conversions run (default `JXL_WORK_DIR`; empty = the system's temp folder), checked as that setting is; the menu gives the one it remembers *(v0.14.0-rc5)* |
 | `--convert-back all\|lossless\|none` | `restore_backup.py` | which files kept as JXL come back in their own format (above) |
@@ -315,7 +357,7 @@ At the top of `selective_backup.py`:
 | Setting | Default | Meaning |
 |---|---|---|
 | `JXLPHOTO` | `""` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`; `""` = no conversion (a line that asks for one is refused, exit 2) |
-| `JXLPHOTO_MIN_VERSION` | `"2.31.0-rc1"` | the oldest jxl-photo a backup runs ([the contract](jxlphoto_contract.md); 2.31.0-rc1 checks every page it converts, JP-20); an older one, or one that does not say its version, is refused (exit 2) |
+| `JXLPHOTO_MIN_VERSION` | `"2.31.0-rc3"` | the oldest jxl-photo a backup runs ([the contract](jxlphoto_contract.md); 2.31.0-rc3 refuses a temp folder with a `%`, JP-22; 2.31.0-rc1 checks every page it converts, JP-20); an older one, or one that does not say its version, is refused (exit 2) |
 | `JXLPHOTO_RESTORE_MIN_VERSION` | `"2.30.0"` | the oldest the restore runs to bring a file back (the decode and the JPEG rebuild did not change since): the jxl-photo kept in an older backup still restores it |
 | `TIFF_JXL_PROFILES` | `{"jxl": ...}` | the profiles the `Tiff` column (or `--tiff`) names: `distance`, `scan_distance`, `eight_bit_distance` (0 = lossless); no profile may be called `jpeg` |
 | `TIFF_EXTENSIONS` | `(".tif", ".tiff")` | what a profile converts (never in an export folder) |
@@ -326,7 +368,8 @@ At the top of `selective_backup.py`:
 | `JXL_TIFF_WORKERS` | `0` | of those, TIFFs at the same time (a TIFF takes GBs of memory); `0` = a quarter of the logical CPUs, at most one per 4 GB of free memory |
 | `DJXL` | `""` | libjxl's `djxl`, which proves and restores a JPEG ([JP-18](jxlphoto_contract.md#jp-18--djxl-gives-the-jpeg-back-from-its-jxl)); `""` = the one on PATH; `"none"` = always through jxl-photo (JP-16) |
 | `JXL_TIMEOUT_MIN` | `30` | a conversion longer than this is given up: the file is copied as it is |
-| `JXL_WORK_DIR` | `""` | where the conversions run, each in a folder of its own, jxl-photo's temp files too; `""` = the system's temp folder (an SSD on most computers). `--work-dir` sets it for one run, and the menu remembers one per computer (`[4] Settings`). The work folder is never inside or above a source or the backup (refused, exit 2: a source that holds the temp folder needs another `JXL_WORK_DIR`). On another volume than the backup, each JXL is copied into it and checked; on the same one, renamed |
+| `CONVERT_GIVE_UP_AFTER` | `2` | a TIFF or JPEG jxl-photo could not convert in this many runs in a row (same file, jxl-photo and settings) stays the copy as it is, not tried again and not a failure; `0` = always try again ([above](#a-file-jxl-photo-cannot-convert)) |
+| `JXL_WORK_DIR` | `""` | where the conversions run, each in a folder of its own, jxl-photo's temp files too; `""` = the system's temp folder (an SSD on most computers). `--work-dir` sets it for one run, and the menu remembers one per computer (`[4] Settings`). The work folder is never inside or above a source or the backup (refused, exit 2: a source that holds the temp folder needs another `JXL_WORK_DIR`). On another volume than the backup, each JXL is copied into it and checked; on the same one, renamed. A path with a `%` in it is refused (exit 2, before anything is read): ExifTool reads a `%` in a file name as a format code, and jxl-photo keeps its temp files there ([JP-22](jxlphoto_contract.md#jp-22--the-temp-folder-never-has-a-)). So is a work folder so deep that jxl-photo's temp folders in it would be 240 characters or more (about 220 for the folder itself): Windows hangs a program whose temp folder has 260 when it starts another one *(rc6)* |
 | `JXL_WORK_FOLDER` | `"pbconv"` | photo-backup's folder inside `JXL_WORK_DIR` (one plain name): one folder per running backup, named by its process number and holding a mark file, removed at the end; a later run removes the marked ones of a backup that no longer runs |
 | `KEEP_TOOLS_IN_BACKUP` | `True` | keep photo-backup, jxl-photo and `KEEP_TOOLS_EXTRA` in the backup |
 | `KEEP_TOOLS_EXTRA` | `()` | more files or folders kept there |

@@ -85,7 +85,13 @@ added the newer parts. The restore has its own guarantees
   TIFF as it is (exit 1): nothing is ever left without a copy. A TIFF copy
   already in the backup leaves only after its JXL is in the backup and in the
   catalog, to `versions\` (the mirror: its trash). A TIFF export is never
-  converted ([tiff_to_jxl.md](tiff_to_jxl.md)).
+  converted ([tiff_to_jxl.md](tiff_to_jxl.md)). *(rc6)* A copy as it is that a
+  new copy as it is replaces keeps its name until the new one is written, on
+  the disk and checked, as every changed file; a source edited since its copy as
+  it is was made is a changed file (only `--update-changed`, or the mirror,
+  replaces it). A page of a multipage TIFF never takes the name of another file
+  of the backup (`x_page1.tif.jxl` of `x.tif` beside an `x_page1.tif`): that
+  TIFF is copied as it is instead (exit 1), and both files have a copy.
 - **The conversions never run inside the backup or a source** *(v0.14.0-rc4)*:
   each one has a folder of its own in `JXL_WORK_DIR` (or `--work-dir`,
   *rc5*) + `JXL_WORK_FOLDER` (the system's temp folder by default; a work
@@ -102,7 +108,12 @@ added the newer parts. The restore has its own guarantees
   backup that no longer runs — only a folder that carries the run's mark file,
   never a link; the mark goes last, so what could not be removed yet is removed
   by a later run *(rc5)*. A work folder that cannot be made copies every file as
-  it is (exit 1).
+  it is (exit 1). At the end of a run the empty `pbconv` folder itself goes too
+  (`os.rmdir`, never a link; one that still holds anything stays) *(rc6)*. A `%`
+  in the work folder's path is refused before anything is read, exit 2: jxl-photo
+  cannot keep its temp files there (JP-22); so is a work folder so deep that
+  jxl-photo's temp folders would be 240 characters or more (Windows hangs a
+  program whose temp folder has 260 when it starts another one).
 - **Ctrl+C stops at a safe point, in seconds, and says so** *(v0.14.0-rc5)*:
   at once `Ctrl+C: stopping at a safe point...`; the conversions running are
   ended (with what jxl-photo started), never waited for — their result would be

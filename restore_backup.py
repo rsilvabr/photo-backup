@@ -28,18 +28,20 @@ import collections
 import hashlib
 import math
 import os
+import queue
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc5"
+__version__ = "0.14.0-rc6"
 
 # ---- Settings -------------------------------------------------------------------
 SPACE_MARGIN_GB = 5.0     # free space kept on each restore target drive (default --space-margin-gb)
@@ -159,7 +161,11 @@ def _restore_group(group, backup, target, jxlphoto, work):
     into the work folder -- a folder of this restore next to the target,
     never in the backup --, jxl-photo decodes them there (its own temp files
     in there too, v0.14.0-rc5), and the one TIFF it makes takes the target's
-    name, never replacing a file. (status, detail)."""
+    name, never replacing a file. A '%' in the work folder's path (the target's
+    folder has one, JP-22) or a work folder too deep for a temp folder (240
+    characters or more: Windows hangs a program whose temp folder has 260)
+    gives jxl-photo a temp folder of its own in the system's temp folder
+    instead, removed after (v0.14.0-rc6). (status, detail)."""
     folder = os.path.dirname(os.path.abspath(target))
     os.makedirs(sb._io(folder), exist_ok=True)
     if os.path.lexists(sb._io(work)):
@@ -170,9 +176,23 @@ def _restore_group(group, backup, target, jxlphoto, work):
     os.makedirs(sb._io(work_out))
     os.makedirs(sb._io(work_temp))
     ext = os.path.splitext(group.rel)[1]
+    own_temp = None
     try:
         if group.kind == "jpeg" and sb._djxl_path() is not None:
             return _rebuild_jpeg_with_djxl(group, backup, target, work_out)
+        if "%" in work_temp or len(work_temp) >= sb._JXL_TEMP_MAX_CHARS:
+            # a '%' (JP-22), or a deep target: Windows hangs a program whose temp
+            # folder has 260 characters or more (v0.14.0-rc6 review, M1)
+            system_temp = tempfile.gettempdir()
+            if ("%" in system_temp or len(system_temp) + 30 >= sb._JXL_TEMP_MAX_CHARS
+                    or sb._is_under(system_temp, backup)
+                    or sb._is_under(sb._real(system_temp), sb._real(backup))):
+                return "ERROR", ("jxl-photo cannot keep its temp files next to the target (a '%' "
+                                 "in its path, or 240 characters or more) nor in the system's "
+                                 "temp folder (a '%' in its path, too deep, or inside the "
+                                 "backup) (JP-22); set TEMP and TMP to a short folder without "
+                                 "'%'")
+            own_temp = tempfile.mkdtemp(prefix="pbrestore_")
         for row, _conv in group.members:
             src = os.path.join(backup, row.rel)
             size = os.stat(sb._io(src)).st_size
@@ -201,7 +221,7 @@ def _restore_group(group, backup, target, jxlphoto, work):
             wanted, item = (".tif", ".tiff"), "JP-10"
         try:
             run = sb._run_jxlphoto(jxlphoto, arguments, max(sb.JXL_TIMEOUT_MIN, 1) * 60,
-                                   temp_dir=work_temp)
+                                   temp_dir=own_temp or work_temp)
         except subprocess.TimeoutExpired:
             return "ERROR", f"jxl-photo took more than {sb.JXL_TIMEOUT_MIN} min"
         said = sb._jxlphoto_said(run)
@@ -232,6 +252,8 @@ def _restore_group(group, backup, target, jxlphoto, work):
                 f"({group.conv.settings}); not the original TIFF's bytes")
     finally:
         sb._remove_own_folder(work)
+        if own_temp:
+            sb._remove_own_folder(own_temp)
 
 
 def _rebuild_jpeg_with_djxl(group, backup, target, work_out):
@@ -577,6 +599,11 @@ def _main(argv):
         jpeg_pool = ThreadPoolExecutor(max_workers=workers)
         tiff_pool = ThreadPoolExecutor(max_workers=min(workers, sb._jxl_tiff_workers()))
         pending = {}
+        # each group's future lands here when it is done: the main thread takes
+        # the finished ones from the queue instead of asking every pending group
+        # at every item (v0.14.0-rc6 review, S2: quadratic, 37 min of CPU for
+        # 114,683 JPEGs)
+        finished_queue = queue.SimpleQueue()
 
         speed = sb._Speed()
 
@@ -601,10 +628,18 @@ def _main(argv):
             results[index] = (status, row.rel, target, detail)
             log.log(f"{status} {row.rel}" + (f": {detail}" if detail else ""))
 
+        def collect_finished():
+            while True:
+                try:
+                    future = finished_queue.get_nowait()
+                except queue.Empty:
+                    return
+                if future in pending:
+                    collect(future)
+
         try:
             for index, (status, row, src, target) in enumerate(items):
-                for future in [future for future in pending if future.done()]:
-                    collect(future)
+                collect_finished()
                 report()
                 if status == "MISSING_IN_BACKUP":
                     results[index] = (status, row.rel, target, "backup file missing")
@@ -642,8 +677,9 @@ def _main(argv):
                                         f"{os.path.basename(target)}.restoring_{stamp}_{index}"
                                         f"{sb.TEMP_SUFFIX}")
                     pool = jpeg_pool if row.kind == "jpeg" else tiff_pool
-                    pending[pool.submit(_run_group, row, backup, target, jxlphoto, work)] = (
-                        index, row, target)
+                    future = pool.submit(_run_group, row, backup, target, jxlphoto, work)
+                    pending[future] = (index, row, target)
+                    future.add_done_callback(finished_queue.put)
                     continue
                 try:
                     backup_stat = os.stat(sb._io(src))
@@ -698,6 +734,12 @@ def _main(argv):
             sb._wait_ending(list(pending), "restores")
             for future in finished:
                 collect(future)
+            # a group that ended between that look and the stop is at its
+            # target too: it goes in the list (v0.14.0-rc6 review, N6)
+            for future in list(pending):
+                if (future.done() and not future.cancelled() and future.exception() is None
+                        and future.result()[0].startswith("RESTORED")):
+                    collect(future)
             print("Interrupted.", file=sys.stderr)
             log.log("Interrupted.")
             log.csv(".csv", ["status", "rel", "target", "detail"],

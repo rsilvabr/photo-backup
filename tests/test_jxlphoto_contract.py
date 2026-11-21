@@ -5,7 +5,7 @@ one (its jxl_photo.py or jxl-photo.exe):
     set PHOTOBACKUP_JXLPHOTO=C:\\path\\to\\jxl-photo\\jxl_photo.py
     python -m pytest tests/test_jxlphoto_contract.py -v
 
-Each test is one item of the contract (JP-1 ... JP-21): a failure names the
+Each test is one item of the contract (JP-1 ... JP-22): a failure names the
 item, and the document says where that item lives in both programs. Needs
 numpy and tifffile (jxl-photo needs them too), and djxl on PATH (jxl-photo
 checks every page of an encode with it: JP-20). About a minute: every call is
@@ -489,3 +489,27 @@ def test_jp21_an_empty_jxlphoto_settings_turns_the_overlay_off(check, tmp_path):
     assert "WORKER_MEMORY_FRACTION" in said, (
         "JP-21: the test's overlay was not read even without JXLPHOTO_SETTINGS "
         "(is it still .jxl_script_settings.json beside the scripts?)")
+
+
+# ---- the temp folder (v0.14.0-rc6, jxl-photo 2.31.0-rc3) ----
+def test_jp22_a_temp_folder_with_a_percent_is_refused(check, tmp_path):
+    temp = tmp_path / "te%mp"
+    temp.mkdir()
+    jpeg = check.jpegs["camera"]
+    cases = (("JP-2", check.tiffs["photo16"],
+              sb._jxlphoto_encode_args(str(check.tiffs["photo16"]), "{out}", PROFILE)),
+             ("JP-15", jpeg, sb._jxlphoto_transcode_args(str(jpeg), "{out}")))
+    for item, source, arguments in cases:
+        before = _stat(source)
+        out = tmp_path / f"out_{item}"
+        out.mkdir()
+        arguments = [str(out) if part == "{out}" else part for part in arguments]
+        run = subprocess.run(
+            sb._jxlphoto_argv(JXLPHOTO, arguments), stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=sb._jxlphoto_env(str(tmp_path / "log"), str(temp)), timeout=TIMEOUT_S)
+        assert run.returncode == 2, f"JP-22: {item}: exit {run.returncode}: {_tail(run)}"
+        assert not list(out.rglob("*")), (
+            f"JP-22: {item}: files in the output folder: {[p.name for p in out.rglob('*')]}")
+        assert "%" in (run.stderr or ""), f"JP-22: {item}: stderr says nothing of the '%'"
+        assert _stat(source) == before, f"JP-22: {item}: the source changed"

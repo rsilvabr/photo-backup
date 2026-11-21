@@ -28,7 +28,7 @@ import string
 import subprocess
 import sys
 
-__version__ = "0.14.0-rc5"
+__version__ = "0.14.0-rc6"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
@@ -142,7 +142,10 @@ def _run_child(script, argv):
     conversions' work folder it remembers (`--work-dir`, v0.14.0-rc5), unless
     `argv` names one: the paths of this computer stay out of the scripts. With
     the conversion off on this computer (`no_convert`, rc5) a backup gets
-    `--no-convert`."""
+    `--no-convert`. Asked to try again the files jxl-photo could not convert
+    ([4] Settings: _retry_marker, v0.14.0-rc6), the backups get
+    `--retry-conversions` until one of them really runs (no dry-run, exit 0
+    or 1)."""
     argv = list(argv)
     remembered = _remembered_jxlphoto()
     if (remembered and "--jxlphoto" not in argv
@@ -156,12 +159,32 @@ def _run_child(script, argv):
             and script in (BACKEND, MANIFEST_BACKEND, MIRROR_BACKEND)
             and "--verify" not in argv):
         argv.append("--no-convert")
+    retry = (os.path.isfile(_retry_marker()) and "--retry-conversions" not in argv
+             and script in (BACKEND, MANIFEST_BACKEND, MIRROR_BACKEND)
+             and "--verify" not in argv and "--no-convert" not in argv)
+    if retry:
+        argv.append("--retry-conversions")
+    code = 130
     try:
-        return subprocess.run([sys.executable, script, *argv]).returncode
+        code = subprocess.run([sys.executable, script, *argv]).returncode
+        return code
     except KeyboardInterrupt:
         return 130
     finally:
         _menu_title()
+        if retry and "--dry-run" not in argv and code in (0, 1):
+            try:                # that one run tried them again: done
+                os.remove(_retry_marker())
+            except OSError:
+                pass
+
+
+def _retry_marker():
+    """The file that asks the next backup to try again the TIFFs and JPEGs
+    jxl-photo could not convert in CONVERT_GIVE_UP_AFTER runs (v0.14.0-rc6):
+    beside the menu's own file, apart from it -- the menu writes its settings
+    from memory, which would bring back a flag removed on the disk."""
+    return CONFIG_PATH + ".retry-conversions"
 
 
 def run_backend(argv):
@@ -1188,6 +1211,24 @@ def settings_menu(config):
         save_config(config)
         say("  Conversion on: TIFF and JPEG are kept as JXL again." if off
             else "  Conversion off: the backups copy TIFF and JPEG as they are.")
+    asked = os.path.isfile(_retry_marker())
+    give_up = _setting("CONVERT_GIVE_UP_AFTER")
+    say(f"  Files jxl-photo could not convert in {give_up} backups in a row: "
+        f"{'tried again by the next backup' if asked else 'kept as they are, not tried again'}")
+    if yes_no("Cancel trying them again?" if asked else
+              "Try them again in the next backup (a new jxl-photo or libjxl, say)?", False):
+        try:
+            if asked:
+                os.remove(_retry_marker())
+            else:
+                with open(_retry_marker(), "w", encoding="utf-8") as handle:
+                    handle.write(f"{datetime.datetime.now().isoformat(timespec='seconds')}: the "
+                                 f"next backup tries again the files jxl-photo could not convert "
+                                 f"(--retry-conversions); removed when it has run\n")
+            say("  Cancelled." if asked else
+                "  The next backup (or manifest, or mirror) tries them again.")
+        except OSError as exc:
+            say(f"  Not saved: {exc}", "yellow")
     say("  Defaults of mirror_backup.py (edit the top of that file to change them):")
     for name in ("MIRROR_KEEP_DAYS", "MIRROR_MAX_DELETE_PERCENT", "MIRROR_MAX_DELETE_MIN"):
         say(f"    {name:<26} {_mirror_setting(name)!r}")
@@ -1282,6 +1323,10 @@ def main(argv=None):
     parser.add_argument("--list-presets", action="store_true", help="list the saved presets")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
+    try:
+        _backend()._start_output()
+    except Exception:
+        pass
     if args.list_presets:
         presets = load_config()["presets"]
         for name in sorted(presets):

@@ -53,7 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 import manifest_backup as mb
 
-__version__ = "0.14.0-rc5"
+__version__ = "0.14.0-rc6"
 
 # ---- Settings -------------------------------------------------------------------
 MIRROR_KEEP_DAYS = 30               # days a file the mirror removed or replaced stays in the trash
@@ -259,6 +259,8 @@ def _plain_backend_args(args, extra):
         argv += ["--base", args.base]
     if args.no_convert:
         argv.append("--no-convert")
+    if getattr(args, "retry_conversions", False):
+        argv.append("--retry-conversions")
     if args.expect_backup_id:
         argv += ["--expect-backup-id", args.expect_backup_id]
     if args.dry_run:
@@ -857,6 +859,10 @@ class MirrorJob:
         self.ours_changed = {}
         for status in statuses:
             if status.status != sb.ST_CHANGED:
+                continue
+            if status.planned.convert and not status.old_outputs and status.replaces:
+                # a copy as it is whose source changed (v0.14.0-rc6 review, S3): no JXL
+                # is there yet; its old copy is the "retire" item below
                 continue
             key = status.planned.rel.casefold()
             row = self.rows_by_key.get(key)
@@ -1525,7 +1531,7 @@ class MirrorJob:
                 if self.replaced[key]:
                     lines.append(_table_line(label, self.replaced[key], indent=4))
             if info.get("failed"):
-                lines.append(_table_line("TIFF copied as TIFF (the conversion failed)",
+                lines.append(_table_line("copied as they are (the conversion failed)",
                                          info["failed"]))
         if self.purged[0] or self.purged[2]:
             lines.append(_table_line("trash deleted for good", self.purged[0], self.purged[1]))
@@ -1815,6 +1821,9 @@ def build_parser():
                         help="the conversion off for this run: what would be converted is "
                              "copied as it is; the JXL already in the backup stay, unless "
                              "their file changed")
+    parser.add_argument("--retry-conversions", action="store_true",
+                        help="try again the TIFFs and JPEGs jxl-photo could not convert in "
+                             "CONVERT_GIVE_UP_AFTER runs in a row (after a new libjxl, say)")
     parser.add_argument("--expect-backup-id", default=None, metavar="ID",
                         help="abort unless the destination holds this backup ID")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")

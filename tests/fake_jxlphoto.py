@@ -29,6 +29,10 @@ JXL without marks, and gives them back with --format jpeg. The environment
                          one) whose name holds this text; FAKE_JXLPHOTO_SLEEP_PIDS: a
                          folder where each waiting call writes <its process id>.pid
 Like jxl-photo, every command writes a log in JXLPHOTO_LOG_DIR\\<backend>\\.
+Like jxl-photo 2.31.0-rc3 (JP-22), a command whose temp folder (TMPDIR, TEMP, TMP:
+Python's tempfile.gettempdir()) has a '%' in its path prints a usage line and one
+`error:` line on stderr and exits 2, before it writes anything (no log either);
+`--version` is answered first.
     FAKE_JXLPHOTO_ONLY   fail only for a file whose name holds this text
     FAKE_JXLPHOTO_DECODE_FAIL   any value: decode (and the JPEG rebuild) stop with exit 1
     FAKE_JXLPHOTO_REBUILD_WRONG  any value: a rebuilt JPEG is not the original's bytes
@@ -226,6 +230,14 @@ def main(argv):
                        **{key: value for key, value in os.environ.items()
                           if key.startswith("JXLPHOTO_") or key in ("TMPDIR", "TEMP", "TMP")}},
                       handle)
+    temp = tempfile.gettempdir()
+    if "--version" not in argv and "%" in temp:       # JP-22: refused before anything is written
+        print("usage: fake_jxlphoto.py [-h] ...", file=sys.stderr)
+        print(f"fake_jxlphoto.py: error: the temp folder has a '%' in its path ({temp}): "
+              f"ExifTool reads a '%' in a file name as a format code, so it cannot keep its "
+              f"files there. Set TEMP_DIR at the top of the script (or the TEMP and TMP "
+              f"variables) to a folder without '%'.", file=sys.stderr)
+        return 2
     if os.environ.get("FAKE_JXLPHOTO_LEAK_TEMP") and "--version" not in argv:
         with tempfile.NamedTemporaryFile("w", prefix="fake_jxlphoto_", suffix=".args",
                                          delete=False) as leaked:
