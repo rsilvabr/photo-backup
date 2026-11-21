@@ -1,8 +1,8 @@
-# photo-backup — back up the photos you actually kept
+# photo-backup — selective backup for photo archives
 
-You shoot 400 frames, the RAWs land in one folder, and the 30 you keep are exported into an `_EXPORT` folder inside it. photo-backup reads that export folder and backs up **those 30 photos**: the exports, plus — picked out of the 400 — their RAW, camera JPEG, edited TIFF and sidecars, plus your Capture One and NX Studio edits. The rest stays behind, or comes along folder by folder if you choose. Read-only on the source, never deletes on the destination (unless you choose the mirror, which goes through a trash), and verifies the backup on any later day with SHA-256. Tested on a 9 TB archive of Capture One, Lightroom and NX Studio sessions from 1991 to 2026.
+Backs up the photos you kept, found through the exports you already make: each exported photo with its RAW, camera JPEG, edited TIFF and sidecars, plus its Capture One and NX Studio edits, in the same folder tree. **Read-only on the source, never deletes on the destination** (only the optional mirror does, through a trash), **and checks every copy with SHA-256**, right after it is made and on any later day. Per-folder modes decide how much of the rest comes along. Tested on a 9 TB archive of Capture One, Lightroom and NX Studio sessions from 1991 to 2026.
 
-A backup from the menu also keeps **Capture One itself**: the ICC profiles, film curves and styles your `.cos` edits only name, with your presets, recipes, shortcuts and workspaces. A double-click restore (no Python needed) puts them back on a new computer, so your photos open with the same look. [Details](docs/captureone.md).
+Also keeps **Capture One itself**: the ICC profiles, film curves and styles your edits name, with your presets and workspaces, and a double-click restore for a new computer. [Details](docs/captureone.md).
 
 **Current version: v0.13.2** (2026-11-12) · [What's new](#whats-new-in-v0132) · [All releases](docs/version_history.md) · Test version: [v0.14.0-rc5](https://github.com/rsilvabr/photo-backup/releases/tag/v0.14.0-rc5), the mirror, TIFF and JPEG kept as JXL ([what's new](docs/whats_new.md#v0140-rc5-test-version-not-released-yet))
 
