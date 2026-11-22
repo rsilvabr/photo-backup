@@ -248,7 +248,7 @@ One line each; the detail is behind each link.
 | [docs/per_folder_modes.md](docs/per_folder_modes.md) | `manifest_backup.py`: the manifest, the modes table column by column, the shipped modes, `--analyze` |
 | [docs/mirror.md](docs/mirror.md) | `mirror_backup.py`: getting a file back, the two modes, what leaves the backup and what never does, the trash, the locks |
 | [docs/tiff_to_jxl.md](docs/tiff_to_jxl.md) | A TIFF, a scan or a JPEG kept as JXL in the backup: profiles, the proof, the restore's choice of formats, moving from FreeFileSync, the programs kept in the backup |
-| [docs/jxlphoto_contract.md](docs/jxlphoto_contract.md) | What jxl-photo must keep doing for photo-backup (仕様書, JP-1 to JP-23), the minimum version, the contract test |
+| [docs/jxlphoto_contract.md](docs/jxlphoto_contract.md) | What jxl-photo must keep doing for photo-backup (仕様書, JP-1 to JP-24), the minimum version, the contract test |
 | [docs/menu.md](docs/menu.md) | The interactive menu item by item, unattended runs, running after jxl-photo, the menu's settings |
 | [docs/commands_and_settings.md](docs/commands_and_settings.md) | Every option and setting of `selective_backup.py`, the logs and CSVs, exit codes |
 | [docs/safety.md](docs/safety.md) | Every safety guarantee in full |

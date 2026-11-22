@@ -64,7 +64,7 @@ from the command line. A future job (e.g. a full mirror) is a new
   JP-19: its bytecode is kept, a start is 0.08 s instead of 0.3-0.5 s) and
   `jxl_photo.py` with `-B` only when that script is not there. **What
   photo-backup needs from jxl-photo is a contract,
-  `docs/jxlphoto_contract.md` (仕様書, JP-1 to JP-23):**
+  `docs/jxlphoto_contract.md` (仕様書, JP-1 to JP-24):**
   the two command lines live once, in `_jxlphoto_encode_args` and
   `_jxlphoto_decode_args`; `_jxlphoto_problem` refuses a jxl-photo older than
   `JXLPHOTO_MIN_VERSION` (2.31.0-rc3: refuses a `%` temp folder, JP-22; 2.31.0-rc1
@@ -100,7 +100,9 @@ from the command line. A future job (e.g. a full mirror) is a new
   temp folder stays under `_JXL_TEMP_MAX_CHARS` (240: Windows hangs a program
   whose TEMP is 260+ characters when it starts a child) — `_work_dir_errors`
   / `_work_root` refuse a work folder that deep, the restore takes its own
-  temp folder beside a deep target; `_copy_as_is` retires the old copy in
+  temp folder beside a deep target (since jxl-photo 2.31.0-rc4 jxl-photo
+  refuses a TMP of 261+ itself, exit 2: contract item JP-24, a second guard
+  that does not move the minimum); `_copy_as_is` retires the old copy in
   `before_final`, never before the copy; `_place_group(..., taken=)` refuses a
   page whose name is another planned file's or another source's JXL
   (`_Catalog.converted_source`); `_convert_status` makes our copy as it is of
@@ -690,7 +692,7 @@ Same as the sibling repo `jxl-photo`. Documents live in `AI_tools/`
 - `docs/captureone.md` — `captureone_backup.py`: what is kept, the restore,
   force and undo, its options and settings.
 - `docs/jxlphoto_contract.md` — the contract with jxl-photo (仕様書): every
-  item JP-1 to JP-23 with its rule, where it lives in both programs and what
+  item JP-1 to JP-24 with its rule, where it lives in both programs and what
   breaks; the minimum version and how it was measured; how to run the
   contract test against any jxl-photo or an old tag.
 - `docs/tiff_to_jxl.md` — a TIFF or JPEG kept as JXL in the backup (the file

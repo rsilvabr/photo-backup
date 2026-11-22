@@ -5,7 +5,7 @@ one (its jxl_photo.py or jxl-photo.exe):
     set PHOTOBACKUP_JXLPHOTO=C:\\path\\to\\jxl-photo\\jxl_photo.py
     python -m pytest tests/test_jxlphoto_contract.py -v
 
-Each test is one item of the contract (JP-1 ... JP-23): a failure names the
+Each test is one item of the contract (JP-1 ... JP-24): a failure names the
 item, and the document says where that item lives in both programs. Needs
 numpy and tifffile (jxl-photo needs them too), and djxl on PATH (jxl-photo
 checks every page of an encode with it: JP-20). About a minute: every call is
@@ -674,5 +674,65 @@ def test_jp22_serve_refuses_a_percent_temp_folder(tmp_path):
     finally:
         if process.poll() is None:
             process.kill()
+        process.stdout.close()
+        process.stderr.close()
+
+
+# ---- a temp folder of 261 characters or more (photo-backup v0.14.0-rc8, jxl-photo 2.31.0-rc4) ----
+LONG_TEMP_S = 60            # a jxl-photo without JP-24 hangs in such a folder: never wait longer
+
+
+def _long_temp(tmp_path):
+    """A folder whose path is 270 characters or more: photo-backup never gives
+    jxl-photo one (it keeps them under 240), so only JP-24 stands here."""
+    folder = tmp_path / "long_temp"
+    while len(str(folder)) < 270:
+        folder = folder / ("t" * 40)
+    folder.mkdir(parents=True)
+    return folder
+
+
+def test_jp24_a_temp_folder_of_261_characters_or_more_is_refused(check, tmp_path):
+    temp = _long_temp(tmp_path)
+    jpeg = check.jpegs["camera"]
+    cases = (("JP-2", check.tiffs["photo16"],
+              sb._jxlphoto_encode_args(str(check.tiffs["photo16"]), "{out}", PROFILE)),
+             ("JP-15", jpeg, sb._jxlphoto_transcode_args(str(jpeg), "{out}")))
+    for item, source, arguments in cases:
+        before = _stat(source)
+        out = tmp_path / f"out24_{item}"
+        out.mkdir()
+        arguments = [str(out) if part == "{out}" else part for part in arguments]
+        try:        # photo-backup's own runner: a timeout ends the tree (what it started too)
+            run = sb._run_converter(sb._jxlphoto_argv(JXLPHOTO, arguments), LONG_TEMP_S,
+                                    env=sb._jxlphoto_env(str(tmp_path / "log24"), str(temp)))
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"JP-24: {item}: no refusal in {LONG_TEMP_S} s with a temp folder of "
+                        f"{len(str(temp))} characters (it hangs as Windows does)")
+        assert run.returncode == 2, f"JP-24: {item}: exit {run.returncode}: {_tail(run)}"
+        said = run.stderr or ""
+        assert "TMP" in said and "261 characters or more" in said, (
+            f"JP-24: {item}: stderr does not name the variable and the limit: {said.strip()[-300:]}")
+        assert not list(out.rglob("*")), (
+            f"JP-24: {item}: files in the output folder: {[p.name for p in out.rglob('*')]}")
+        assert _stat(source) == before, f"JP-24: {item}: the source changed"
+
+
+def test_jp24_serve_refuses_a_temp_folder_of_261_characters_or_more(tmp_path):
+    temp = _long_temp(tmp_path)
+    process = _serving(tmp_path, "transcode", temp)
+    try:
+        try:
+            first = _first_line(process, LONG_TEMP_S)
+        except Exception:
+            first = None
+        assert first == b"", f"JP-24: --serve did not stop before its first line: {first!r}"
+        assert process.wait(LONG_TEMP_S) == 2, "JP-24: --serve must exit 2"
+        said = process.stderr.read().decode("utf-8", "replace")
+        assert "TMP" in said and "261 characters or more" in said, (
+            f"JP-24: --serve: stderr does not name the variable and the limit: {said.strip()[-300:]}")
+    finally:
+        if process.poll() is None:
+            sb._kill_tree(process)
         process.stdout.close()
         process.stderr.close()

@@ -8,7 +8,7 @@ work: change anything else in jxl-photo freely; change one of these items and
 photo-backup breaks — safely (it stops, or keeps the TIFF as it is), but it
 breaks.
 
-Each item has a number, **JP-1** to **JP-23**, used in three places:
+Each item has a number, **JP-1** to **JP-24**, used in three places:
 
 - here: the rule, where it lives in each program, what breaks;
 - in photo-backup's messages: `CONVERT FAILED <file>: ... (JP-5)`, a restore's
@@ -46,7 +46,8 @@ jxl-photo's git tags (`set PHOTOBACKUP_JXLPHOTO=...`, below):
 | v2.30.0, v2.30.1, v2.30.2 | 17 of 17 (2026-11-19); v2.30.2 with rc4's test: 19 of 21 (2026-11-20) | the first release whose `jxl_photo.py` runs its backends by name, and still the restore's minimum; for a backup JP-1 refuses it, and JP-20 fails: no page is checked, and without djxl it still writes the JXL |
 | v2.31.0-rc1 | 21 of 21 (2026-11-20); with rc6's test: 20 of 22, with rc7's: 20 of 23 (2026-11-22) | the first that checks every page of an encode (JP-20); JP-1 refuses it now, JP-22 fails (with a `%` temp folder the encode exits 0) and JP-23 (no `--serve`: photo-backup would run it one call per file) |
 | v2.31.0-rc2 | 20 of 22; with rc7's test: 20 of 23 (2026-11-22) | as rc1 for photo-backup: JP-1 refuses it, JP-22 fails (exit 0), JP-23 fails (no `--serve`) |
-| **v2.31.0-rc3** | **22 of 22**; with rc7's test: **23 of 23** (2026-11-22) | refuses a temp folder with a `%` (JP-22); the first with `--serve` (JP-23) |
+| **v2.31.0-rc3** | **22 of 22**; with rc7's test: **23 of 23**; with JP-24's: 23 of 24 (2026-11-22) | refuses a temp folder with a `%` (JP-22); the first with `--serve` (JP-23); no refusal of a temp folder of 261+ characters (JP-24: a second guard, the minimum stays here) |
+| **v2.31.0-rc4** | **24 of 24** (2026-11-22) | refuses a temp folder of 261 characters or more (JP-24); a tool's error text in one line, the whole cause (jxl-photo #688) |
 | `jxl-photo.exe` 2.29.0_beta1 | 16 of 17 | the exe had its backends by name before the script did; JP-1 refused it (one minimum for both) |
 
 (JP-15 to JP-17 were added with photo-backup v0.14.0-rc3 and measured the same
@@ -56,7 +57,9 @@ command's own script it goes through `jxl_photo.py` — so they move nothing
 either. JP-20 and JP-21, also v0.14.0-rc4, moved it to 2.31.0-rc1. JP-22,
 v0.14.0-rc6, moved it to 2.31.0-rc3. JP-23, v0.14.0-rc7, is the serve mode that
 2.31.0-rc3 already had: photo-backup falls back to one call per file without
-it, so the minimum did not move.)
+it, so the minimum did not move. JP-24, after v0.14.0-rc7, is a second guard
+behind photo-backup's own (a temp folder under 240 characters): 2.31.0-rc4
+has it, 2.31.0-rc3 does not and stays the minimum.)
 
 ## When you change jxl-photo
 
@@ -72,7 +75,7 @@ it, so the minimum did not move.)
    Without `PHOTOBACKUP_JXLPHOTO` the test is skipped, so photo-backup's own
    suite never needs jxl-photo. On a version older than
    `JXLPHOTO_MIN_VERSION`, JP-1 fails by definition: read the others.
-2. **Everything passed** (every test, no failure): photo-backup keeps working with that version. (Without djxl
+2. **Everything passed** (every test, no failure): photo-backup keeps working with that version — so does a version that fails only JP-24, a second guard (2.31.0-rc3). (Without djxl
    on PATH every encode fails: since 2.31.0-rc1 jxl-photo needs it to check
    the pages, JP-20.)
 3. **A failure names its item** (`AssertionError: JP-6: multi.jxl: ...`): read
@@ -534,6 +537,34 @@ changing the encoder.
   malformed line's answer or a process that goes on after a failed job. The
   contract test runs every command through photo-backup's own client on a real
   jxl-photo.
+
+### JP-24 — A temp folder of 261 characters or more is refused
+
+- **Rule:** on Windows, a jxl-photo command whose `TMP` (or `TEMP`, when `TMP`
+  is not set at all) is 261 characters or more (UTF-16 units) exits 2 right
+  after reading its command line — before any program of its own and any
+  file —, naming the variable and `261 characters or more` on stderr; a
+  `--serve` process exits 2 before its first line. A Windows process whose
+  `TMP` is that long hangs when it starts a program (it stops inside
+  `GetTempPathW`; measured on build 26300): cjxl, djxl and ExifTool would never
+  finish.
+- **photo-backup:** never gives jxl-photo a temp folder of 240 characters or
+  more itself (`_JXL_TEMP_MAX_CHARS`: `_work_dir_errors` and `_work_root`
+  refuse a work folder that deep, the restore takes a temp folder of its own
+  beside a deep target; v0.14.0-rc6). JP-24 is the second guard: a path
+  photo-backup missed is a refusal in a second (`CONVERT FAILED`, copied as it
+  is) instead of a conversion that waits `JXL_TIMEOUT_MIN` for nothing.
+- **jxl-photo (since 2.31.0-rc4):** `_long_temp_problem` in
+  `jxl_photo_common.py`, called right after argparse in every backend's
+  `main()`, and in `_serve_refusal` for `--serve`.
+- **If it breaks:** nothing changes while photo-backup's own guard holds;
+  without both, a conversion in a too-deep temp folder hangs until
+  `JXL_TIMEOUT_MIN` and its file is copied as it is. So it does not move the
+  minimum: 2.31.0-rc3 has no refusal and is still accepted. The contract test
+  runs an encode, a transcode and a serve process with a temp folder of 270
+  characters or more: exit 2, the variable and the limit on stderr, nothing
+  written, the source unchanged, nothing on the serve process's stdout; a
+  jxl-photo without JP-24 is stopped after 60 s (it would hang).
 
 ## What jxl-photo may change freely
 
