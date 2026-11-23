@@ -86,6 +86,16 @@ def _tail(run):
     return sb._tail((run.stdout or "") + "\n" + (run.stderr or ""), 8)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def own_appdata(tmp_path_factory):
+    """jxl-photo keeps the result of its ICC test in %APPDATA%\\jxl-photo\\icc-cache
+    (2.31.0-rc7): every jxl-photo of this test gets a throwaway APPDATA, so
+    the lossy encodes never fill the real cache of this computer."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("APPDATA", str(tmp_path_factory.mktemp("appdata")))
+        yield
+
+
 @pytest.fixture(scope="module")
 def check(tmp_path_factory):
     """Every TIFF encoded once with photo-backup's own command line, every

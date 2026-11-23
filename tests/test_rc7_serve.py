@@ -289,7 +289,7 @@ def test_version_key_orders_test_kinds():
 def test_beta_older_than_rc_minimum_refused(env, monkeypatch):
     monkeypatch.setenv("FAKE_JXLPHOTO_VERSION", "2.31.0_beta9")
     sb._JXLPHOTO_VERSIONS.clear()
-    assert sb.JXLPHOTO_MIN_VERSION == "2.31.0-rc3"
+    assert sb.JXLPHOTO_MIN_VERSION == "2.31.0"
     problem = sb._jxlphoto_problem(str(env.tool))
     assert problem and "older than" in problem
 

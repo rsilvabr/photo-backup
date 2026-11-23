@@ -820,7 +820,7 @@ def test_j34_what_jxlphoto_said():
 
 def test_j35_the_minimum_is_a_jxlphoto_that_checks_every_page():
     key = sb._version_key
-    assert key("jxl-photo 2.31.0-rc3") >= key(sb.JXLPHOTO_MIN_VERSION)
+    assert key("jxl-photo 2.31.0-rc8") < key(sb.JXLPHOTO_MIN_VERSION)    # v0.14.0-rc8: the release
     assert key("jxl-photo 2.31.0-rc1") < key(sb.JXLPHOTO_MIN_VERSION)
     assert key("jxl-photo 2.31.0") >= key(sb.JXLPHOTO_MIN_VERSION)
     assert key("jxl-photo 2.30.2") < key(sb.JXLPHOTO_MIN_VERSION)

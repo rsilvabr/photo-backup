@@ -38,7 +38,7 @@ from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor, TimeoutErro
 from dataclasses import dataclass, field, replace as _replace_fields
 from datetime import datetime, timedelta
 
-__version__ = "0.14.0-rc7"
+__version__ = "0.14.0-rc8"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -135,10 +135,10 @@ SUMMARY_INSIDE_NAMES = 5            # subfolder names shown under "inside sessio
 # ---- TIFF and JPEG as JXL in the backup (jxl-photo) ---------------------------------------
 JXLPHOTO = ""                       # jxl-photo's jxl_photo.py (or jxl-photo.exe): converts a TIFF or a JPEG to
                                     # JXL in the backup and back on restore; "" = no conversion (--jxlphoto)
-JXLPHOTO_MIN_VERSION = "2.31.0-rc3"  # the oldest jxl-photo that keeps photo-backup's contract
-                                    # (docs/jxlphoto_contract.md: 2.31.0-rc3 refuses a temp folder
-                                    # with a '%', JP-22, and an ExifTool step that cannot open its
-                                    # file is an error there); an older one is refused, exit 2
+JXLPHOTO_MIN_VERSION = "2.31.0"     # the oldest jxl-photo a backup runs (docs/jxlphoto_contract.md):
+                                    # the release; its test versions are refused (2.31.0-rc3 was the
+                                    # first that keeps the contract, rc5 wrote the wrong orientation
+                                    # into the pages after the first of a TIFF); older = exit 2
 JXLPHOTO_RESTORE_MIN_VERSION = "2.30.0"  # the oldest the restore runs to make a file back (the
                                     # decode and the JPEG rebuild did not change since): the
                                     # jxl-photo kept in an older backup still restores it

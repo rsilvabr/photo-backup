@@ -3,6 +3,14 @@
 The short notes of each recent release, newest first; the README keeps the
 current one. Every release in detail: [version_history.md](version_history.md).
 
+## v0.14.0-rc8 (test version, not released yet)
+
+2026-11-23. jxl-photo 2.31.0, the release. Everything of rc7 and below holds.
+
+- **jxl-photo 2.31.0 is the new minimum** for a backup (point `[4] Settings` at it): its test versions are refused now. They kept the contract, but 2.31.0-rc5 wrote the wrong orientation into the JXL of every page after the first of a multipage TIFF (jxl-photo #713; the TIFF a restore makes is right, jxl-photo's known_issues.md lists the files), and up to rc7 a restore whose ICC profile could not be read gave a TIFF without it and said OK (now an ERROR, the JXL kept). The restore's minimum stays 2.30.0.
+- **A new contract item, JP-24**: since 2.31.0-rc4 jxl-photo refuses a temp folder of 261 characters or more itself (exit 2), a second guard behind photo-backup's own (under 240). [JP-24](jxlphoto_contract.md#jp-24--a-temp-folder-of-261-characters-or-more-is-refused)
+- **The contract test leaves this computer's ICC cache alone**: every jxl-photo it runs gets a throwaway `APPDATA` (jxl-photo keeps its ICC test results in `%APPDATA%\jxl-photo\icc-cache`). jxl-photo 2.31.0: 24 of 24 items.
+
 ## v0.14.0-rc7 (test version, not released yet)
 
 2026-11-22. jxl-photo's `--serve` mode: one jxl-photo process per worker converts file after file, instead of one process per file. Needs jxl-photo 2.31.0-rc3 (unchanged). Everything of rc6 and below holds.

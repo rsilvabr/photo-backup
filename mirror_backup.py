@@ -53,7 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 import manifest_backup as mb
 
-__version__ = "0.14.0-rc7"
+__version__ = "0.14.0-rc8"
 
 # ---- Settings -------------------------------------------------------------------
 MIRROR_KEEP_DAYS = 30               # days a file the mirror removed or replaced stays in the trash

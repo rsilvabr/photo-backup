@@ -48,12 +48,14 @@ the original's), and close to them at a distance above 0.
 1. Tell photo-backup where jxl-photo is: `JXLPHOTO` at the top of
    `selective_backup.py` (`jxl_photo.py` of a jxl-photo folder, or
    `jxl-photo.exe`), or `--jxlphoto PATH` on the command line. It must be
-   jxl-photo 2.31.0-rc3 or newer (`JXLPHOTO_MIN_VERSION`: it refuses a temp
-   folder with a `%`, JP-22, and checks every page it converts), and a TIFF needs libjxl's `djxl` on PATH (jxl-photo
+   jxl-photo 2.31.0 or newer (`JXLPHOTO_MIN_VERSION`; its test versions are
+   refused: they had bugs of their own, see [the contract](jxlphoto_contract.md#the-minimum-version)), and a TIFF needs libjxl's `djxl` on PATH (jxl-photo
    checks the pages with it; without it a `Tiff` profile is refused, exit 2).
    A TIFF kept as JXL by a jxl-photo before 2.31.0-rc3 could, rarely, lack its
    EXIF or its XMP (#686: an antivirus holding a temp file at that very
-   moment); jxl-photo's docs/known_issues.md says how to tell. Its pixels are
+   moment), and one kept by 2.31.0-rc5 has the wrong orientation in the JXL
+   of each page after the first (#713; the TIFF a restore makes is right);
+   jxl-photo's docs/known_issues.md says how to tell. Its pixels are
    not affected.
    What photo-backup needs from jxl-photo is [its contract](jxlphoto_contract.md),
    checked by a test you can run against any jxl-photo.
@@ -396,7 +398,7 @@ At the top of `selective_backup.py`:
 | Setting | Default | Meaning |
 |---|---|---|
 | `JXLPHOTO` | `""` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`; `""` = no conversion (a line that asks for one is refused, exit 2) |
-| `JXLPHOTO_MIN_VERSION` | `"2.31.0-rc3"` | the oldest jxl-photo a backup runs ([the contract](jxlphoto_contract.md); 2.31.0-rc3 refuses a temp folder with a `%`, JP-22; 2.31.0-rc1 checks every page it converts, JP-20); an older one, or one that does not say its version, is refused (exit 2) |
+| `JXLPHOTO_MIN_VERSION` | `"2.31.0"` | the oldest jxl-photo a backup runs ([the contract](jxlphoto_contract.md); the release: its test versions are refused); an older one, or one that does not say its version, is refused (exit 2) |
 | `JXLPHOTO_RESTORE_MIN_VERSION` | `"2.30.0"` | the oldest the restore runs to bring a file back (the decode and the JPEG rebuild did not change since): the jxl-photo kept in an older backup still restores it |
 | `TIFF_JXL_PROFILES` | `{"jxl": ...}` | the profiles the `Tiff` column (or `--tiff`) names: `distance`, `scan_distance`, `eight_bit_distance` (0 = lossless); no profile may be called `jpeg` |
 | `TIFF_EXTENSIONS` | `(".tif", ".tiff")` | what a profile converts (never in an export folder) |

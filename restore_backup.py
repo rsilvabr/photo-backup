@@ -41,7 +41,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc7"
+__version__ = "0.14.0-rc8"
 
 # ---- Settings -------------------------------------------------------------------
 SPACE_MARGIN_GB = 5.0     # free space kept on each restore target drive (default --space-margin-gb)

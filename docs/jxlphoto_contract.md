@@ -18,18 +18,21 @@ Each item has a number, **JP-1** to **JP-24**, used in three places:
 
 ## The minimum version
 
-A backup refuses a jxl-photo older than **`JXLPHOTO_MIN_VERSION` = 2.31.0-rc3**
+A backup refuses a jxl-photo older than **`JXLPHOTO_MIN_VERSION` = 2.31.0**
 (top of `selective_backup.py`): a backup with a `Tiff` or `Jpeg` profile stops
-before reading anything (exit 2). Why: it refuses a temp folder with a `%`
+before reading anything (exit 2). Since photo-backup v0.14.0-rc8 it is the
+release, and its test versions are refused: 2.31.0-rc3 was the first that keeps
+the contract, but its test versions had bugs of their own (rc5 wrote the wrong
+orientation into the JXL of every page after the first of a multipage TIFF,
+jxl-photo #713; up to rc7 a restore whose ICC profile could not be read made a
+TIFF without it and said OK). What 2.31.0-rc3 brought: it refuses a temp folder with a `%`
 (JP-22), and an ExifTool step that cannot open its file is an error there
 (#686: a file held for an instant by an antivirus, an indexer or a backup agent
 made a master without its XMP block or its EXIF and said OK; an error since
 2.31.0-rc3). 2.31.0-rc1 was the first that checks every page it converts
-(JP-20). A test version counts as older than its release
-(`2.31.0` without a suffix would refuse `2.31.0-rc1`); test versions of one
-number are in order of their own number: the minimum, itself a test version,
-refuses `2.31.0-rc1` and `2.31.0-rc2` and passes `2.31.0-rc3`, `2.31.0-rc4`
-and `2.31.0`.
+(JP-20). A test version counts as older than its release, so
+`2.31.0` refuses every `2.31.0-rcN`; test versions of one number are in order
+of their kind (alpha, beta, rc) and their own number.
 
 The restore has a minimum of its own, **`JXLPHOTO_RESTORE_MIN_VERSION` =
 2.30.0**: making a file back (JP-10, JP-11, JP-13, JP-16, JP-18) did not change
@@ -48,6 +51,8 @@ jxl-photo's git tags (`set PHOTOBACKUP_JXLPHOTO=...`, below):
 | v2.31.0-rc2 | 20 of 22; with rc7's test: 20 of 23 (2026-11-22) | as rc1 for photo-backup: JP-1 refuses it, JP-22 fails (exit 0), JP-23 fails (no `--serve`) |
 | **v2.31.0-rc3** | **22 of 22**; with rc7's test: **23 of 23**; with JP-24's: 23 of 24 (2026-11-22) | refuses a temp folder with a `%` (JP-22); the first with `--serve` (JP-23); no refusal of a temp folder of 261+ characters (JP-24: a second guard, the minimum stays here) |
 | **v2.31.0-rc4** | **24 of 24** (2026-11-22) | refuses a temp folder of 261 characters or more (JP-24); a tool's error text in one line, the whole cause (jxl-photo #688) |
+| v2.31.0-rc5 to rc8 | 24 of 24 each (run by jxl-photo, 2026-11-22/23); JP-1 refuses them since v0.14.0-rc8 | rc5 wrote the wrong orientation into the pages after the first (#713, fixed in rc6) |
+| **v2.31.0** | **24 of 24** (2026-11-23) | the release, the code of rc8: the minimum since photo-backup v0.14.0-rc8 |
 | `jxl-photo.exe` 2.29.0_beta1 | 16 of 17 | the exe had its backends by name before the script did; JP-1 refused it (one minimum for both) |
 
 (JP-15 to JP-17 were added with photo-backup v0.14.0-rc3 and measured the same
@@ -59,7 +64,8 @@ v0.14.0-rc6, moved it to 2.31.0-rc3. JP-23, v0.14.0-rc7, is the serve mode that
 2.31.0-rc3 already had: photo-backup falls back to one call per file without
 it, so the minimum did not move. JP-24, after v0.14.0-rc7, is a second guard
 behind photo-backup's own (a temp folder under 240 characters): 2.31.0-rc4
-has it, 2.31.0-rc3 does not and stays the minimum.)
+has it, 2.31.0-rc3 does not and stayed the minimum. v0.14.0-rc8 moved it to
+the release, 2.31.0: no new item, the test versions' own bugs.)
 
 ## When you change jxl-photo
 
@@ -75,7 +81,7 @@ has it, 2.31.0-rc3 does not and stays the minimum.)
    Without `PHOTOBACKUP_JXLPHOTO` the test is skipped, so photo-backup's own
    suite never needs jxl-photo. On a version older than
    `JXLPHOTO_MIN_VERSION`, JP-1 fails by definition: read the others.
-2. **Everything passed** (every test, no failure): photo-backup keeps working with that version — so does a version that fails only JP-24, a second guard (2.31.0-rc3). (Without djxl
+2. **Everything passed** (every test, no failure): photo-backup keeps working with that version. A version that fails only JP-1 (an older test version) or only JP-24 (a second guard) keeps the contract but is refused or older. (Without djxl
    on PATH every encode fails: since 2.31.0-rc1 jxl-photo needs it to check
    the pages, JP-20.)
 3. **A failure names its item** (`AssertionError: JP-6: multi.jxl: ...`): read

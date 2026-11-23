@@ -132,7 +132,7 @@ TIFF and JPEG kept as JXL in the backup, and the programs kept in it
 | Constant | Default | Meaning |
 |---|---|---|
 | `JXLPHOTO` | `""` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe` (default `--jxlphoto`); `""` = no conversion |
-| `JXLPHOTO_MIN_VERSION` | `2.31.0-rc3` | the oldest jxl-photo a backup runs: [the contract](jxlphoto_contract.md) between the two programs (2.31.0-rc3 refuses a temp folder with a `%`, JP-22; 2.31.0-rc1 checks every page it converts) |
+| `JXLPHOTO_MIN_VERSION` | `2.31.0` | the oldest jxl-photo a backup runs: [the contract](jxlphoto_contract.md) between the two programs (the release; its test versions are refused: rc5 wrote the wrong orientation into later pages) |
 | `JXLPHOTO_RESTORE_MIN_VERSION` | `2.30.0` | the oldest jxl-photo the restore runs (the one an older backup keeps still brings its files back) |
 | `TIFF_JXL_PROFILES` | `{"jxl": {"distance": 0.05, "scan_distance": 0, "eight_bit_distance": 0}}` | the profiles a manifest's `Tiff` column (or `--tiff`) names; jxl-photo picks the distance per TIFF (0 = lossless) |
 | `TIFF_EXTENSIONS` | `.tif`, `.tiff` | what a profile converts (never in an export folder) |

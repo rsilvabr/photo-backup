@@ -67,7 +67,8 @@ from the command line. A future job (e.g. a full mirror) is a new
   `docs/jxlphoto_contract.md` (仕様書, JP-1 to JP-24):**
   the two command lines live once, in `_jxlphoto_encode_args` and
   `_jxlphoto_decode_args`; `_jxlphoto_problem` refuses a jxl-photo older than
-  `JXLPHOTO_MIN_VERSION` (2.31.0-rc3: refuses a `%` temp folder, JP-22; 2.31.0-rc1
+  `JXLPHOTO_MIN_VERSION` (2.31.0 since v0.14.0-rc8: the release, its test
+  versions refused; 2.31.0-rc3 refuses a `%` temp folder, JP-22; 2.31.0-rc1
   was the first that checks every page it encodes, JP-20; the restore passes its own `JXLPHOTO_RESTORE_MIN_VERSION`,
   2.30.0, so a backup comes back with the jxl-photo it keeps) or one that
   does not say its version; a `Tiff` profile without djxl on PATH

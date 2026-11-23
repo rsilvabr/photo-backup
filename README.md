@@ -4,7 +4,7 @@ Backs up the photos you kept, found through the exports you already make: each e
 
 Also keeps **Capture One itself**: the ICC profiles, film curves and styles your edits name, with your presets and workspaces, and a double-click restore for a new computer. [Details](docs/captureone.md).
 
-**Current version: v0.13.2** (2026-11-12) · [What's new](#whats-new-in-v0132) · [All releases](docs/version_history.md) · Test version: [v0.14.0-rc7](https://github.com/rsilvabr/photo-backup/releases/tag/v0.14.0-rc7), the mirror, TIFF and JPEG kept as JXL ([what's new](docs/whats_new.md#v0140-rc7-test-version-not-released-yet))
+**Current version: v0.13.2** (2026-11-12) · [What's new](#whats-new-in-v0132) · [All releases](docs/version_history.md) · Test version: [v0.14.0-rc8](https://github.com/rsilvabr/photo-backup/releases/tag/v0.14.0-rc8), the mirror, TIFF and JPEG kept as JXL ([what's new](docs/whats_new.md#v0140-rc8-test-version-not-released-yet))
 
 **Windows program, no Python needed:** [photo-backup-exe](https://github.com/rsilvabr/photo-backup-exe/releases/latest) — unzip and double-click.
 
@@ -104,7 +104,7 @@ Four things, each one optional, make the backup smaller without losing a photo:
 | 3 | **TIFF kept as JXL** (`Tiff` column): a developed TIFF or a film scan stays TIFF on your disk, JXL in the backup | NX Studio 45 MP: 218 MB → 34 MB; scans, lossless: 59–71%, the same pixels |
 | 4 | **JPEG kept as JXL** (`Jpeg` column): every JPEG, exports too, by a lossless transcode | 146 real JPEGs: 81% of their size, every one back byte for byte |
 
-**Turning it on.** 1 and 2 need nothing: they follow what jxl-photo left in your export folders. For 3 and 4: jxl-photo 2.31.0-rc3 or newer and libjxl's `djxl` on PATH; tell the menu where jxl-photo is (`[4] Settings`, also where the conversions run, say another disk); put `jxl` in the manifest's `Tiff` or `Jpeg` column. On a slow computer, the conversion can be turned off for a while: new files go as they are, and are converted later.
+**Turning it on.** 1 and 2 need nothing: they follow what jxl-photo left in your export folders. For 3 and 4: jxl-photo 2.31.0 or newer and libjxl's `djxl` on PATH; tell the menu where jxl-photo is (`[4] Settings`, also where the conversions run, say another disk); put `jxl` in the manifest's `Tiff` or `Jpeg` column. On a slow computer, the conversion can be turned off for a while: new files go as they are, and are converted later.
 
 **Nothing is lost on the way.** Each JXL counts only after it is proven (every TIFF page decoded and compared with the TIFF's, the JPEG rebuilt byte for byte); anything else is copied as it is. The restore gives back all the original formats, only the lossless ones, or none. In detail: [TIFF and JPEG as JXL](docs/tiff_to_jxl.md), [jxl-photo and photo-backup](docs/related_projects.md#jxl-photo), and what jxl-photo must keep doing for all this: [the contract](docs/jxlphoto_contract.md).
 
