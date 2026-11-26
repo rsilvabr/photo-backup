@@ -31,6 +31,23 @@ def script(monkeypatch, answers):
     return answers
 
 
+_KEEP_OPTIONS = ("--versions-keep-days", "--originals-keep-days", "--keep-days")
+
+
+def without_keep_days(tail):
+    """A child's argv without the keep-days options the menu adds to every
+    backup and mirror run (261126, keep-days; test_keep_days.py checks them)."""
+    result, skip = [], False
+    for item in tail:
+        if skip:
+            skip = False
+        elif item in _KEEP_OPTIONS:
+            skip = True
+        else:
+            result.append(item)
+    return result
+
+
 def capture_backend(monkeypatch, codes=None):
     calls = []
     codes = list(codes or [])
@@ -322,13 +339,13 @@ def test_settings_remember_jxlphoto_after_checking_it(tmp_path, monkeypatch, men
     monkeypatch.delenv("FAKE_JXLPHOTO_VERSION", raising=False)
     # answers: jxl-photo? its path; the work folder? (rc5) no; the conversion off? no;
     # try the failed conversions again? (rc6) no; forget the choices? no
-    script(monkeypatch, ["y", str(tmp_path / "missing.py"), "n", "n", "n", "n", "n"])
+    script(monkeypatch, ["y", str(tmp_path / "missing.py"), "n", "n", "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert "jxlphoto" not in menu.load_config()                 # not found: not saved
-    script(monkeypatch, ["y", f'"{tool}"', "n", "n", "n", "n", "n"])
+    script(monkeypatch, ["y", f'"{tool}"', "n", "n", "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["jxlphoto"] == str(tool)
-    script(monkeypatch, ["y", "-", "n", "n", "n", "n", "n"])
+    script(monkeypatch, ["y", "-", "n", "n", "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["jxlphoto"] == ""
 
@@ -348,7 +365,7 @@ def test_the_scripts_get_the_remembered_jxlphoto(monkeypatch, menu_config):
     menu.run_backend(["--source", "S"])
     menu.run_restore(["--backup", "B", "--jxlphoto", r"C:\other.py"])   # named: kept
     menu.run_captureone(["--dest", "D"])                        # needs no jxl-photo
-    tails = [command[2:] for command in commands]
+    tails = [without_keep_days(command[2:]) for command in commands]
     assert tails[0] == ["--manifest", "m.csv"]
     assert tails[1] == ["--manifest", "m.csv", "--jxlphoto", r"C:\jxl\jxl_photo.py"]
     assert tails[2][-2:] == tails[3][-2:] == ["--jxlphoto", r"C:\jxl\jxl_photo.py"]
@@ -362,13 +379,13 @@ def test_settings_remember_the_work_folder_when_it_exists(tmp_path, monkeypatch,
     work.mkdir()
     # answers: jxl-photo? no; the work folder? yes, its path; the conversion off? no;
     # try the failed conversions again? no; forget the choices? no
-    script(monkeypatch, ["n", "y", str(tmp_path / "missing"), "n", "n", "n", "n"])
+    script(monkeypatch, ["n", "y", str(tmp_path / "missing"), "n", "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert "work_dir" not in menu.load_config()                 # not a folder: not saved
-    script(monkeypatch, ["n", "y", f'"{work}"', "n", "n", "n", "n"])
+    script(monkeypatch, ["n", "y", f'"{work}"', "n", "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["work_dir"] == str(work)
-    script(monkeypatch, ["n", "y", "-", "n", "n", "n", "n"])
+    script(monkeypatch, ["n", "y", "-", "n", "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["work_dir"] == ""
 
@@ -390,7 +407,7 @@ def test_the_backups_get_the_remembered_work_folder(monkeypatch, menu_config):
     menu.run_backend(["--source", "S", "--work-dir", r"F:\other"])  # named: kept
     menu.run_restore(["--backup", "B"])
     menu.run_captureone(["--dest", "D"])
-    tails = [command[2:] for command in commands]
+    tails = [without_keep_days(command[2:]) for command in commands]
     assert tails[0] == ["--source", "S"]
     assert tails[1] == ["--manifest", "m.csv", "--work-dir", r"E:\TEMP"]
     assert tails[2] == ["--dest", "D", "--work-dir", r"E:\TEMP"]
@@ -405,7 +422,7 @@ def test_the_conversion_off_on_this_computer(monkeypatch, menu_config):
     menu says so on top; the same question turns it back on."""
     # answers: jxl-photo? no; the work folder? no; the conversion off? yes; try the failed
     # conversions again? no; forget? no
-    script(monkeypatch, ["n", "n", "y", "n", "n", "n"])
+    script(monkeypatch, ["n", "n", "y", "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["no_convert"] == "yes"
     commands = []
@@ -421,10 +438,10 @@ def test_the_conversion_off_on_this_computer(monkeypatch, menu_config):
     menu.run_manifest(["--manifest", "m.csv", "--verify", "quick"])
     menu.run_restore(["--backup", "B"])
     menu.run_captureone(["--dest", "D"])
-    tails = [command[2:] for command in commands]
+    tails = [without_keep_days(command[2:]) for command in commands]
     assert [tail[-1] == "--no-convert" for tail in tails] == [True, True, True, False, False,
                                                               False]
-    script(monkeypatch, ["n", "n", "y", "n", "n", "n"])
+    script(monkeypatch, ["n", "n", "y", "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["no_convert"] == ""
 

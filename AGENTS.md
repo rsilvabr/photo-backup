@@ -58,7 +58,12 @@ from the command line. A future job (e.g. a full mirror) is a new
   planning, `_retire_undone` / `_undo_proof` after the copy: the digest this
   run copied, `adopt_sha256`, the row's, else the backup file read; never the
   source); no proof = `UNDO SKIPPED`, the group stays, its keys planned (review
-  261126, S2). `--reconvert-older` (`_reconvert_older`, `FileStatus.reconvert`)
+  261126, S2). A group proven to be of ANOTHER version of the file
+  (`FileStatus.undo_older`: another size, or an UP_TO_DATE row's other hash;
+  after the copy, the source's bytes -- copied, adopted or our row -- differ; a
+  file only read from the backup proves nothing) is an old copy: with
+  `--update-changed` (the mirror: always) it leaves as `versions`
+  (`UNDONE (older version)`), else `UNDO WAITS` (final review 261126, SF1). `--reconvert-older` (`_reconvert_older`, `FileStatus.reconvert`)
   makes again the TIFF JXL of an OLDER jxl-photo (`_version_key`; no version =
   older, logged; newer or equal: left alone, S1); a new group that fails keeps
   the old one only while `_old_group_whole` (every file and row still there),
@@ -206,7 +211,11 @@ from the command line. A future job (e.g. a full mirror) is a new
   `CONFIG_PATH` to a temp file. Every setting at the top of every script is
   named in its docs (`README.md` + `docs/`, or `README_mobile_backup.md`):
   `tests/test_docs.py::test_docs_cover_the_settings` (v0.13.2), with
-  `NOT_SETTINGS` for the constants that are not settings.
+  `NOT_SETTINGS` for the constants that are not settings. Since 261126
+  (keep-days) `[9] Backup space` runs `--space-report`, `[4] Settings` keeps the
+  five *_KEEP_DAYS per computer (`_KEEP_DAYS`, config keys `versions_keep_days`,
+  ...), and `_run_child` passes them to every backup, manifest (not a verify or
+  an analysis) and mirror run: this computer's value, else the script's setting.
 - `restore_backup.py` — restores files out of a backup (`--to` /
   `--to-original`). A `%` in the restore's folder next to the target gives
   jxl-photo a temp folder of its own in the system's temp folder (`pbrestore_`,
@@ -320,9 +329,57 @@ from the command line. A future job (e.g. a full mirror) is a new
   a `subst` letter cannot lead the backup into a source. Use `_overlaps` for
   every such safety check (also restore target × backup); `_is_under` stays
   string-only for the catalog's own paths.
-- **Nothing on the destination is ever deleted** — except by `mirror_backup.py`
-  (v0.14.0), see its rule below; its trash is the one folder inside
-  `CATALOG_FOLDER` where files are deleted. With `--adopt-by-hash` the backup
+- **What the backup sets aside, and the only deletions of the normal backup
+  (261126, keep-days).** Three kinds leave the backup's tree, each into a run
+  folder `CATALOG_FOLDER\<store>\<stamp>\<rel>`: `versions` (the old copy of a
+  changed file, a JXL group undone or made again, the JXL of an older version;
+  `versions\` / `VERSIONS_KEEP_DAYS`, the mirror's `trash_versions\` /
+  `MIRROR_VERSIONS_KEEP_DAYS`), `originals` (a TIFF copy its JXL replaced:
+  `replaces`; `ORIGINALS_FOLDER` / `ORIGINALS_KEEP_DAYS`, the mirror's
+  `trash_originals\` / `MIRROR_ORIGINALS_KEEP_DAYS`; one row each in the
+  catalog's `originals` table, written with the move, removed with the file,
+  checked by `_first_unsafe_rel`) and, mirror only, `removed` (`trash\` /
+  `MIRROR_KEEP_DAYS`). A *_KEEP_DAYS is N (the first real run on or after the
+  run's day + N deletes it), `0` (deleted at once, after the typed number) or
+  `None`/`never` (only when space is short); anything else is exit 2 before
+  reading (`_store_settings_errors`, `_keep_days_arg`). The normal backup
+  deletes only (a) a run folder of `versions\` or `originals\` past its days
+  (`_expired_runs`; TIFF copies a JXL replaced before v0.14.0-rc9 were set
+  aside in `versions\` and follow `VERSIONS_KEEP_DAYS`), (b) what a person chose when space was short (`_room_options` /
+  `_choose_room`, then `_typed_confirmation` of the total), (c) with a
+  *_KEEP_DAYS of 0, a file at the moment it would be set aside (`_SetAside`)
+  and the run folders already in that store (`_zero_day_runs`; the mirror's
+  `zero_runs`), after the typed number (SF1) and never more files of a kind
+  than were counted and typed (`_SetAside.left`; the mirror's `typed` /
+  `_delete_now`): the typed number is an upper bound, anything more is moved
+  (final review 261126, MF1/SF3; `_copy_as_is` retires a TIFF `replaces` copy
+  as `originals`, the kind `_set_aside_counts` counted, converted or not), (d) a JPEG copy its proven JXL
+  gives back byte for byte (`_retire_replaced`: the copy itself read, its
+  SHA-256 = the group's `source_sha256`, and its row does not say other bytes;
+  SF5). After deleting what the space check counted on, the disk is asked again
+  (`_fits_now`; the mirror after `remove()`, minus `freed_during_copy()`): not
+  enough = exit 2 before the first byte (MF2); a mirror that removed files
+  first shows its box (`finish(..., stopped=)`, `MIRROR STOPPED`; SF2). A
+  catalog that cannot be written in `_purge_store_run` sets
+  `_Catalog.write_failed`: that deletion stops, no further run folder is
+  purged, exit 1, never a traceback (SF6); the mirror's `remove()` then
+  removes nothing (`catalog_failed`) and `_run_backup` shows its box
+  (`finish(..., stopped=, todo=)`, `MIRROR STOPPED`; final review, SF2). Never in a dry-run, `--verify` or `--analyze`; never
+  without a person for (b)/(c) (`--yes` stops, exit 2, nothing changed; the
+  mirror: `--unattended`); never through a link (`_store_problem` over every
+  folder of `CATALOG_FOLDER` a real run writes into, before the first byte: the
+  stores, `ORPHANS_FOLDER` with `--move-orphans`, `TOOLS_FOLDER` with
+  `KEEP_TOOLS_IN_BACKUP` (`store_stop`, exit 2); the mirror's
+  `_trash_problem(dest, written=True)` / `_written_folders`: its trash folders,
+  `versions\`, `tools\`; final review, SF1); only folders named like a
+  stamp (`_STAMP_NAME`: `_move_aside` names a FILE ` (2)`, never a run folder),
+  only by their real path (`_purge_store_run`, shared with the mirror). Each run
+  deletes only in its own stores; the normal backup lists the mirror's (the same
+  disk, `_mirror_stores`) and never deletes there. Every run prints the space
+  block (`_space_block_lines`); `--space-report` reads only the destination.
+  A copy the mirror did not write always goes to the normal `versions\`.
+  Otherwise **nothing on the destination is deleted** — except by
+  `mirror_backup.py` (v0.14.0), see its rule below. With `--adopt-by-hash` the backup
   sets the date of a file it did not write (no row; never through a link) to
   the source's, and only when both were read and their SHA-256 is the same, and
   neither changed since (`_apply_hash_adoptions`). Its bytes are never written;
@@ -360,10 +417,30 @@ from the command line. A future job (e.g. a full mirror) is a new
   changed file that is ours: old copy to the trash; not ours: `versions\`
   (`sb._handle_old_copy`). What leaves goes to
   `_photo_backup\trash\<stamp>\<rel>` (`sb._move_aside`) for
-  `MIRROR_KEEP_DAYS`; a run deletes trash runs past that date
-  (`_purge_trash_run`: only folders named `\d{6}_\d{6}`, only by their real
-  path, never following a link; `_trash_problem` stops a real run when
-  `_photo_backup` or the trash is a link). Deleting for good before the date,
+  `MIRROR_KEEP_DAYS`; since 261126 (keep-days) the old copy it replaces goes to
+  `trash_versions\` (`MIRROR_VERSIONS_KEEP_DAYS`), a TIFF copy a JXL replaces
+  to `trash_originals\` (`MIRROR_ORIGINALS_KEEP_DAYS`, with its `originals`
+  row), a JPEG copy whose JXL gives its bytes back is deleted when ours
+  (`keep_old_file(..., kind)`); `--keep-days`, `--versions-keep-days`,
+  `--originals-keep-days` set them for a run (`stores(args)`); a run deletes
+  trash runs of the three past their dates
+  (`_purge_trash_run` -> `sb._purge_store_run`: only folders named `\d{6}_\d{6}`,
+  only by their real path, never following a link; `_trash_problem` stops a
+  real run when `_photo_backup` or a trash folder is a link). The generic store
+  code (`_StoreRun`, `_scan_tree`, `_store_runs`, `_purge_store_run`,
+  `_expiry_text`, `_typed_confirmation`) lives once, in `selective_backup.py`;
+  the mirror keeps thin wrappers (`_expiry_text(run, days)`: `None` = never,
+  a sentinel = `MIRROR_KEEP_DAYS`; SF3). A store with 0 days that would delete
+  something -- this run's files or what is already in it -- needs the typed
+  number in `confirm` (`at_once`, `zero_runs`; `--unattended` stops), and a
+  file is deleted at once only through `_delete_now(kind)`: its days are 0 AND
+  `typed[kind]` (set only after the typed number) has room left -- never by the
+  days alone (final review 261126, MF1; `_kind_for_good` is for the screens and
+  counts). Its table
+  splits a JPEG copy its JXL replaces by `_Item.ours` (deleted with proof, else
+  the trash; not ours: `versions\`; SF4). When space is short the mirror uses the normal backup's chooser
+  (`_room_options` over its three trash folders; its old "this run, without the
+  trash" option is gone: `--keep-days 0` does that). Deleting for good before the date,
   a line over `MIRROR_MAX_DELETE_PERCENT` (unless `--allow-mass-delete`) and
   a total mirror need the number of files typed (`_typed_confirmation`);
   `--unattended` never asks and stops instead (exit 2, nothing changed). One
@@ -422,8 +499,9 @@ from the command line. A future job (e.g. a full mirror) is a new
   before the new names), the TIFF is copied as it is (`_copy_as_is`, which
   retires what is left of the old group after the copy); if that copy fails
   too, the TIFF has no copy in the backup's tree until the next run (the old
-  JXL is in `versions\` or the mirror's trash; a mirror with no trash deleted
-  it), exit 1 (final review 261126, SF2).
+  JXL is in `versions\` or the mirror's trash; a mirror with no trash, or a
+  normal backup with `VERSIONS_KEEP_DAYS = 0` typed, deleted it), exit 1
+  (final review 261126, SF2).
 - **The restore never writes to the backup.** `restore_backup.py` opens the
   catalog read-only, never writes, moves or deletes anything under `--backup`,
   and never overwrites a target file that already exists. An empty `--to` or
@@ -720,7 +798,9 @@ Same as the sibling repo `jxl-photo`. Documents live in `AI_tools/`
   `selective_backup.py`, the logs and CSVs, exit codes.
 - `docs/safety.md` — every safety guarantee in full (the README keeps one
   line each).
-- `docs/reruns_and_moves.md` — re-runs, the versions folder, moves, orphans.
+- `docs/reruns_and_moves.md` — re-runs, the versions folder, what the backup
+  sets aside and for how long (the three kinds, their days, the space block,
+  `--space-report`, room on demand), moves, orphans.
 - `docs/verifying.md` — verify, statuses, the check after each copy, a
   damaged catalog (the backend's message points to "A damaged catalog", which
   the README's "Good to know" names too), rolling verify, backup ID.

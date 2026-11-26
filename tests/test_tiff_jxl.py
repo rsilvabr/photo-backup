@@ -46,6 +46,7 @@ JXL = {"2025/shoot/DSC_0001.tif.jxl", "2025/scans/000037.tiff.jxl", "2025/scans/
 TIFFS = {"2025/shoot/DSC_0001.tif", "2025/scans/000037.tiff", "2025/scans/000038.tif"}
 SETTINGS = "jxl: d=0.05 scan=0 8bit=0 e=7"
 VERSIONS = "versions"                                   # under CATALOG_FOLDER
+ORIGINALS = getattr(sb, "ORIGINALS_FOLDER", "originals")                         # ... the TIFF copies a JXL replaced (261126)
 
 
 @pytest.fixture(autouse=True)
@@ -254,12 +255,13 @@ def test_j4_our_tiff_copies_become_jxl(env, capsys):
     assert TIFFS <= backed(env.dest)
     assert backup(env, "--tiff", "jxl") == 0
     assert backed(env.dest) == OTHERS | JXL
-    assert TIFFS <= under(env.dest, VERSIONS)
+    assert TIFFS <= under(env.dest, ORIGINALS)              # TIFF originals (261126)
+    assert not under(env.dest, VERSIONS)
     assert not {rel for (rel,) in db(env.dest, "SELECT rel FROM files")} & {
         rel.replace("/", "\\") for rel in TIFFS}
     out = capsys.readouterr().out
-    assert row_count(out, "copies their JXL replaces (to versions\\)") == "3"
-    assert "3 copies in the backup replaced by their JXL (to versions)" in out
+    assert row_count(out, "copies their JXL replaces (to originals\\)") == "3"
+    assert "3 copies in the backup replaced by their JXL (3 to originals" in out
 
 
 def test_j4_another_programs_copies_become_jxl_a_different_one_stays(env):
@@ -272,8 +274,8 @@ def test_j4_another_programs_copies_become_jxl_a_different_one_stays(env):
     assert backup(env, "--tiff", "jxl") == 0
     assert backed(env.dest) == OTHERS | JXL | {"2025/scans/000037.tiff"}
     assert other.read_bytes() == b"a different TIFF"    # not a copy of the source: left alone
-    assert under(env.dest, VERSIONS) == {"2025/shoot/DSC_0001.tif",
-                                                   "2025/scans/000038.tif"}
+    assert under(env.dest, ORIGINALS) == {"2025/shoot/DSC_0001.tif",
+                                          "2025/scans/000038.tif"}
 
 
 # ---- J5 a conversion that fails: the TIFF is copied as it is -------------------------------
@@ -290,11 +292,11 @@ def test_j5_a_failed_conversion_copies_the_tiff(env, monkeypatch, how, photoback
         env.src / "2025/scans/000038.tif").read_bytes()
     assert {"2025/shoot/DSC_0001.tif.jxl", "2025/scans/000037.tiff.jxl"} <= have
     assert no_work_left(env)
-    # the next run converts it, and the TIFF copy goes to versions
+    # the next run converts it, and the TIFF copy goes to originals (261126)
     monkeypatch.delenv("FAKE_JXLPHOTO_FAIL")
     assert backup(env, "--tiff", "jxl") == 0
     assert backed(env.dest) == OTHERS | JXL
-    assert "2025/scans/000038.tif" in under(env.dest, VERSIONS)
+    assert "2025/scans/000038.tif" in under(env.dest, ORIGINALS)
 
 
 def test_j5_no_jxlphoto_at_all_copies_every_tiff(env, monkeypatch):
@@ -342,7 +344,7 @@ def test_j7_the_mirror_trashes_a_gone_group_and_our_tiff_copies(env, monkeypatch
     have = backed(env.dest)
     assert {mirror_rel(env, rel) for rel in JXL} <= have
     assert not {mirror_rel(env, rel) for rel in TIFFS} & have
-    trash = under(env.dest, mir.MIRROR_TRASH_FOLDER)
+    trash = under(env.dest, mir.MIRROR_TRASH_ORIGINALS_FOLDER)
     assert {mirror_rel(env, rel) for rel in TIFFS} <= trash        # ours: to the trash
     rows = list(csv.DictReader(io.StringIO(latest_csv(photobackup_log_dir, "_actions.csv"))))
     retired = [row for row in rows if row["action"] == "retire"]
@@ -371,7 +373,7 @@ def test_j7_another_programs_tiff_copies_go_to_the_mirrors_trash(env, monkeypatc
     man = write_manifest(env.root / "jxl.csv", (env.src / "2025", "6", "", "", "jxl"))
     assert mir.main(["--manifest", str(man), "--dest", str(env.dest), "--yes"]) == 0
     assert {mirror_rel(env, rel) for rel in JXL} <= backed(env.dest)
-    assert under(env.dest, mir.MIRROR_TRASH_FOLDER) == {
+    assert under(env.dest, mir.MIRROR_TRASH_ORIGINALS_FOLDER) == {
         mirror_rel(env, "2025/shoot/DSC_0001.tif"), mirror_rel(env, "2025/scans/000038.tif")}
     assert other.read_bytes() == b"not the source's TIFF"     # not a copy: never moved
     assert not under(env.dest, VERSIONS)
@@ -892,7 +894,7 @@ def test_j41_a_name_that_fails_to_change_is_set_right_next_run(env, monkeypatch,
     monkeypatch.setattr(sb, "_rename_no_clobber", real)
     assert backup(env, "--tiff", "jxl") == 0
     assert backed(env.dest) == OTHERS | JXL
-    assert "2025/scans/000038.tif" in under(env.dest, VERSIONS)   # nothing lost
+    assert "2025/scans/000038.tif" in under(env.dest, ORIGINALS)  # nothing lost
 
 
 def test_j42_the_route_follows_the_volume_not_the_letter(tmp_path, monkeypatch):
@@ -1161,7 +1163,7 @@ def test_j50_no_convert_copies_tiffs_as_they_are_and_keeps_the_jxl(env, monkeypa
     assert backup(env, "--tiff", "jxl", "--update-changed") == 0
     assert len(encodes(env)) == 3 + 4
     assert backed(env.dest) == OTHERS | JXL | {"2025/scans/000039.tif.jxl"}
-    assert {"2025/scans/000037.tiff", "2025/scans/000039.tif"} <= under(env.dest, VERSIONS)
+    assert {"2025/scans/000037.tiff", "2025/scans/000039.tif"} <= under(env.dest, ORIGINALS)
     # the manifest and the mirror take it too, without jxl-photo
     monkeypatch.setattr(sb, "JXLPHOTO", str(env.root / "no-jxl-photo.py"))
     monkeypatch.setattr(sb, "_djxl_on_path", lambda: None)

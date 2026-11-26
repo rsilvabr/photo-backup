@@ -93,12 +93,15 @@ def backed(dest):
     return result
 
 
-def trashed(dest):
-    """The files in the trash (every run), relative to SRC."""
-    root = Path(dest) / sb.CATALOG_FOLDER / mir.MIRROR_TRASH_FOLDER
-    if not root.exists():
-        return set()
-    return {_after_src(str(path)) for path in root.rglob("*") if path.is_file()}
+def trashed(dest, *folders):
+    """The files in the mirror's trash (every run; its three folders since
+    261126, keep-days, or the ones named), relative to SRC."""
+    found = set()
+    for folder in folders or mir._trash_folders():
+        root = Path(dest) / sb.CATALOG_FOLDER / folder
+        if root.exists():
+            found |= {_after_src(str(path)) for path in root.rglob("*") if path.is_file()}
+    return found
 
 
 def catalogued(dest):
@@ -376,10 +379,20 @@ def test_t13_a_changed_file_the_backup_did_not_write_goes_to_versions(env):
 
 # ---- T14-T15: the trash -------------------------------------------------------------------------
 def test_t14_no_trash_with_keep_days_0(env, monkeypatch):
+    """0 days = no trash. Since 261126 (keep-days) each of the three trash
+    folders has its days, and deleting at once needs the number typed: the
+    removal (MIRROR_KEEP_DAYS) and the replaced copy (MIRROR_VERSIONS_KEEP_DAYS)."""
     monkeypatch.setattr(mir, "MIRROR_KEEP_DAYS", 0)
+    monkeypatch.setattr(mir, "MIRROR_VERSIONS_KEEP_DAYS", 0)
     make_trash_run(env.dest, datetime(2026, 1, 1), {"old/x.NEF": 10})
     (env.src / "A/trip/DSC_0001.NEF").unlink()
     (env.src / "A/trip/DSC_0002.NEF").write_bytes(b"n" * 1500)
+    before = snapshot(env.dest)
+    assert mirror("--manifest", env.man, "--dest", env.dest, "--unattended") == 2
+    assert snapshot(env.dest) == before                 # nobody to type: nothing changed
+    # 1 removed + 1 replaced + 1 already in the trash (0 days: typed too, SF1
+    # of the keep-days review)
+    answers(monkeypatch, "3")
     assert mirror("--manifest", env.man, "--dest", env.dest, "--yes") == 0
     assert "A/trip/DSC_0001.NEF" not in backed(env.dest)
     assert in_backup(env, "A/trip/DSC_0002.NEF").read_bytes() == b"n" * 1500
@@ -447,21 +460,40 @@ def test_t16b_the_question_without_yes(env, monkeypatch, capsys):
 Usage = collections.namedtuple("Usage", "total used free")
 
 
+def free_grows_with(base, *runs):
+    """A disk_usage whose free space is `base` plus what was deleted of `runs`
+    (the chooser asks the disk again after deleting, 261126)."""
+    sizes = {run: sum(path.stat().st_size for path in run.rglob("*") if path.is_file())
+             for run in runs}
+
+    def usage(path):
+        gone = sum(size for run, size in sizes.items() if not run.exists())
+        return Usage(10 ** 9, 0, base + gone)
+    return usage
+
+
 def test_t17_not_enough_space(env, monkeypatch, capsys):
+    """The shared chooser of 261126 (keep-days): its options are labelled by
+    the trash folder ("mirror trash: the oldest (...)", "...: all of it")
+    instead of "the oldest trash" / "the whole trash"; Enter cancels ("0" is
+    not an option any more). The typed number, --unattended and the order
+    by size are as before."""
     now = datetime.now()
     first = make_trash_run(env.dest, now - timedelta(days=5), {"A/x.NEF": 5000})
     second = make_trash_run(env.dest, now - timedelta(days=1), {"A/y.NEF": 7000})
     (env.src / "A/trip/NEW.NEF").write_bytes(b"n" * 3000)
-    monkeypatch.setattr(sb.shutil, "disk_usage", lambda path: Usage(10 ** 9, 0, 1000))
+    monkeypatch.setattr(sb.shutil, "disk_usage", free_grows_with(1000, first, second))
     common = ("--manifest", env.man, "--dest", env.dest, "--space-margin-gb", "0")
     capsys.readouterr()
     assert mirror(*common, "--dry-run") == 0
     out = capsys.readouterr().out
     assert "NOT ENOUGH SPACE" in out and "<- recommended" in out
-    assert "1) the oldest trash" in out and "2) the whole trash" in out
+    assert "1) mirror trash: the oldest (" in out and "2) mirror trash: all of it" in out
     before = snapshot(env.dest)
     assert mirror(*common, "--unattended") == 2
     answers(monkeypatch, "0")
+    assert mirror(*common, "--yes") == 2
+    answers(monkeypatch, "")                     # Enter = cancel
     assert mirror(*common, "--yes") == 2
     answers(monkeypatch, "1", "2")               # option 1, a wrong number
     assert mirror(*common, "--yes") == 2
@@ -475,13 +507,25 @@ def test_t17_not_enough_space(env, monkeypatch, capsys):
     assert mirror(*common, "--yes") == 2          # nothing can make it fit
 
 
-def test_t18_this_run_without_the_trash(env, monkeypatch):
+def test_t18_this_run_without_the_trash(env, monkeypatch, capsys):
+    """The chooser of 261126 offers what is set aside, not this run's removals
+    (that option is gone, on purpose: --keep-days 0 deletes them at once,
+    after the typed number)."""
     (env.src / "A/trip/DSC_0001.NEF").unlink()
     (env.src / "A/trip/NEW.NEF").write_bytes(b"n" * 1500)
-    monkeypatch.setattr(sb.shutil, "disk_usage", lambda path: Usage(10 ** 9, 0, 600))
-    answers(monkeypatch, "1", "1")
+    copy = in_backup(env, "A/trip/DSC_0001.NEF")
+    size = copy.stat().st_size
+    # the disk is asked again after the removals (MF2 of the keep-days review):
+    # deleting the copy frees its bytes
+    monkeypatch.setattr(sb.shutil, "disk_usage",
+                        lambda path: Usage(10 ** 9, 0, 600 + (0 if copy.exists() else size)))
+    before = snapshot(env.dest)
     assert mirror("--manifest", env.man, "--dest", env.dest, "--space-margin-gb", "0",
-                  "--yes") == 0
+                  "--yes") == 2
+    assert snapshot(env.dest) == before
+    answers(monkeypatch, "1")                     # the typed number of --keep-days 0
+    assert mirror("--manifest", env.man, "--dest", env.dest, "--space-margin-gb", "0",
+                  "--keep-days", "0", "--yes") == 0
     assert "A/trip/DSC_0001.NEF" not in backed(env.dest)
     assert trashed(env.dest) == set()
     assert in_backup(env, "A/trip/NEW.NEF").exists()

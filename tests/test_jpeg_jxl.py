@@ -114,7 +114,10 @@ def test_j18_a_jpeg_that_does_not_come_back_is_copied_as_it_is(env, monkeypatch,
     monkeypatch.delenv("FAKE_JXLPHOTO_FAIL")
     assert backup(env, "--jpeg", "jxl") == 0                # it works now: the copy leaves
     assert "2025/phone/cmyk.jpg.jxl" in backed(env.dest)
-    assert "2025/phone/cmyk.jpg" in under(env.dest, VERSIONS)
+    # its JXL gives these very bytes back: the copy is deleted, not kept (261126)
+    assert "2025/phone/cmyk.jpg" not in backed(env.dest)
+    assert "2025/phone/cmyk.jpg" not in under(env.dest, VERSIONS)
+    assert "DELETED (its JXL gives these bytes back) " in latest_log(photobackup_log_dir)
 
 
 # ---- J19 the restore's choice of formats ------------------------------------------------------
@@ -225,7 +228,11 @@ def test_j22_the_mirror_trashes_our_jpeg_copies(env, monkeypatch, photobackup_lo
     assert "convert JPEG to JXL (lossless)" in out and "old copy replaced by its JXL" in out
     have = backed(env.dest)
     assert {mirror_rel(env, rel) + ".jxl" for rel in ALL_JPEGS} <= have
-    assert {mirror_rel(env, rel) for rel in ALL_JPEGS} <= under(env.dest, mir.MIRROR_TRASH_FOLDER)
+    # ours, and their JXL gives their bytes back: deleted, in no trash (261126)
+    assert not {mirror_rel(env, rel) for rel in ALL_JPEGS} & (
+        have | under(env.dest, mir.MIRROR_TRASH_FOLDER)
+        | under(env.dest, mir.MIRROR_TRASH_VERSIONS_FOLDER) | under(env.dest, VERSIONS))
+    assert "JPEG copies deleted (JXL gives the same bytes)" in out
 
 
 def test_j23_the_manifest_jpeg_column(env, capsys, photobackup_log_dir):

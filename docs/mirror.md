@@ -99,12 +99,15 @@ And in every mode:
   backup wrote it, and to `versions\` (as in a normal backup) when it did not.
   An old copy identical byte for byte to the new one is not kept.
 - **A JXL the manifest no longer wants** (the line's `Tiff` or `Jpeg` says copy
-  now) leaves like the old copy of a changed file, to the trash when the backup
-  wrote it, only after the plain copy of the same file is in the backup and
-  holds the bytes the JXL was made from (SHA-256; else it stays, `UNDO SKIPPED`
-  in the log); it is counted in the line's limit (`MIRROR_MAX_DELETE_PERCENT`)
-  and shown in the box (*JXL replaced by the file*). With no trash
-  (`MIRROR_KEEP_DAYS = 0`) it frees no room for the copies: it leaves after them.
+  now) leaves like the old copy of a changed file, to `trash_versions\` when the
+  backup wrote it, only after the plain copy of the same file is in the backup
+  and holds the bytes the JXL was made from (SHA-256). A JXL proven to be of an
+  older version of the file (another size, or the bytes copied differ) leaves
+  too, as an old version (`UNDONE (older version)`); without proof it stays
+  (`UNDO SKIPPED` in the log). It is counted in the line's limit
+  (`MIRROR_MAX_DELETE_PERCENT`) and shown in the box (*JXL replaced by the
+  file*). With no trash (`MIRROR_VERSIONS_KEEP_DAYS = 0`) it frees no room for
+  the copies: it leaves after them.
 - **Never behind a link**: a file whose source is behind a link or junction
   the backup does not follow stays.
 - **A line with read errors removes nothing** in that run (without a
@@ -174,25 +177,48 @@ console's title do. A run that stops says so in a box of its own:
 
 ## The trash
 
-- **Where:** `<backup>\_photo_backup\trash\<run>\`, one folder per run (its
-  name is the time the run started, `YYMMDD_HHMMSS`), with the same folders
-  as the backup inside.
-- **How long:** `MIRROR_KEEP_DAYS` (30) days. The first real mirror on or
-  after that day — the day the screen shows, at any hour *(v0.14.0-rc2)* —
-  deletes the run's folder for good, also unattended. With
-  `MIRROR_KEEP_DAYS = 0` nothing goes to the trash (what leaves is deleted at
-  once), and the next run also empties the trash that is there.
-- **Look:** `--show-trash` (`[8]` → `[3]`): every run, newest first, with its
-  date, until when it stays, its files and where they came from. Changes
-  nothing.
-- **Empty it:** `--empty-trash` (`[8]` → `[4]`) deletes everything in it, or
-  with `--before YYYY-MM-DD` only what was taken out before that day, after you
-  type the number of files. Never with `--unattended`.
+- **Where:** three folders under `<backup>\_photo_backup\` *(since 261126,
+  keep-days)*, each with one folder per run (its name is the time the run
+  started, `YYMMDD_HHMMSS`) and the same folders as the backup inside:
+  `trash\` (`MIRROR_TRASH_FOLDER`) for what the mirror **removed** (gone from
+  the source, no longer selected), `trash_versions\`
+  (`MIRROR_TRASH_VERSIONS_FOLDER`) for the **old copies it replaced** (a changed
+  file, a JXL undone or made again, the JXL of an older version) and
+  `trash_originals\` (`MIRROR_TRASH_ORIGINALS_FOLDER`) for the **TIFF copies a
+  JXL replaced** (each listed in the catalog's `originals` table). A JPEG copy
+  its JXL gives back byte for byte is deleted, not kept. What the mirror did not
+  write goes to `versions\`, as in a normal backup.
+- **How long:** each folder its own days: `MIRROR_KEEP_DAYS`,
+  `MIRROR_VERSIONS_KEEP_DAYS`, `MIRROR_ORIGINALS_KEEP_DAYS` (30 each), or
+  `--keep-days`, `--versions-keep-days`, `--originals-keep-days` for one run (a
+  whole number, `0` or `never`). The first real mirror on or after that day —
+  the day the screen shows, at any hour *(v0.14.0-rc2)* — deletes the run's
+  folder for good, also unattended. `never` keeps it until space is short. With
+  `0` nothing goes to that folder: what leaves is deleted at once, and what is
+  already in it is deleted too; both need the number of files typed in that run
+  (`--unattended` stops, nothing changed), and never more files of a folder are
+  deleted at once than were typed for it: anything more goes to that folder,
+  and the next run asks for it.
+- **`--show-trash` and `--empty-trash`** say "only when space is short" for a
+  folder kept `never`, never a date. A catalog that another program holds while
+  `--empty-trash` deletes stops it there: what was deleted is said, the rest
+  stays (exit 1). The same while a mirror deletes its trash past its date:
+  nothing more leaves the backup, the `MIRROR STOPPED` box says what was
+  deleted (exit 1).
+- **Look:** `--show-trash` (`[8]` → `[3]`): every run of the three folders,
+  newest first, with its date, until when it stays, its files and where they
+  came from. Changes nothing. The menu's `[9] Backup space` shows the three
+  folders beside the normal backup's `versions\` and `originals\`
+  ([reruns_and_moves.md](reruns_and_moves.md#what-the-backup-sets-aside-and-for-how-long)).
+- **Empty it:** `--empty-trash` (`[8]` → `[4]`) deletes everything in the three
+  folders, or with `--before YYYY-MM-DD` only what was taken out before that day,
+  after you type the number of files. Never with `--unattended`.
 - Only folders named like a run are ever deleted, each only by its real path:
   a folder of another name in the trash is listed and never touched, and a
   link or junction inside is left where it is (and is not an error of every
-  later run, *v0.14.0-rc2*). If `_photo_backup` or the trash is itself a link
-  or junction, the mirror changes nothing (exit 2), and so does any other link
+  later run, *v0.14.0-rc2*). If `_photo_backup`, a trash folder, `versions\` or
+  `tools\` is itself a link or junction, the mirror changes nothing (exit 2),
+  and so does any other link
   or junction inside the backup on the way to its files *(v0.14.0-rc2)*.
 - **Ctrl+C** while files are removed or the trash is emptied still ends with
   the box (`MIRROR INTERRUPTED`) and the list of what was done to each file
@@ -222,32 +248,40 @@ console's title do. A run that stops says so in a box of its own:
 ## When it does not fit
 
 When the copy does not fit even after the trash past its date is deleted, the
-mirror offers what could be deleted **for good** to make room — only the
-options that make it fit, the one that deletes the least first:
+mirror offers what could be deleted **for good** to make room: the chooser the
+normal backup uses too *(261126, keep-days)*, with the mirror's three trash
+folders as its options — for each folder that holds something, its oldest run
+folders (when they are enough alone) and all of it, the one that deletes the
+least first:
 
 ```
   !! NOT ENOUGH SPACE on H: - 312.4 GB missing.
-     It fits if the mirror deletes these FOR GOOD (no trash, no way back):
-       1) the oldest trash (2026-10-19 to 2026-11-02)       1,204 files   340.1 GB  <- recommended
-       2) the whole trash                                   3,410 files   812.0 GB
-       0) cancel: nothing changes
+     It fits if the mirror deletes these FOR GOOD (no way back):
+       1) mirror trash: the oldest (2026-10-19 to 2026-11-02)  1,204 files  340.1 GB   free after 352.5 GB  <- recommended
+       2) mirror trash: all of it                              3,410 files  812.0 GB   free after 824.4 GB
+       3) mirror trash: TIFF originals: all of it                 12 files    9.0 GB   free after 21.4 GB  (not enough alone)
+       Enter) cancel: nothing changes
 ```
 
-The other options are *what this run removes, without the trash* and *the
-whole trash + this run, without the trash* (when nothing smaller fits). They
-are in the order of what they delete, the least first *(v0.14.0-rc2: in rc1 the
-trash came first even when this run deleted less)*; between two of the same
-size, the oldest trash: what left the backup today is the likeliest to be a
-mistake nobody has noticed yet. A run with nothing to copy never asks: it
-needs no space *(v0.14.0-rc2)*. You choose a number (Enter cancels), then type
-the number of files. Unattended, the mirror stops instead and says how much
-each option would free. `_free_space.csv` lists every file of every option.
+Several can be chosen (`1 3`; two of one folder: the larger wins); then you type
+the number of files. The run deletes them before the first copy, asks the disk
+again, and stops when it still does not fit — no second question. The disk is
+asked again after the removals whenever the space check counted on what was to
+be deleted (the trash past its date too): a run folder that could not be deleted
+never lets the copy start on a full disk. When files had already left the backup
+by then, the mirror's box (`MIRROR STOPPED`) says what left and the trash folder
+it is in (exit 1: something changed); else the STOP box (exit 2). *What
+this run removes, without the trash* is no longer an option: `--keep-days 0`
+does that, after its own typed number. A run with nothing to copy never asks: it
+needs no space *(v0.14.0-rc2)*. Unattended, the mirror stops instead and names
+what is set aside. `_free_space.csv` lists the run folders of every option.
 
 ## Unattended runs
 
 `--unattended` (what a preset of the menu uses) never asks anything. What would
 need a typed number stops the run with exit 2, nothing changed: a line over the
-limit, not enough space, `--empty-trash`. `--total` cannot run unattended.
+limit, not enough space, a trash folder with `0` days that would delete
+something, `--empty-trash`. `--total` cannot run unattended.
 `--yes` alone only skips the "Mirror now?" question; a number that needs typing
 is still asked at the console. A preset made from `[8] Mirror` runs the scoped
 mirror of its manifest with `--unattended` ([menu.md](menu.md#unattended-runs-task-scheduler)).
@@ -264,6 +298,9 @@ mirror of its manifest with `--unattended` ([menu.md](menu.md#unattended-runs-ta
 | `--mirror {disk,selection}` | with `--source`: what "gone" means for the whole run (default `disk`) |
 | `--total` | also remove what came from folders that are not in this run (typed confirmation) |
 | `--allow-mass-delete` | let a line remove or replace more than `MIRROR_MAX_DELETE_PERCENT` of its files without typing the number |
+| `--keep-days N\|never` | days what the mirror removes stays in `trash\` (default `MIRROR_KEEP_DAYS`); `0` = deleted at once, typed |
+| `--versions-keep-days N\|never` | the same for `trash_versions\` (default `MIRROR_VERSIONS_KEEP_DAYS`) |
+| `--originals-keep-days N\|never` | the same for `trash_originals\` (default `MIRROR_ORIGINALS_KEEP_DAYS`) |
 | `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, for the lines that keep TIFF or JPEG as JXL (default `JXLPHOTO`) *(v0.14.0-rc2)* |
 | `--retry-conversions` | try again what jxl-photo could not convert in `CONVERT_GIVE_UP_AFTER` runs in a row *(v0.14.0-rc6; [a file jxl-photo cannot convert](tiff_to_jxl.md#a-file-jxl-photo-cannot-convert))* |
 | `--reconvert-older` | make again every TIFF kept as JXL whose JXL was made by an older jxl-photo; the old JXL goes to the trash (each counts in its line's limit). One run; not with `--no-convert` ([a new jxl-photo](tiff_to_jxl.md#a-new-jxl-photo)) |
@@ -292,10 +329,14 @@ At the top of `mirror_backup.py`:
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `MIRROR_KEEP_DAYS` | `30` | days a removed or replaced file stays in the trash; `0` = no trash |
+| `MIRROR_KEEP_DAYS` | `30` | days a removed file stays in `trash\`; `0` = no trash (deleted at once, typed); `None` = never by age |
+| `MIRROR_VERSIONS_KEEP_DAYS` | `30` | the same for the old copies it replaced, in `trash_versions\` |
+| `MIRROR_ORIGINALS_KEEP_DAYS` | `30` | the same for the TIFF copies a JXL replaced, in `trash_originals\` |
 | `MIRROR_MAX_DELETE_PERCENT` | `20` | the limit per line, in % of its files in the backup; `0` = no limit |
 | `MIRROR_MAX_DELETE_MIN` | `5` | ... and the fewest files that can trip it |
-| `MIRROR_TRASH_FOLDER` | `trash` | the trash's folder, under `_photo_backup` |
+| `MIRROR_TRASH_FOLDER` | `trash` | the folder of what it removed, under `_photo_backup` |
+| `MIRROR_TRASH_VERSIONS_FOLDER` | `trash_versions` | the folder of the old copies it replaced |
+| `MIRROR_TRASH_ORIGINALS_FOLDER` | `trash_originals` | the folder of the TIFF copies a JXL replaced |
 | `MIRROR_LOCK_FILE` | `mirror.lock` | the lock of a running mirror, under `_photo_backup` |
 | `MIRROR_SUMMARY_LINES` | `10` | lines per table on the screen (the CSV has all) |
 
@@ -312,12 +353,12 @@ In `Logs\`, next to the backup's usual CSVs (`<stamp>_mirror_plan.csv`, ...):
   backup, `trash_purge`, `trash_foreign`), `reason`, `line`, `rel`, `size`,
   `source_path`, `note` and `result` (written before the run as `planned`,
   rewritten at the end with what happened).
-- `<stamp>_mirror_free_space.csv` — when it does not fit: every file of every
-  option (`group`, `path`, `size`).
+- `<stamp>_mirror_free_space.csv` — when it does not fit: the run folders of
+  every option (`option`, `run_folder`, `taken_out`, `files`, `size`).
 - The log names each step: `MIRROR TRASH <rel>`, `MIRROR DELETED <rel>`,
   `MIRROR TRASH old copy <rel>`, `MIRROR REPLACED <rel>`, `MIRROR ROW DROPPED
-  <rel>`, `MIRROR KEPT <rel>: <why>`, `MIRROR TRASH PURGED <run>`,
-  `CONFIRMATION given|refused`, `LOCK taken over`.
+  <rel>`, `MIRROR KEPT <rel>: <why>`, `PURGED _photo_backup\<folder>\<run>`,
+  `CONFIRMATION given|refused`, `FREE SPACE chosen`, `LOCK taken over`.
 - `--show-trash` and `--empty-trash` write `<stamp>_mirror_trash.log`.
 
 | Exit code | Meaning |

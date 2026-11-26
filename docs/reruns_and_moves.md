@@ -35,6 +35,79 @@ copy and remembers the size, mtime and sha256 of every copied file — the size
 and mtime the source had at the moment it was copied (a file saved by your
 editor while the backup runs is recorded as copied, not as planned).
 
+## What the backup sets aside, and for how long
+
+What leaves the backup's tree is one of three kinds. Each has a folder per run
+(`<dest>\_photo_backup\<folder>\<YYMMDD_HHMMSS>\<rel>`) and its own number of
+days, separately for the normal backup and the mirror:
+
+| kind | what | normal backup: folder / setting | mirror: folder / setting |
+|---|---|---|---|
+| old versions | the old copy of a changed file; a JXL group undone or made again (`--reconvert-older`); the JXL of an older version of a file | `versions\` / `VERSIONS_KEEP_DAYS` (`--versions-keep-days`) | `trash_versions\` / `MIRROR_VERSIONS_KEEP_DAYS` |
+| TIFF originals | a TIFF copy its JXL replaced | `ORIGINALS_FOLDER` (`originals\`) / `ORIGINALS_KEEP_DAYS` (`--originals-keep-days`) | `trash_originals\` / `MIRROR_ORIGINALS_KEEP_DAYS` |
+| removed | (mirror only) a file gone from the source, no longer selected, ... | — (the normal backup never removes those: [orphans](#orphans)) | `trash\` / `MIRROR_KEEP_DAYS` |
+
+- **A whole number N**: kept N days. The first real run (a dry-run, `--verify`
+  or `--analyze` never deletes) on or after the day *taken out + N* deletes that
+  run folder, right after the question and before the first copy. Each run
+  deletes only in the folders it owns: the normal backup in `versions\` and
+  `originals\`, the mirror in its three trash folders.
+- **`never`** (`None` in the script): never deleted by age; only offered when
+  space is short. The default of the normal backup: it keeps everything, as
+  before. The mirror keeps its 30 days.
+- **`0`**: not kept at all: what leaves the backup's tree is deleted at once,
+  and the run folders already kept in that folder are deleted at the next run.
+  Both need the number of files typed in that run; `--yes` (the normal backup)
+  or `--unattended` (the mirror) stops instead (exit 2, nothing changed). The
+  number is an upper bound: never more files of a kind are deleted than were
+  typed for it; anything more is kept in its folder, and the next run asks for
+  it. The menu's own copy steps run with `--yes`: they stop too.
+  Capture One rewrites its settings files at each edit: with old versions at 0
+  almost every run asks, and every preset stops.
+- TIFF copies a JXL replaced before v0.14.0-rc9 were set aside in `versions\`
+  and follow `VERSIONS_KEEP_DAYS`. The old copy (as it is) of a TIFF whose
+  source changed goes to `originals\` whether the new version is converted or
+  copied as it is (the conversion off or failed): where the summary counted it.
+- Anything else is refused before anything is read (exit 2).
+- A copy the mirror did not write (no row, not adoptable) always goes to the
+  normal backup's `versions\`, never to a trash folder.
+- **A JPEG copy its JXL replaced** is deleted, but only when the file itself,
+  read, holds the bytes its JXL gives back (the JXL's `source_sha256`, proven when
+  it was made) and its row does not say other bytes: the log says `DELETED (its
+  JXL gives these bytes back)`. Without that proof (a file that cannot be read,
+  other bytes) it is kept as an old version.
+- The catalog's table `originals` lists each TIFF copy kept in `originals\` (or
+  the mirror's `trash_originals\`): where it is, the name it had, its size, date
+  and SHA-256. Its row goes when the file is deleted.
+- Only folders named like a stamp are deleted, by their real path, never through
+  a link or junction; a store that is a link stops a real run (exit 2), and so
+  does `orphans\` with `--move-orphans` or `tools\` (the programs kept in the
+  backup), before the first byte.
+- When the space check counted on what expires (or what a person chose), the
+  disk is asked again after deleting it: a run folder that could not be deleted
+  (a file held by another program) leaves too little room, and the run stops
+  before the first copy (exit 2, `Still not enough space after deleting what was
+  set aside`).
+- A catalog that cannot be written while deleting (another program holds it)
+  stops the deletion there: what was deleted is said, the rest stays (exit 1).
+
+**Every run shows the space block** next to its `Space:` line: one row per
+folder that exists (the normal backup lists the mirror's trash too: the same
+disk), its files, size, how long it is kept and its next deletion, what expires
+in this run, and how much would be free after deleting each.
+`selective_backup.py --space-report --dest X` (the menu's **[9] Backup space**)
+prints the same in full, run folder by run folder, and reads only the
+destination.
+
+**When the run does not fit**, a person at the console (not `--yes`, not
+`--unattended`) is offered what this run owns that is set aside: per folder its
+oldest run folders (when they are enough) and all of it, the smallest first,
+with "free after". Several can be chosen (`1 3`; two of one folder: the larger
+wins), then the number of files is typed. The run deletes them before the first
+copy, asks the disk again, and stops (exit 2) if it still does not fit. A
+dry-run only shows the options; `--yes` or `--unattended` stops, naming what is
+set aside. The list of what each option deletes is `<stamp>_free_space.csv`.
+
 ## Moved and renamed folders
 
 When you rename a session (`250129_Flores` → `250129_Flores [FINAL]`), every

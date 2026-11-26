@@ -154,7 +154,7 @@ def test_s3_a_changed_source_with_a_copy_as_is_waits_for_update_changed(env, mon
     assert row_count(out, "copies their JXL replaces (to versions\\)") is None
     assert backup(env, "--tiff", "jxl", "--update-changed") == 0
     assert "2025/scans/000037.tiff.jxl" in backed(env.dest)
-    assert "2025/scans/000037.tiff" in under(env.dest, "versions")
+    assert "2025/scans/000037.tiff" in under(env.dest, sb.ORIGINALS_FOLDER)    # 261126
 
 
 def test_s3_the_mirror_shows_the_old_copy_as_retired_not_as_a_stranger(env, monkeypatch,
@@ -183,7 +183,7 @@ def test_s3_the_mirror_shows_the_old_copy_as_retired_not_as_a_stranger(env, monk
 def test_s5_the_menu_asks_the_next_backup_to_try_again(monkeypatch, menu_config):
     # answers: jxl-photo? no; the work folder? no; the conversion off? no; try the failed
     # conversions again? yes; forget the choices? no
-    script(monkeypatch, ["n", "n", "n", "y", "n", "n"])
+    script(monkeypatch, ["n", "n", "n", "y", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert os.path.isfile(menu._retry_marker())
     commands = []

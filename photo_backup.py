@@ -137,7 +137,32 @@ def _remembered_jxlphoto():
 
 # the options of a run that backs nothing up: it never gets nor spends the
 # one-run markers (_retry_marker, _reconvert_marker; review 261126, S3)
-_NOT_A_BACKUP = ("--verify", "--analyze", "--show-trash", "--empty-trash")
+_NOT_A_BACKUP = ("--verify", "--analyze", "--show-trash", "--empty-trash", "--space-report")
+
+# how long each kind of file the backup sets aside is kept (261126, keep-days):
+# (config key of this computer, option, script, setting of that script)
+_KEEP_DAYS = (
+    ("versions_keep_days", "--versions-keep-days", "backup", "VERSIONS_KEEP_DAYS"),
+    ("originals_keep_days", "--originals-keep-days", "backup", "ORIGINALS_KEEP_DAYS"),
+    ("mirror_keep_days", "--keep-days", "mirror", "MIRROR_KEEP_DAYS"),
+    ("mirror_versions_keep_days", "--versions-keep-days", "mirror", "MIRROR_VERSIONS_KEEP_DAYS"),
+    ("mirror_originals_keep_days", "--originals-keep-days", "mirror",
+     "MIRROR_ORIGINALS_KEEP_DAYS"),
+)
+
+
+def _days_word(value):
+    """A *_KEEP_DAYS value as the scripts take it: N, or `never` (None)."""
+    return "never" if value is None else str(value)
+
+
+def _keep_days_value(key, owner, setting):
+    """This computer's choice ([4] Settings), else the script's own setting."""
+    remembered = _remembered(key).strip()
+    if remembered:
+        return remembered
+    value = _setting(setting) if owner == "backup" else _mirror_setting(setting)
+    return _days_word(value)
 
 
 def _run_child(script, argv):
@@ -165,6 +190,18 @@ def _run_child(script, argv):
             and script in (BACKEND, MANIFEST_BACKEND, MIRROR_BACKEND)
             and "--verify" not in argv):
         argv.append("--no-convert")
+    # how long what the backup sets aside is kept (261126, keep-days): this
+    # computer's choice ([4] Settings), else the script's own setting -- always
+    # passed, never a literal of the menu
+    if script in (BACKEND, MANIFEST_BACKEND) and not any(
+            flag in argv for flag in ("--verify", "--analyze")):
+        for key, option, owner, setting in _KEEP_DAYS:
+            if owner == "backup" and option not in argv:
+                argv += [option, _keep_days_value(key, owner, setting)]
+    if script == MIRROR_BACKEND:
+        for key, option, owner, setting in _KEEP_DAYS:
+            if owner == "mirror" and option not in argv:
+                argv += [option, _keep_days_value(key, owner, setting)]
     # the one-run markers go only to a run that backs up: never a verify, an
     # analysis or the mirror's trash commands, which would accept the flag and
     # spend the marker without converting anything (review 261126, S3)
@@ -1189,6 +1226,90 @@ def captureone_menu(config):
             _captureone_job(["--revert-last"], "Undo")
 
 
+def space_flow(config):
+    """[9] Backup space (261126): what the backup holds set aside -- old
+    versions, TIFF originals, the mirror's trash --, when each is deleted and
+    what deleting it would free. Reads only the backup."""
+    title("Backup space - what is set aside, when it is deleted")
+    dest = ask_dest(config["last"].get("dest", "") or _mirror_dest_default(config),
+                    must_exist=True)
+    rc = run_backend(["--space-report", "--dest", dest])
+    if rc != 0:
+        say(f"Backup space: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "yellow")
+    return rc
+
+
+_KEEP_KINDS = (("old versions (a changed file's old copy, a JXL replaced)",
+                "versions_keep_days", "mirror_versions_keep_days"),
+               ("TIFF originals (a TIFF copy its JXL replaced)",
+                "originals_keep_days", "mirror_originals_keep_days"),
+               ("removed by the mirror (gone, unselected)", None, "mirror_keep_days"))
+
+
+def _keep_days_rows(config):
+    """[(kind, backup's days, mirror's days)] as this computer runs them: its
+    choice, else the script's setting ('-': not that script's)."""
+    settings = {key: (owner, setting) for key, _option, owner, setting in _KEEP_DAYS}
+
+    def value(key):
+        if key is None:
+            return "-"
+        chosen = str(config.get(key) or "").strip()
+        if chosen:
+            return chosen
+        owner, setting = settings[key]
+        return _days_word(_setting(setting) if owner == "backup" else _mirror_setting(setting))
+    return [(label, value(backup), value(mirror)) for label, backup, mirror in _KEEP_KINDS]
+
+
+def _parse_days(text):
+    """'never', a whole number 0 or more, '-' (forget: the script's setting),
+    or None when it is none of them."""
+    text = text.strip().casefold()
+    if text in ("never", "-"):
+        return text
+    if text and text.isascii() and text.isdigit():
+        return str(int(text))
+    return None
+
+
+def keep_days_settings(config):
+    """[4] Settings: how long what the backup sets aside is kept, per computer
+    (261126): a small table, kind | backup | mirror, each value editable."""
+    say("  How long what the backup sets aside is kept (days; never = only when space is "
+        "short; 0 = not kept):")
+    say(f"    {'kind':<58} {'backup':>8} {'mirror':>8}")
+    for label, backup, mirror in _keep_days_rows(config):
+        say(f"    {label:<58} {backup:>8} {mirror:>8}")
+    if not yes_no("Change one of them (on this computer)?", False):
+        return
+    for label, backup_key, mirror_key in _KEEP_KINDS:
+        for script, key in (("backup", backup_key), ("mirror", mirror_key)):
+            if key is None:
+                continue
+            current = dict((row[0], row) for row in _keep_days_rows(config))[label]
+            shown = current[1] if script == "backup" else current[2]
+            while True:
+                answer = ask(f"  {label} - {script} (N days, 0, never, - = the script's "
+                             f"setting)", shown)
+                days = _parse_days(answer)
+                if days is not None:
+                    break
+                say("  Type a whole number of days, 0, never, or -.", "yellow")
+            if days == "0" and shown != "0":
+                say("  0 = not kept: what leaves the backup from now on is DELETED at once, and "
+                    "the files already kept there are DELETED at the next run. Either happens "
+                    "only after you type the number of files; a preset, --yes or an unattended "
+                    "run stops instead (exit 2) and changes nothing. The menu's own copy steps "
+                    "([1] Back up, [7] Manifest) run with --yes too: they stop; run the script "
+                    "by hand to type the number. Capture One rewrites its "
+                    "settings files at each edit, so with old versions at 0 almost every run "
+                    "asks, and presets stop.", "yellow")
+            config[key] = "" if days == "-" else days
+    save_config(config)
+    say("  Saved for this computer.")
+
+
 def settings_menu(config):
     title("Settings")
     say(f"  Remembered choices and presets: {CONFIG_PATH}")
@@ -1274,8 +1395,10 @@ def settings_menu(config):
                 "  The next backup (or manifest, or mirror) makes them again.")
         except OSError as exc:
             say(f"  Not saved: {exc}", "yellow")
+    keep_days_settings(config)
     say("  Defaults of mirror_backup.py (edit the top of that file to change them):")
-    for name in ("MIRROR_KEEP_DAYS", "MIRROR_MAX_DELETE_PERCENT", "MIRROR_MAX_DELETE_MIN"):
+    for name in ("MIRROR_KEEP_DAYS", "MIRROR_VERSIONS_KEEP_DAYS", "MIRROR_ORIGINALS_KEEP_DAYS",
+                 "MIRROR_MAX_DELETE_PERCENT", "MIRROR_MAX_DELETE_MIN"):
         say(f"    {name:<26} {_mirror_setting(name)!r}")
     if yes_no("Forget the remembered choices (presets are kept)?", False):
         config["last"] = {}
@@ -1299,6 +1422,7 @@ def interactive():
         say("  [6] Capture One only (back up, restore, force, undo)")
         say("  [7] Manifest (each folder with its own mode)")
         say("  [8] Mirror (the backup follows a manifest; removes what is gone, through a trash)")
+        say("  [9] Backup space (what is set aside, when it is deleted)")
         say("  [0] Exit")
         answer = ask("Choose", "1")
         if answer == "0":
@@ -1319,6 +1443,8 @@ def interactive():
             manifest_flow(config)
         elif answer == "8":
             mirror_menu(config)
+        elif answer == "9":
+            space_flow(config)
 
 
 def run_preset(name):

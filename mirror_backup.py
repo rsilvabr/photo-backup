@@ -43,6 +43,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import sys
 import textwrap
 import time
@@ -56,18 +57,25 @@ import manifest_backup as mb
 __version__ = "0.14.0-rc8"
 
 # ---- Settings -------------------------------------------------------------------
-MIRROR_KEEP_DAYS = 30               # days a file the mirror removed or replaced stays in the trash
-                                    # (<dest>\_photo_backup\trash\<run>); then the next mirror deletes it for
-                                    # good. 0 = no trash: removed at once (and the next run empties the trash)
+MIRROR_KEEP_DAYS = 30               # days a file the mirror removed (gone from the source, no longer
+                                    # selected) stays in the trash (<dest>\_photo_backup\trash\<run>); then
+                                    # the next mirror on or after that day deletes it for good. 0 = no trash:
+                                    # deleted at once, after the number of files is typed (--unattended
+                                    # stops); None = never by age (only when space is short)
+MIRROR_VERSIONS_KEEP_DAYS = 30      # the same for the old copies the mirror replaced (a changed file, a JXL
+                                    # undone or made again): <dest>\_photo_backup\trash_versions\<run>
+MIRROR_ORIGINALS_KEEP_DAYS = 30     # ... and for the TIFF copies a JXL replaced: trash_originals\<run>
 MIRROR_MAX_DELETE_PERCENT = 20      # a manifest line (without a manifest: the whole run) that would remove
 MIRROR_MAX_DELETE_MIN = 5           # or replace more than this % of its files in the backup, and at least
                                     # MIRROR_MAX_DELETE_MIN files, changes nothing unless the number of files
                                     # is typed (or --allow-mass-delete); MIRROR_MAX_DELETE_PERCENT = 0 = no limit
-MIRROR_TRASH_FOLDER = "trash"       # under selective_backup.CATALOG_FOLDER
+MIRROR_TRASH_FOLDER = "trash"       # under selective_backup.CATALOG_FOLDER: what the mirror removed
+MIRROR_TRASH_VERSIONS_FOLDER = "trash_versions"     # ... the old copies it replaced
+MIRROR_TRASH_ORIGINALS_FOLDER = "trash_originals"   # ... the TIFF copies a JXL replaced
 MIRROR_LOCK_FILE = "mirror.lock"    # under selective_backup.CATALOG_FOLDER while a real mirror runs
 MIRROR_SUMMARY_LINES = 10           # lines per table on the screen (the _actions.csv has all)
 
-_STAMP = re.compile(r"\d{6}_\d{6}")     # a trash folder made by a run: its stamp, YYMMDD_HHMMSS
+_STAMP = re.compile(r"[0-9]{6}_[0-9]{6}")     # a trash folder made by a run: its stamp, YYMMDD_HHMMSS
 _RULE = "=" * 80                        # the frame of every block this script prints
 _LABEL = 50                             # width of a table's label column, its indent included
 
@@ -134,9 +142,11 @@ def _day(moment):
     return moment.strftime("%Y-%m-%d")
 
 
-def _until():
-    """The day a file put in the trash now is deleted for good."""
-    return _day(datetime.now() + timedelta(days=MIRROR_KEEP_DAYS))
+def _until(days=None):
+    """The day a file put in the trash now is deleted for good (`days`: of its
+    store; MIRROR_KEEP_DAYS by default); never: when space is short."""
+    days = MIRROR_KEEP_DAYS if days is None else days
+    return _day(datetime.now() + timedelta(days=days))
 
 
 def _list_place(path):
@@ -159,9 +169,31 @@ def _stop_lines(dest, why, todo):
 
 
 # ---- Settings and options ------------------------------------------------------------
+def stores(args=None):
+    """The mirror's three stores (selective_backup._Store), with this run's
+    days (its options, else the settings): what it removed, the old copies it
+    replaced, the TIFF copies a JXL replaced."""
+    def days(option, setting):
+        return getattr(args, option, setting) if args is not None else setting
+    return [sb._Store("removed", "removed", MIRROR_TRASH_FOLDER,
+                      days("keep_days", MIRROR_KEEP_DAYS), "mirror"),
+            sb._Store("versions", "old versions", MIRROR_TRASH_VERSIONS_FOLDER,
+                      days("versions_keep_days", MIRROR_VERSIONS_KEEP_DAYS), "mirror"),
+            sb._Store("originals", "TIFF originals", MIRROR_TRASH_ORIGINALS_FOLDER,
+                      days("originals_keep_days", MIRROR_ORIGINALS_KEEP_DAYS), "mirror")]
+
+
+_KEEP_SETTING = {"removed": "MIRROR_KEEP_DAYS", "versions": "MIRROR_VERSIONS_KEEP_DAYS",
+                 "originals": "MIRROR_ORIGINALS_KEEP_DAYS"}
+
+
 def _settings_errors():
     errors = []
-    for name in ("MIRROR_KEEP_DAYS", "MIRROR_MAX_DELETE_MIN"):
+    for name in ("MIRROR_KEEP_DAYS", "MIRROR_VERSIONS_KEEP_DAYS", "MIRROR_ORIGINALS_KEEP_DAYS"):
+        problem = sb._keep_days_problem(name, globals()[name])
+        if problem:
+            errors.append(problem)
+    for name in ("MIRROR_MAX_DELETE_MIN",):
         value = globals()[name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             errors.append(f"{name} must be a whole number, 0 or more (it is {value!r})")
@@ -172,19 +204,21 @@ def _settings_errors():
     value = MIRROR_SUMMARY_LINES
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         errors.append(f"MIRROR_SUMMARY_LINES must be a whole number, 1 or more (it is {value!r})")
-    reserved = {"versions", sb.ORPHANS_FOLDER.casefold(), sb.BACKUP_ID_FILE.casefold(),
-                "catalog.sqlite", "catalog.sqlite-journal"}
+    reserved = sb._reserved_names() | {str(sb.ORIGINALS_FOLDER).casefold()}
     names = []
-    for name in ("MIRROR_TRASH_FOLDER", "MIRROR_LOCK_FILE"):
+    settings = ("MIRROR_TRASH_FOLDER", "MIRROR_TRASH_VERSIONS_FOLDER",
+                "MIRROR_TRASH_ORIGINALS_FOLDER", "MIRROR_LOCK_FILE")
+    for name in settings:
         value = globals()[name]
         text = value.strip() if isinstance(value, str) else ""
         if (not text or text != value or text in (".", "..")
                 or any(char in text for char in "\\/:") or text.casefold() in reserved):
-            errors.append(f"{name} must be a plain name (not versions, orphans or a file of the "
-                          f"catalog), not {value!r}")
+            errors.append(f"{name} must be a plain name (not versions, originals, orphans or a "
+                          f"file of the catalog), not {value!r}")
         names.append(text.casefold())
-    if names[0] and names[0] == names[1]:
-        errors.append("MIRROR_TRASH_FOLDER and MIRROR_LOCK_FILE must be two different names")
+    seen = [name for name in names if name]
+    if len(set(seen)) != len(seen):
+        errors.append(f"{', '.join(settings)} must be four different names")
     return errors
 
 
@@ -239,6 +273,10 @@ def _manifest_backend_args(args, rows):
     parsed.verify = None
     parsed.max_gb = sb.VERIFY_MAX_GB
     parsed.yes = args.yes or args.unattended
+    # the mirror's own days are its job's (stores()); the normal backup's stores
+    # (versions\ for a copy the mirror did not write) keep the backup's settings
+    parsed.versions_keep_days = sb.VERSIONS_KEEP_DAYS
+    parsed.originals_keep_days = sb.ORIGINALS_KEEP_DAYS
     return mb._backend_args(parsed, rows, os.path.abspath(args.dest))
 
 
@@ -323,187 +361,74 @@ def _make_writable(path):
     os.chmod(sb._io(path), os.stat(sb._io(path)).st_mode | 0o200)
 
 
-def _delete_file(path):
-    """Delete one file for good (Windows refuses a read-only one: made writable first)."""
-    try:
-        os.remove(sb._io(path))
-    except PermissionError:
-        _make_writable(path)
-        os.remove(sb._io(path))
+_delete_file = sb._delete_backup_file      # one file for good (a read-only one made writable)
 
 
-# ---- The trash -------------------------------------------------------------------------------
-@dataclasses.dataclass
-class _TrashRun:
-    name: str           # the stamp of the run that filled it: YYMMDD_HHMMSS
-    path: str
-    when: datetime
-    files: int = 0
-    nbytes: int = 0
-    links: int = 0      # links/junctions inside: never followed, never removed
-    folders: object = None      # collections.Counter: where (_group) -> files
-    folder_bytes: object = None
+# ---- The trash: three stores, run folders, their days (the generic part lives in
+# ---- selective_backup.py since 261126, keep-days; these are thin wrappers) -------------------
+_TrashRun = sb._StoreRun
+_scan_tree = sb._scan_tree
+_typed_confirmation = sb._typed_confirmation
 
 
-def _trash_root(dest):
-    return os.path.join(dest, sb.CATALOG_FOLDER, MIRROR_TRASH_FOLDER)
+def _trash_root(dest, folder=None):
+    return sb._store_root(dest, folder or MIRROR_TRASH_FOLDER)
 
 
-def _trash_problem(dest):
-    """Why the backup's own folder or its trash cannot be used, or None. Each
-    must be where it says, by its real path: a junction planted there would
-    lead the mirror to move files into another place -- a source even -- and
-    to delete there."""
-    real_dest = sb._real(dest)
-    for rel in (sb.CATALOG_FOLDER, os.path.join(sb.CATALOG_FOLDER, MIRROR_TRASH_FOLDER)):
-        path = os.path.join(dest, rel)
-        try:
-            present = os.path.lexists(sb._io(path))
-        except (OSError, ValueError):
-            present = False
-        if not present:
-            continue
-        real = sb._real(path)
-        expected = os.path.join(real_dest, rel)
-        if os.path.normcase(real).rstrip("\\/") != os.path.normcase(expected).rstrip("\\/"):
-            return f"{path} leads somewhere else ({real}): the mirror does not use it"
+def _trash_folders():
+    return (MIRROR_TRASH_FOLDER, MIRROR_TRASH_VERSIONS_FOLDER, MIRROR_TRASH_ORIGINALS_FOLDER)
+
+
+def _written_folders():
+    """Every folder under selective_backup.CATALOG_FOLDER a mirror run writes
+    into: its trash folders, the normal versions\\ (an old copy it did not
+    write) and tools\\ (KEEP_TOOLS_IN_BACKUP). SF1 of the final review 261126."""
+    return (_trash_folders() + (sb._VERSIONS_FOLDER,)
+            + ((sb.TOOLS_FOLDER,) if sb.KEEP_TOOLS_IN_BACKUP else ()))
+
+
+def _trash_problem(dest, written=False):
+    """Why the backup's own folder or one of the mirror's trash folders (with
+    `written`: every folder a real run writes into, _written_folders) cannot
+    be used, or None. Each must be where it says, by its real path: a junction
+    planted there would lead the mirror to move files into another place -- a
+    source even -- and to delete there."""
+    for folder in (_written_folders() if written else _trash_folders()):
+        problem = sb._store_problem(dest, folder)
+        if problem:
+            return problem.replace("it is not used", "the mirror does not use it")
     return None
 
 
-def _scan_tree(root):
-    """([(path relative to root, size)], [links], problems) of a folder:
-    links and junctions are never followed."""
-    files, links, problems = [], [], 0
-    stack = [root]
-    while stack:
-        folder = stack.pop()
-        try:
-            with os.scandir(sb._io(folder)) as listing:
-                entries = list(listing)
-        except OSError:
-            problems += 1
-            continue
-        for entry in entries:
-            path = os.path.join(folder, entry.name)
-            try:
-                if entry.is_symlink() or entry.is_junction():
-                    links.append(path)
-                elif entry.is_dir(follow_symlinks=False):
-                    stack.append(path)
-                else:
-                    files.append((os.path.relpath(path, root),
-                                  entry.stat(follow_symlinks=False).st_size))
-            except OSError:
-                problems += 1
-    return files, links, problems
+def _trash_runs(dest, folder=None):
+    """(runs, foreign, problem) of one trash folder (default: MIRROR_TRASH_FOLDER)."""
+    runs, foreign, problem = sb._store_runs(dest, folder or MIRROR_TRASH_FOLDER)
+    if problem:
+        problem = "the trash " + problem
+    return runs, foreign, problem
 
 
-def _trash_runs(dest):
-    """(runs, foreign, problem): the runs in the trash, oldest first; the
-    paths in it that no run made (never touched); why it cannot be read."""
-    root = _trash_root(dest)
-    runs, foreign = [], []
-    try:
-        with os.scandir(sb._io(root)) as listing:
-            entries = list(listing)
-    except FileNotFoundError:
-        return runs, foreign, None
-    except OSError as exc:
-        return runs, foreign, f"the trash {root} cannot be read ({exc.strerror or exc})"
-    for entry in entries:
-        path = os.path.join(root, entry.name)
-        when = None
-        try:
-            plain = (not (entry.is_symlink() or entry.is_junction())
-                     and entry.is_dir(follow_symlinks=False))
-        except OSError:
-            plain = False
-        if plain and _STAMP.fullmatch(entry.name):
-            try:
-                when = datetime.strptime(entry.name, "%y%m%d_%H%M%S")
-            except ValueError:
-                when = None
-        if when is None:
-            foreign.append(path)
-            continue
-        files, links, _problems = _scan_tree(path)
-        folders = collections.Counter()
-        folder_bytes = collections.Counter()
-        for rel, size in files:
-            folders[_group(rel)] += 1
-            folder_bytes[_group(rel)] += size
-        runs.append(_TrashRun(entry.name, path, when, len(files), sum(size for _rel, size in files),
-                              len(links), folders, folder_bytes))
-    runs.sort(key=lambda run: (run.when, run.name))
-    return runs, foreign, None
+def _purge_trash_run(run, dest, log, folder=None, catalog=None):
+    """Delete one run of a trash folder for good: (files, bytes, problems)."""
+    return sb._purge_store_run(run, dest, folder or MIRROR_TRASH_FOLDER, log, catalog)
 
 
-def _purge_trash_run(run, dest, log):
-    """Delete one run of the trash for good: (files, bytes, problems). Only
-    what is inside that run's folder, by its real path; a link or junction
-    inside is left where it is and never followed."""
-    expected = os.path.join(sb._real(dest), sb.CATALOG_FOLDER, MIRROR_TRASH_FOLDER, run.name)
-    real = sb._real(run.path)
-    if os.path.normcase(real).rstrip("\\/") != os.path.normcase(expected).rstrip("\\/"):
-        log.log(f"ERROR TRASH {run.path}: it leads somewhere else ({real}); not touched")
-        return 0, 0, 1
-    counts = [0, 0, 0]
-
-    def purge(folder):
-        try:
-            with os.scandir(sb._io(folder)) as listing:
-                entries = list(listing)
-        except OSError as exc:
-            log.log(f"ERROR TRASH {folder}: {exc}")
-            counts[2] += 1
-            return
-        for entry in entries:
-            path = os.path.join(folder, entry.name)
-            try:
-                if entry.is_symlink() or entry.is_junction():
-                    # left where it is, never followed; not a problem of each
-                    # later run either (finding 8 of the rc1 review)
-                    log.log(f"MIRROR TRASH LINK left {path} (never followed)")
-                elif entry.is_dir(follow_symlinks=False):
-                    purge(path)
-                    try:
-                        os.rmdir(sb._io(path))
-                    except OSError:
-                        pass
-                else:
-                    size = entry.stat(follow_symlinks=False).st_size
-                    _delete_file(path)
-                    counts[0] += 1
-                    counts[1] += size
-            except OSError as exc:
-                log.log(f"ERROR TRASH {path}: {exc}")
-                counts[2] += 1
-
-    purge(run.path)
-    try:
-        os.rmdir(sb._io(run.path))
-    except OSError:
-        pass
-    log.log(f"MIRROR TRASH PURGED {run.name}: {counts[0]} files / {_size(counts[1])}"
-            + (f", {counts[2]} problems" if counts[2] else ""))
-    return tuple(counts)
+_DEFAULT_DAYS = object()       # "not given": MIRROR_KEEP_DAYS (None is `never`)
 
 
-def _expiry_text(run):
-    """When a run of the trash is deleted for good, in words."""
-    until = run.when + timedelta(days=MIRROR_KEEP_DAYS)
-    days = (until.date() - datetime.now().date()).days
-    if MIRROR_KEEP_DAYS == 0 or days <= 0:
-        return "at the next mirror"
-    return f"{_day(until)} (in {days} day{'s' if days != 1 else ''})"
+def _expiry_text(run, days=_DEFAULT_DAYS):
+    """When a run of the trash is deleted for good, in words; days None =
+    never: only when space is short (SF3 of the review 261126)."""
+    return sb._expiry_text(run, MIRROR_KEEP_DAYS if days is _DEFAULT_DAYS else days,
+                           "at the next mirror")
 
 
-def _trash_table(runs):
+def _trash_table(runs, days=_DEFAULT_DAYS):
     """The runs of the trash, newest first, with where their files came from."""
     lines = [f"  {'taken out on':<21}{'deleted for good on':<27}{'files':>12}{'size':>12}"]
     newest = list(reversed(runs))
     for run in newest[:MIRROR_SUMMARY_LINES]:
-        lines.append(f"  {run.when:%Y-%m-%d %H:%M:%S}  {_expiry_text(run):<27}"
+        lines.append(f"  {run.when:%Y-%m-%d %H:%M:%S}  {_expiry_text(run, days):<27}"
                      f"{_n(run.files):>12}{_size(run.nbytes):>12}")
         for folder, count in run.folders.most_common(3):
             lines.append(f"     {_short(folder, 45):<45}{_n(count):>12}"
@@ -515,25 +440,6 @@ def _trash_table(runs):
     lines.append(f"  {'total':<48}{_n(sum(r.files for r in runs)):>12}"
                  f"{_size(sum(r.nbytes for r in runs)):>12}")
     return lines
-
-
-# ---- Typed confirmation ------------------------------------------------------------------------
-def _typed_confirmation(lines, count, log):
-    """True only when the person types `count` (dots, commas and spaces are
-    ignored): a number that changes every time cannot be typed from habit, and
-    reading it is reading how much is at stake. Anything else -- Enter, 'y',
-    a closed console -- is a no."""
-    for line in lines:
-        print(line)
-    try:
-        answer = input(f"To go on, type {count} and press Enter (anything else cancels): ")
-    except (EOFError, KeyboardInterrupt):
-        print()
-        answer = ""
-    ok = count > 0 and re.sub(r"[\s.,]", "", answer) == str(count)
-    log.log(f"CONFIRMATION {'given' if ok else 'refused'} ({count} files): "
-            + " ".join(line.strip() for line in lines if line.strip()))
-    return ok
 
 
 # ---- One run at a time (the rules of mobile_backup.py 0.1.4, copied on purpose:
@@ -697,6 +603,7 @@ class _Item:
     note: str = ""
     result: str = "planned"
     row: object = None  # sb._Row of a catalogued file
+    ours: bool = True   # a copy its JXL replaces: written by the backup, as the plan saw it
 
 
 _REMOVE_REASONS = (("gone from the source", "source_missing"),
@@ -718,7 +625,18 @@ class MirrorJob:
         self.unattended = bool(args.unattended)
         self.dest = os.path.abspath(args.dest)
         self.stamp = stamp or time.strftime("%y%m%d_%H%M%S")
-        self.for_good = MIRROR_KEEP_DAYS == 0
+        # the days of each store (261126, keep-days): its option, else its setting
+        self.store_list = stores(args)
+        self.days = {store.kind: store.days for store in self.store_list}
+        self.folders = {store.kind: store.folder for store in self.store_list}
+        self.for_good = self.days["removed"] == 0           # what it removes: no trash
+        self.at_once = {}                   # {kind: files} deleted at once (0 days): typed
+        self.typed = collections.Counter()  # {kind: files} a person typed for in confirm():
+        # what may still be deleted at once (MF1 of the final review 261126)
+        self.catalog_failed = None          # the catalog could not be written while purging
+        self.finished = False
+        self.store_scans = []
+        self.used_kinds = set()             # the trash folders this run moved files into
         self.interrupted = False
         self.changed_something = False
         self.lock_text = None
@@ -732,6 +650,7 @@ class MirrorJob:
         self.trash_runs = []
         self.trash_foreign = []
         self.expired = []
+        self.zero_runs = []                 # (kind, run) already in a trash folder of 0 days
         self.purge_runs = []
         self.space_options = []
         self.rows_by_key = {}
@@ -780,14 +699,74 @@ class MirrorJob:
     def _items(self, *actions):
         return [item for item in self.items if item.action in actions]
 
+    def stores(self):
+        """The stores this run owns (selective_backup lists them, and offers
+        them when space is short): the three trash folders."""
+        return list(self.store_list)
+
+    def _kind_for_good(self, kind):
+        """Whether this kind's days are 0 (for the screens and the counts)."""
+        return self.for_good if kind == "removed" else self.days.get(kind) == 0
+
+    def _delete_now(self, kind):
+        """Whether a file of this kind is deleted at once: its days are 0 AND a
+        person typed for it in confirm(), never more files of a kind than were
+        typed (MF1 of the final review 261126, as the normal backup's
+        _SetAside). Anything else goes to its trash folder, and the next run
+        asks for it there (zero_runs; --unattended stops)."""
+        if not self._kind_for_good(kind) or self.typed[kind] <= 0:
+            return False
+        self.typed[kind] -= 1
+        return True
+
+    def _kind_fate(self, kind):
+        """Where a file of this kind goes, in words."""
+        if self._kind_for_good(kind):
+            return "deleted for good (no trash)"
+        days = self.days.get(kind)
+        if days is None:
+            return "to the trash (deleted only when space is short)"
+        return f"to the trash until {_until(days)}"
+
+    def _item_kind(self, item):
+        """The store an item that leaves goes to: removed (gone, unselected),
+        originals (a TIFF copy its JXL replaces), versions (the rest)."""
+        if item.action == "remove":
+            return "removed"
+        if (item.action == "retire" and item.reason == "replaced_by_jxl"
+                and os.path.splitext(item.rel)[1].casefold() in sb.TIFF_EXTENSIONS):
+            return "originals"
+        return "versions"
+
     def _keep(self, reason, line, row, note, size=None):
         self.items.append(_Item("keep", reason, line, row.rel, row.size if size is None else size,
                                 row.source_path, note, row=row))
 
     def _fate(self):
-        if self.for_good:
-            return "deleted for good (no trash)"
-        return f"to the trash until {_until()}"
+        """Where what the mirror removes goes, in words."""
+        return self._kind_fate("removed")
+
+    def _where(self, kind):
+        """A table's short word for where a kind goes."""
+        return "deleted (no trash)" if self._kind_for_good(kind) else "to the trash"
+
+    def _trash_place_lines(self, kinds, verb):
+        """Where the files of these kinds can be copied back from, and until when."""
+        kept = [kind for kind in ("removed", "versions", "originals")
+                if kind in kinds and not self._kind_for_good(kind)]
+        if not kept:
+            return []
+        lines = ["", f"  Removed and replaced files {verb} these folders:" if len(kept) > 1
+                 else f"  Removed and replaced files {verb} this folder "
+                      f"{self._until_text(kept[0])}:"]
+        for kind in kept:
+            path = os.path.join(_trash_root(self.dest, self.folders[kind]), self.stamp)
+            lines.append(f"    {path}" + (f"   ({self._until_text(kind)})" if len(kept) > 1 else ""))
+        return lines
+
+    def _until_text(self, kind):
+        days = self.days.get(kind)
+        return "until space is short" if days is None else f"until {_until(days)}"
 
     def _stop(self, why, todo):
         self.stop_reason = why
@@ -795,9 +774,10 @@ class MirrorJob:
 
     # -- review: before the summary is printed; nothing is written but the CSV ----------
     def review(self, planned, statuses, rows, prefixes, orphans, used_keys, listings, dest, log,
-               possible=()):
+               possible=(), store_scans=None):
         """Decide what each file of the backup becomes; (lines to print, bytes
-        this run frees by itself)."""
+        this run frees by itself). `store_scans`: the listing of the three
+        trash folders selective_backup made (else listed here)."""
         self.log = log
         self.dest = dest
         self.prefixes = list(prefixes)
@@ -910,20 +890,25 @@ class MirrorJob:
                     continue
                 self.items.append(_Item("stray", "not_catalogued", None, rel, size, "",
                                         "not written by the backup: never touched"))
-        # the trash
-        self.trash_problem = _trash_problem(dest)
-        problem = None
+        # the trash: its three folders (261126, keep-days)
+        if store_scans is None:
+            store_scans = sb._scan_stores(dest, self.stores())
+        self.store_scans = [scan for scan in store_scans if scan.owned]
+        self.trash_problem = _trash_problem(dest, written=True)
         if self.trash_problem is None:
-            self.trash_runs, self.trash_foreign, problem = _trash_runs(dest)
-            self.trash_problem = problem
+            self.trash_problem = next((scan.problem for scan in self.store_scans if scan.problem),
+                                      None)
         if self.trash_problem is not None:
-            self.trash_runs, self.trash_foreign = [], []
-        now = datetime.now()
+            self.store_scans = []
+        removed_scan = next((scan for scan in self.store_scans
+                             if scan.store.kind == "removed"), None)
+        self.trash_runs = removed_scan.runs if removed_scan is not None else []
+        self.trash_foreign = [path for scan in self.store_scans for path in scan.foreign]
         # by its day, as the screen shows it: the first mirror on or after that
         # day deletes it, at any hour (finding 11 of the rc1 review)
-        self.expired = [run for run in self.trash_runs
-                        if (now.date() - run.when.date()).days >= MIRROR_KEEP_DAYS]
-        for run in self.expired:
+        self.expired = [(scan.store.folder, run) for scan in self.store_scans
+                        for run in sb._expired_runs(scan)]
+        for _folder, run in self.expired:
             self.items.append(_Item("trash_purge", "expired", None, os.path.relpath(run.path, dest),
                                     run.nbytes, "", f"{run.files} files, past their date"))
         for path in self.trash_foreign:
@@ -944,12 +929,33 @@ class MirrorJob:
                     # program's): what any run adopts as its own; ours, then
                     self.adoptable[status.replaces.casefold()] = (status.planned.size,
                                                                   status.planned.mtime_ns)
-        freed = sum(run.nbytes for run in self.expired)
-        if self.for_good and self.trash_problem is None:
+                # as keep_old_file will judge it (the table says where it goes, SF4)
+                judge = row if row is not None else SimpleNamespace(
+                    size=status.planned.size, mtime_ns=sb._db_ns(status.planned.mtime_ns))
+                item.ours = bool(found) and _ours(judge, found[0], found[1])
+        # what is already kept in a trash folder of 0 days goes only after the
+        # typed number (SF1 of the review 261126)
+        self.zero_runs = [(scan.store.kind, run) for scan in self.store_scans
+                          for run in sb._zero_day_runs(scan)]
+        freed = sum(run.nbytes for _folder, run in self.expired)
+        if self.trash_problem is None:
             # a JXL its plain copy replaces leaves only after every copy (N3 of
-            # the review 261126): it frees no room for them
+            # the review 261126): it frees no room for them; each kind frees
+            # room only when it is deleted at once (its days are 0)
             freed += sum(item.size for item in self._items("remove", "replace", "retire")
-                         if item.reason != "replaced_by_plain")
+                         if item.reason != "replaced_by_plain"
+                         and self._kind_for_good(self._item_kind(item)))
+        # what this run deletes at once (a store's days are 0): a person types it
+        self.at_once = collections.Counter()
+        for item in self._items("remove", "replace", "retire"):
+            kind = self._item_kind(item)
+            if self._kind_for_good(kind):
+                self.at_once[kind] += 1
+        if self._kind_for_good("versions"):
+            for status in statuses:     # the other pages of an old JXL group made again
+                if (status.planned.convert and status.status == sb.ST_CHANGED
+                        and len(status.old_outputs) > 1):
+                    self.at_once["versions"] += len(status.old_outputs) - 1
         new = [status for status in statuses
                if status.status == sb.ST_NEW and not status.planned.convert]
         changed = [status for status in statuses if status.status == sb.ST_CHANGED
@@ -960,6 +966,16 @@ class MirrorJob:
                         "remove": len(self._items("remove")), "convert": len(converts)}
         self._write_actions()
         return self._summary(statuses, possible), freed
+
+    def freed_during_copy(self):
+        """What the copy itself frees later (an old copy replaced and deleted
+        at once, its kind's days being 0): counted by the review, not yet on
+        the disk when the space is asked again after remove() (MF2)."""
+        if self.trash_problem is not None:
+            return 0
+        return sum(item.size for item in self._items("replace", "retire")
+                   if item.reason != "replaced_by_plain"
+                   and self._kind_for_good(self._item_kind(item)))
 
     def _check_limit(self, rows):
         """The lines that would remove or replace more than
@@ -1034,9 +1050,24 @@ class MirrorJob:
         leaving_bytes = sum(item.size for item in leaving)
         replaced = ""
         if leaving:
+            # each kind to its own trash folder, with its own days (261126)
+            fates = collections.OrderedDict()
+            for item in leaving:
+                fates.setdefault(self._item_kind(item), 0)
+                fates[self._item_kind(item)] += 1
+            if len(fates) == 1:
+                fate = self._kind_fate(next(iter(fates)))
+            else:
+                names = {"versions": "old versions", "originals": "TIFF originals"}
+                fate = "; ".join(f"{names[kind]} {self._kind_fate(kind)}" for kind in fates)
+            jpegs_proven = any(item.action == "retire" and item.reason == "replaced_by_jxl"
+                               and self._item_kind(item) == "versions" for item in leaving)
             replaced = (f"{_files(len(leaving))} ({_size(leaving_bytes)}) "
                         f"{'leaves' if len(leaving) == 1 else 'leave'} the backup, "
-                        f"replaced by a newer form of the same file: {self._fate()}.")
+                        f"replaced by a newer form of the same file: {fate}."
+                        + (" A JPEG copy the backup wrote is deleted when its JXL gives its very "
+                           "bytes back (the copy is read first); else it goes to the trash."
+                           if jpegs_proven else ""))
         if removes:
             verdict = (f"{_files(len(removes))} ({_size(removed_bytes)}) will be removed from "
                        f"the backup: {self._fate()}." + (f" {replaced}" if replaced else ""))
@@ -1058,7 +1089,7 @@ class MirrorJob:
                                      sum(s.planned.size for s in changed)))
             ours = self._items("replace")
             if ours:
-                where = "deleted (no trash)" if self.for_good else "to the trash"
+                where = self._where("versions")
                 lines.append(_table_line(f"old copy {where}", len(ours),
                                          sum(item.size for item in ours), indent=4))
             others = self._items("versions")
@@ -1076,14 +1107,32 @@ class MirrorJob:
                                      sum(s.planned.size for s in jpegs)))
         undone = [item for item in self._items("retire") if item.reason == "replaced_by_plain"]
         if undone:
-            where = "deleted (no trash)" if self.for_good else "to the trash"
-            lines.append(_table_line(f"JXL replaced by the file ({where})", len(undone),
-                                     sum(item.size for item in undone), indent=4))
+            lines.append(_table_line(f"JXL replaced by the file ({self._where('versions')})",
+                                     len(undone), sum(item.size for item in undone), indent=4))
         retires = [item for item in self._items("retire") if item.reason != "replaced_by_plain"]
-        if retires:
-            where = "deleted (no trash)" if self.for_good else "to the trash"
-            lines.append(_table_line(f"old copy replaced by its JXL ({where})", len(retires),
-                                     sum(item.size for item in retires), indent=4))
+        tiff_retires = [item for item in retires if self._item_kind(item) == "originals"]
+        jpeg_retires = [item for item in retires if self._item_kind(item) != "originals"]
+        if tiff_retires:
+            lines.append(_table_line(f"old copy replaced by its JXL ({self._where('originals')})",
+                                     len(tiff_retires), sum(item.size for item in tiff_retires),
+                                     indent=4))
+        # a JPEG copy: deleted only when ours and its JXL gives its very bytes
+        # back (the copy read); ours otherwise to the trash; not ours to
+        # versions\\ (SF4 of the review 261126)
+        jpeg_ours = [item for item in jpeg_retires if item.ours]
+        jpeg_others = [item for item in jpeg_retires if not item.ours]
+        if jpeg_retires:
+            lines.append(_table_line("old copy replaced by its JXL (JPEG)", len(jpeg_retires),
+                                     sum(item.size for item in jpeg_retires), indent=4))
+        if jpeg_ours:
+            label = ("deleted (no trash)" if self._kind_for_good("versions")
+                     else "deleted with proof, else to the trash")
+            lines.append(_table_line(label, len(jpeg_ours), sum(item.size for item in jpeg_ours),
+                                     indent=6))
+        if jpeg_others:
+            lines.append(_table_line("to versions\\ (not written by the backup)",
+                                     len(jpeg_others), sum(item.size for item in jpeg_others),
+                                     indent=6))
         where = "delete for good" if self.for_good else "to the trash"
         lines.append(_table_line(f"remove from the backup ({where})", len(removes), removed_bytes))
         for label, reason in _REMOVE_REASONS:
@@ -1103,11 +1152,17 @@ class MirrorJob:
         if strays:
             lines.append(_table_line("not written by the backup (never touched)", len(strays),
                                      sum(item.size for item in strays)))
-        if self.expired:
-            lines.append(_table_line(f"trash older than {MIRROR_KEEP_DAYS} days: deleted for good",
-                                     sum(run.files for run in self.expired),
-                                     sum(run.nbytes for run in self.expired)))
-        kept_runs = [run for run in self.trash_runs if run not in self.expired]
+        expired_paths = {run.path for _folder, run in self.expired}
+        for scan in self.store_scans:
+            gone = [run for run in scan.runs if run.path in expired_paths]
+            if gone:
+                name = ("trash" if scan.store.kind == "removed"
+                        else f"trash ({scan.store.label})")
+                lines.append(_table_line(f"{name} older than {scan.store.days} days: deleted "
+                                         f"for good", sum(run.files for run in gone),
+                                         sum(run.nbytes for run in gone)))
+        kept_runs = [run for scan in self.store_scans for run in scan.runs
+                     if run.path not in expired_paths]
         if kept_runs:
             lines.append(_table_line("trash from earlier runs (kept)", sum(r.files for r in kept_runs),
                                      sum(r.nbytes for r in kept_runs)))
@@ -1119,9 +1174,8 @@ class MirrorJob:
             lines += ["", "  Where the files to remove are (the folders with the most):"]
             for folder, count in groups.most_common(MIRROR_SUMMARY_LINES):
                 lines.append(_table_line(folder, count, group_bytes[folder], indent=4))
-        if (removes or leaving) and not self.for_good:
-            lines += ["", f"  Removed and replaced files can be copied back from this folder "
-                          f"until {_until()}:", f"    {os.path.join(_trash_root(self.dest), self.stamp)}"]
+        lines += self._trash_place_lines({self._item_kind(item) for item in removes + leaving},
+                                         "can be copied back from")
         if strays:
             by_folder = collections.Counter(os.path.dirname(item.rel) or "." for item in strays)
             lines += ["", "  Files the backup did not write (never touched), by folder:"]
@@ -1136,7 +1190,8 @@ class MirrorJob:
     def _attention_lines(self):
         lines = []
         if self.trash_problem:
-            lines += ["", "  !! THE TRASH CANNOT BE USED: a real run changes nothing until it can."]
+            lines += ["", f"  !! THE TRASH (OR ANOTHER FOLDER OF {sb.CATALOG_FOLDER}) CANNOT BE USED: "
+                          f"a real run changes nothing until it can."]
             lines += _wrap(self.trash_problem, indent=5)
         errored = [line for line in self.lines if line.errors]
         if errored:
@@ -1168,105 +1223,8 @@ class MirrorJob:
         return [_table_line(folder, count, group_bytes[folder], indent=5)
                 for folder, count in groups.most_common(MIRROR_SUMMARY_LINES)]
 
-    # -- not enough space ---------------------------------------------------------------
-    def space_lines(self, needed, free, margin):
-        """What could be deleted for good to make room, the least first."""
-        missing = needed - (free - margin)
-        drive = os.path.splitdrive(self.dest)[0] or self.dest
-        runs = [run for run in self.trash_runs if run not in self.expired]
-        this_run = self._items("remove", "replace", "retire") if not self.for_good else []
-        this_bytes = sum(item.size for item in this_run)
-        options = []
-        oldest, total = [], 0
-        for run in runs:
-            oldest.append(run)
-            total += run.nbytes
-            if total >= missing:
-                break
-        if oldest and total >= missing:
-            first, last = _day(oldest[0].when), _day(oldest[-1].when)
-            days = first if first == last else f"{first} to {last}"
-            label = ("the whole trash" if len(oldest) == len(runs)
-                     else f"the oldest trash ({days})")
-            options.append((label, oldest, False))
-            if len(oldest) < len(runs):
-                options.append(("the whole trash", runs, False))
-        if this_run and this_bytes >= missing:
-            options.append(("what this run removes, without the trash", [], True))
-        whole = sum(run.nbytes for run in runs)
-        if (runs and this_run and not options and whole + this_bytes >= missing):
-            options.append(("the whole trash + this run, without the trash", runs, True))
-        self.space_options = []
-        for label, chosen, with_run in options:
-            files = sum(run.files for run in chosen) + (len(this_run) if with_run else 0)
-            nbytes = sum(run.nbytes for run in chosen) + (this_bytes if with_run else 0)
-            self.space_options.append((label, chosen, with_run, files, nbytes))
-        # the one that deletes the least first (finding 13 of the rc1 review)
-        self.space_options.sort(key=lambda option: (option[4], option[3]))
-        lines = ["", f"  !! NOT ENOUGH SPACE on {drive} - {_size(missing)} missing."]
-        if not self.space_options:
-            lines += _wrap(f"Even deleting the whole trash and this run's removals for good would "
-                           f"free only {_size(whole + this_bytes)}. Make room on {drive}, or choose "
-                           f"a smaller mode, then run the mirror again.", indent=5)
-            return lines
-        lines.append("     It fits if the mirror deletes these FOR GOOD (no trash, no way back):")
-        for index, (label, _chosen, _with_run, files, nbytes) in enumerate(self.space_options, 1):
-            mark = "  <- recommended" if index == 1 else ""
-            lines.append(f"       {index}) {_short(label, 44):<44}{_files(files):>15}"
-                         f"{_size(nbytes):>11}{mark}")
-        lines.append("       0) cancel: nothing changes")
-        if self.log is not None:
-            rows = []
-            for run in runs:
-                files, _links, _problems = _scan_tree(run.path)
-                rows += [(f"trash {run.name}", os.path.join(run.path, rel), size)
-                         for rel, size in files]
-            for item in this_run:
-                group = "this run: removed" if item.action == "remove" else "this run: replaced"
-                rows.append((group, os.path.join(self.dest, item.rel), item.size))
-            path = self.log.csv("_free_space.csv", ["group", "path", "size"], rows)
-            lines += [f"     What each option deletes: {os.path.basename(path)}",
-                      f"       in {os.path.dirname(path)}"]
-        return lines
-
-    def free_space(self, needed, free, margin):
-        """Ask which option to delete for good (Enter = cancel), then the
-        typed number of files. Never without a person at the console."""
-        drive = os.path.splitdrive(self.dest)[0] or self.dest
-        missing = _size(needed - (free - margin))
-        if not self.space_options:
-            self._stop(f"there is not enough space on {drive} ({missing} missing), even deleting "
-                       f"the trash for good", f"make room on {drive} or choose a smaller mode")
-            return False
-        if self.unattended:
-            self._stop(f"there is not enough space on {drive} ({missing} missing), and nothing is "
-                       f"deleted for good without a person at the console",
-                       "run the mirror by hand (photo_backup.py -> [8] Mirror) and choose what "
-                       "to delete for good, or empty the trash ([8] -> [4], or --empty-trash)")
-            return False
-        try:
-            answer = input(f"Choose 1-{len(self.space_options)}, or Enter to cancel: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            answer = ""
-        if (not (answer.isascii() and answer.isdigit())
-                or not 1 <= int(answer) <= len(self.space_options)):
-            self._stop("nothing was chosen to make room", "make room, then run the mirror again")
-            return False
-        index = int(answer)
-        label, chosen, with_run, files, nbytes = self.space_options[index - 1]
-        sentence = (f" Everything in option {index} ({label}: {_files(files)}, {_size(nbytes)}) "
-                    f"will be deleted and can NOT be recovered later. Are you sure?")
-        if not _typed_confirmation(["", "!! DELETE FOR GOOD"] + _wrap(sentence.strip()), files,
-                                   self.log):
-            self._stop("deleting for good to make room was not confirmed",
-                       "make room another way, then run the mirror again")
-            return False
-        self.purge_runs = list(chosen)
-        if with_run:
-            self.for_good = True
-        self.log.log(f"FREE SPACE option {index}: {label} ({files} files, {_size(nbytes)})")
-        return True
+    # -- not enough space: selective_backup's shared chooser (_room_options,
+    # -- _choose_room) offers the three trash folders since 261126 (keep-days) --
 
     # -- the questions -----------------------------------------------------------------------
     def confirm(self):
@@ -1284,7 +1242,7 @@ class MirrorJob:
             self._stop(why, "wait until the other mirror ends; if none is running, delete the "
                             "lock file named above")
             return False
-        fate = ("They go to the trash and stay there until " + _until() + "."
+        fate = (f"They go to the trash and stay there {self._until_text('removed')}."
                 if not self.for_good else "They are deleted and can NOT be recovered later.")
         if self.over_limit and not self.allow_mass:
             count = sum(item[1] for item in self.over_limit)
@@ -1324,6 +1282,39 @@ class MirrorJob:
                            "run the scoped mirror ([8] -> [1]), which keeps folders outside "
                            "this run, or run the total one again and confirm")
                 return False
+        zero_files = sum(run.files for _kind, run in self.zero_runs)
+        if self.at_once or zero_files:
+            # a store whose days are 0 keeps nothing: what leaves is deleted at
+            # once, what is already in it goes now, and only a person who types
+            # the number lets it (261126; SF1 of its review)
+            count = sum(self.at_once.values()) + zero_files
+            kinds = set(self.at_once) | {kind for kind, _run in self.zero_runs}
+            names = " and ".join(f"{_KEEP_SETTING[kind]} = 0" for kind in
+                                 ("removed", "versions", "originals") if kind in kinds)
+            if self.unattended:
+                self._stop(f"{names}: {_files(count)} would be deleted at once (no trash), and "
+                           f"that needs a person at the console",
+                           "run the mirror by hand (photo_backup.py -> [8] Mirror) and type the "
+                           "number of files, or give those files days in the trash")
+                return False
+            parts = []
+            if self.at_once:
+                parts.append(f"Up to {_files(sum(self.at_once.values()))} that leave the backup in "
+                             f"this run are DELETED at once, not kept in a trash.")
+            if zero_files:
+                folders = " and ".join(dict.fromkeys(
+                    f"{sb.CATALOG_FOLDER}\\{self.folders[kind]}" for kind, _run in self.zero_runs))
+                parts.append(f"The {_files(zero_files)} already in {folders} are DELETED now.")
+            lines = ["", f"!! NO TRASH: {names}"]
+            lines += _wrap(" ".join(parts) + " They can NOT be recovered later.", indent=3)
+            if not _typed_confirmation(lines, count, self.log):
+                self._stop("deleting at once (no trash) was not confirmed",
+                           "run the mirror again and type the number, or give those files days "
+                           "in the trash (--keep-days, --versions-keep-days, "
+                           "--originals-keep-days)")
+                return False
+            # only what was typed is deleted at once, at most that many of each kind
+            self.typed = collections.Counter(self.at_once)
         return True
 
     def proceed_prompt(self):
@@ -1341,11 +1332,13 @@ class MirrorJob:
         reason, still ours, asked again right now."""
         seen = set()
         try:
-            for run in self.expired + self.purge_runs:
-                if run.name in seen:
+            for folder, run in self.expired + self.purge_runs:
+                if run.path in seen:
                     continue
-                seen.add(run.name)
-                files, nbytes, problems = _purge_trash_run(run, dest, log)
+                if getattr(catalog, "write_failed", None):
+                    break                   # the catalog cannot be written: the rest stays (SF6)
+                seen.add(run.path)
+                files, nbytes, problems = _purge_trash_run(run, dest, log, folder, catalog)
                 self.purged[0] += files
                 self.purged[1] += nbytes
                 self.purged[2] += problems
@@ -1354,8 +1347,22 @@ class MirrorJob:
         except KeyboardInterrupt:
             self.interrupted = True
             self.changed_something = True
+            catalog.commit()                # the originals rows of what was deleted
             log.log("INTERRUPTED while deleting the trash past its date")
             return
+        if getattr(catalog, "write_failed", None):
+            # the catalog cannot be written (another program holds it): nothing
+            # more leaves the backup in this run; the box says what did (SF2 of
+            # the final review 261126)
+            try:
+                catalog.commit()
+            except sqlite3.Error:
+                pass
+            self.catalog_failed = catalog.write_failed
+            log.log(f"MIRROR NOTHING REMOVED: the catalog could not be written "
+                    f"({catalog.write_failed})")
+            return
+        catalog.commit()
         fresh = {row.key: reason for reason, row in orphans}
         if self.total:
             for row in catalog.all_rows():
@@ -1391,7 +1398,7 @@ class MirrorJob:
                         item.result = "kept: changed in the backup since the plan"
                         log.log(f"MIRROR KEPT {row.rel}: changed in the backup")
                     else:
-                        if self.for_good:
+                        if self._delete_now("removed"):
                             _delete_file(dst)
                             item.result = "deleted for good"
                             log.log(f"MIRROR DELETED {row.rel}")
@@ -1402,8 +1409,8 @@ class MirrorJob:
                             kept_as = "" if used == target else f" (kept as {os.path.basename(used)})"
                             item.result = "to the trash" + kept_as
                             log.log(f"MIRROR TRASH {row.rel}{kept_as}")
+                        self.changed_something = True       # before the row: it left
                         catalog.delete(row.key)
-                        self.changed_something = True
                         sb._prune_empty_parents(os.path.dirname(dst), dest, log)
                     count += 1
                     if count % 50 == 0:
@@ -1432,7 +1439,7 @@ class MirrorJob:
                 row = None
         if row is None:
             before = sb._handle_old_copy(dest, stamp, status, log, keep_old=self._to_versions)
-        elif self.for_good:
+        elif self._delete_now("versions"):
             before = self._replace_for_good(dest, stamp, status, log, row)
         else:
             before = sb._handle_old_copy(dest, stamp, status, log,
@@ -1457,12 +1464,14 @@ class MirrorJob:
             if not _ours(row, size, mtime_ns):
                 self._to_versions(dest, stamp, status, log)     # changed since the check
                 return
-            target = os.path.join(_trash_root(dest), stamp, status.planned.rel)
+            target = os.path.join(_trash_root(dest, self.folders["versions"]), stamp,
+                                  status.planned.rel)
             os.makedirs(sb._io(os.path.dirname(target)), exist_ok=True)
             used = sb._move_aside(status.dst, target)
             log.log(f"MIRROR TRASH old copy {status.planned.rel}"
                     + ("" if used == target else f" (kept as {os.path.basename(used)})"))
             self.replaced["trash"] += 1
+            self.used_kinds.add("versions")
             self.changed_something = True
         return keep_old
 
@@ -1480,12 +1489,18 @@ class MirrorJob:
                 self._to_versions(dest, stamp, status, log)
         return before_final
 
-    def keep_old_file(self, dest, stamp, rel, log):
-        """Where a backup file goes when a TIFF's JXL takes over (an old JXL
-        group, or a TIFF copy the JXL replaces): ours to the trash -- deleted,
-        with no trash --, anything else to versions\\, as in a normal backup.
-        A TIFF copy without a row that still has the source TIFF's size and
-        date (made by another program) is what a run adopts: ours too."""
+    def keep_old_file(self, dest, stamp, rel, log, kind="versions"):
+        """Where a backup file goes when a JXL or a plain copy takes over (an
+        old JXL group, a TIFF or JPEG copy the JXL replaces, a JXL undone):
+        ours to the trash folder of its kind (261126: `originals` ->
+        trash_originals, the rest -> trash_versions) -- deleted when that
+        kind's days are 0 --, anything else to versions\\, as in a normal
+        backup. A JPEG copy whose JXL gives its very bytes back
+        (`jpeg_proven`) is deleted when ours. A TIFF copy without a row that
+        still has the source TIFF's size and date (made by another program) is
+        what a run adopts: ours too. Returns (where it went or None, the kind
+        of store)."""
+        store_kind = "originals" if kind == "originals" else "versions"
         path = os.path.join(dest, rel)
         row = self.rows_by_key.get(rel.casefold())
         if row is None and rel.casefold() in self.adoptable:
@@ -1494,38 +1509,52 @@ class MirrorJob:
         item = self.retire_items.get(rel.casefold())
         # what takes its place: a JXL (a TIFF copy it replaces), or the plain copy
         # (a JXL group the manifest no longer wants)
-        by, kind = (("its plain copy", "undone") if item is not None
-                    and item.reason == "replaced_by_plain" else ("its JXL", "jxl"))
+        by, label = (("its plain copy", "undone") if item is not None
+                     and item.reason == "replaced_by_plain" else ("its JXL", "jxl"))
         state, size, mtime_ns = _dest_stat(path)
         if state == "unreadable":
             raise OSError(f"cannot be read in the backup; it stays: {rel}")
+        went = (None, None)
         if state == "ok" and row is not None and _ours(row, size, mtime_ns):
-            if self.for_good:
+            if kind == "jpeg_proven":
+                _delete_file(path)
+                log.log(f"MIRROR DELETED {rel} (its JXL gives these bytes back)")
+                self.replaced["jpeg_deleted"] += 1
+                result = "deleted (its JXL gives these bytes back)"
+            elif self._delete_now(store_kind):
                 _delete_file(path)
                 log.log(f"MIRROR DELETED {rel} (replaced by {by})")
-                self.replaced[f"{kind}_for_good"] += 1
+                self.replaced[f"{label}_for_good"] += 1
                 result = f"deleted for good (replaced by {by})"
             else:
-                target = os.path.join(_trash_root(dest), stamp, rel)
+                target = os.path.join(_trash_root(dest, self.folders[store_kind]), stamp, rel)
                 os.makedirs(sb._io(os.path.dirname(target)), exist_ok=True)
                 used = sb._move_aside(path, target)
                 log.log(f"MIRROR TRASH {rel} (replaced by {by})"
                         + ("" if used == target else f" (kept as {os.path.basename(used)})"))
-                self.replaced[f"{kind}_trash"] += 1
+                self.replaced[f"{label}_trash"] += 1
                 result = f"to the trash (replaced by {by})"
+                went = (used, store_kind)
+                self.used_kinds.add(store_kind)
             self.changed_something = True
         elif state == "ok":
-            sb._move_file_to_versions(dest, stamp, rel, log)
-            self.replaced[f"{kind}_versions"] += 1
+            went = (sb._move_file_to_versions(dest, stamp, rel, log), "versions")
+            self.replaced[f"{label}_versions"] += 1
             result = "to versions\\ (not written by the backup)"
         else:
             result = "already missing"
         if item is not None:
             item.result = result
+        return went
 
     # -- after the copy ------------------------------------------------------------------------
-    def finish(self, log, done, done_bytes, error_count, interrupted=False):
-        """What happened, in the same table as the summary; (problems?)."""
+    def finish(self, log, done, done_bytes, error_count, interrupted=False, stopped=None,
+               todo=None):
+        """What happened, in the same table as the summary; (problems?).
+        `stopped`: why the run stopped before copying, after files had left
+        the backup (SF2 of the review 261126): the box says what and where;
+        `todo`: what to do then (default: make room)."""
+        self.finished = True
         removed = [item for item in self._items("remove")
                    if item.result.startswith(("to the trash", "deleted for good"))]
         dropped = [item for item in self._items("remove", "drop_row")
@@ -1537,9 +1566,11 @@ class MirrorJob:
         # the headline says what the "errors" row and the exit code say: every
         # error of the run, and a failed conversion (review 261126, S5)
         all_errors = errors + self.purged[2] + info.get("errors", 0)
-        title = "MIRROR INTERRUPTED" if interrupted else "MIRROR DONE"
+        title = ("MIRROR STOPPED" if stopped else "MIRROR INTERRUPTED" if interrupted
+                 else "MIRROR DONE")
         replaced = self.replaced["done"]
-        fate = "deleted for good" if self.for_good else f"in the trash until {_until()}"
+        fate = ("deleted for good" if self.for_good
+                else f"in the trash {self._until_text('removed')}")
         parts = [f"{_n(done)} copied"
                  + (f" ({_n(replaced)} of them replacing a changed file)" if replaced else "")]
         parts.append(f"{_n(len(removed))} removed from the backup ({fate})" if removed
@@ -1552,6 +1583,9 @@ class MirrorJob:
         else:
             ending = "No errors."
         headline = "; ".join(parts) + ". " + ending
+        if stopped:
+            headline = (f"It stopped before copying: {stopped}. Nothing was copied. What had "
+                        f"already left the backup is below. {ending}")
         lines = ["", _top_rule(), f" {title} - {self.dest}"]
         lines += _wrap(headline)
         lines += [_RULE, _table_head()]
@@ -1584,6 +1618,7 @@ class MirrorJob:
                                      info.get("bytes_out", 0), indent=4))
             for key, label in (("jxl_trash", "old copies replaced: to the trash"),
                                ("jxl_for_good", "old copies replaced: deleted (no trash)"),
+                               ("jpeg_deleted", "JPEG copies deleted (JXL gives the same bytes)"),
                                ("jxl_versions", "old copies replaced: to versions\\")):
                 if self.replaced[key]:
                     lines.append(_table_line(label, self.replaced[key], indent=4))
@@ -1598,15 +1633,22 @@ class MirrorJob:
         if self.purged[0] or self.purged[2]:
             lines.append(_table_line("trash deleted for good", self.purged[0], self.purged[1]))
         lines.append(_table_line("errors", errors + self.purged[2] + info.get("errors", 0)))
-        if (removed or self.replaced["trash"] or self.replaced["jxl_trash"]
-                or self.replaced["undone_trash"]) and not self.for_good:
-            lines += ["", f"  Removed and replaced files are in this folder until {_until()};",
-                      "  to get one back, copy it from there (the folders are the same as in the backup):",
-                      f"    {os.path.join(_trash_root(self.dest), self.stamp)}"]
+        used = set(self.used_kinds)
+        if any(item.result.startswith("to the trash") for item in removed):
+            used.add("removed")
+        place = self._trash_place_lines(used, "are in")
+        if place:
+            lines += place
+            lines.append("  To get one back, copy it from there (the folders are the same as in "
+                         "the backup).")
         self._write_actions()
         if self.actions_csv:
             lines += ["", "  The list of every file and what happened to it:"]
             lines += _list_place(self.actions_csv)
+        if stopped:
+            lines += [""] + _wrap("What to do: " + (todo or "make room on the disk another way "
+                                                     "(or choose more to delete), then run the "
+                                                     "mirror again") + ".", indent=2)
         lines.append(f"  The log: {os.path.basename(log.path)}")
         lines.append(_RULE)
         for line in lines:
@@ -1626,6 +1668,8 @@ def _log_header(log, args, argv):
     log.log("command: " + " ".join(command))
     log.log("settings: " + ", ".join(f"{key}={value}" for key, value in sorted(vars(args).items())))
     log.log(f"mirror settings: MIRROR_KEEP_DAYS={MIRROR_KEEP_DAYS}, "
+            f"MIRROR_VERSIONS_KEEP_DAYS={MIRROR_VERSIONS_KEEP_DAYS}, "
+            f"MIRROR_ORIGINALS_KEEP_DAYS={MIRROR_ORIGINALS_KEEP_DAYS}, "
             f"MIRROR_MAX_DELETE_PERCENT={MIRROR_MAX_DELETE_PERCENT}, "
             f"MIRROR_MAX_DELETE_MIN={MIRROR_MAX_DELETE_MIN}")
 
@@ -1702,9 +1746,26 @@ def _trash_args_problem(args, dest, log):
     return _trash_problem(dest)
 
 
+def _trash_listing(args, dest):
+    """[(store, runs, foreign)] of the three trash folders, or (None, problem)."""
+    listing = []
+    for store in stores(args):
+        runs, foreign, problem = _trash_runs(dest, store.folder)
+        if problem:
+            return None, problem
+        listing.append((store, runs, foreign))
+    return listing, None
+
+
+def _store_title(store):
+    return {"removed": "removed from the backup (gone from the source, no longer selected)",
+            "versions": "old copies replaced (a changed file, a JXL undone or made again)",
+            "originals": "TIFF copies a JXL replaced"}[store.kind]
+
+
 def _show_trash(args, stamp, argv):
-    """What is in the trash, where it came from, until when, and how to get a
-    file back. Changes nothing."""
+    """What is in the trash -- its three folders --, where it came from, until
+    when, and how to get a file back. Changes nothing."""
     dest = os.path.abspath(args.dest)
     log = _new_log(stamp, "mirror_trash")
     if log is None:
@@ -1712,9 +1773,9 @@ def _show_trash(args, stamp, argv):
     try:
         _log_header(log, args, argv)
         problem = _trash_args_problem(args, dest, log)
-        runs = foreign = []
+        listing = []
         if problem is None:
-            runs, foreign, problem = _trash_runs(dest)
+            listing, problem = _trash_listing(args, dest)
         if problem:
             lines = ["", _top_rule(), f" TRASH OF {dest}", _RULE]
             lines += _wrap("It cannot be read: " + problem)
@@ -1726,11 +1787,19 @@ def _show_trash(args, stamp, argv):
         lines += _wrap("What the mirror removed from the backup or replaced in it. Nothing here "
                        "is deleted before its date.")
         lines.append(_RULE)
-        if runs:
-            lines += _trash_table(runs)
+        everything = [run for _store, runs, _foreign in listing for run in runs]
+        foreign = [path for _store, _runs, paths in listing for path in paths]
+        for store, runs, _paths in listing:
+            if not runs:
+                continue
+            lines += ["", f"  {_store_title(store)}: {_trash_root(dest, store.folder)}"
+                          f" (kept: {sb._days_text(store.days)})"]
+            lines += _trash_table(runs, store.days)
+        if everything:
             lines += ["", "  To get a file back, copy it from the folder of its run; the folders "
                           "inside are", "  the same as in the backup:"]
-            for run in list(reversed(runs))[:MIRROR_SUMMARY_LINES]:
+            newest = sorted(everything, key=lambda run: (run.when, run.path), reverse=True)
+            for run in newest[:MIRROR_SUMMARY_LINES]:
                 lines.append(f"    {run.path}")
             lines.append("  The list of every file of a run: <its name>_mirror_actions.csv, in")
             lines.append(f"    {sb.LOG_DIR}")
@@ -1748,8 +1817,9 @@ def _show_trash(args, stamp, argv):
 
 
 def _empty_trash(args, stamp, argv):
-    """Delete runs of the trash for good, after the typed number of files.
-    Never without a person at the console."""
+    """Delete runs of the trash -- its three folders -- for good, after the
+    typed number of files. Never without a person at the console. The
+    catalog's rows of the TIFF originals deleted go with them."""
     dest = os.path.abspath(args.dest)
     log = _new_log(stamp, "mirror_trash")
     if log is None:
@@ -1758,27 +1828,30 @@ def _empty_trash(args, stamp, argv):
     try:
         _log_header(log, args, argv)
         problem = _trash_args_problem(args, dest, log)
-        runs = foreign = []
+        listing = []
         if problem is None:
-            runs, foreign, problem = _trash_runs(dest)
+            listing, problem = _trash_listing(args, dest)
         if problem:
             for line in _stop_lines(dest, problem, "fix that, then try again"):
                 log.out(line)
             return 2
-        if args.before:
-            before = datetime.strptime(args.before, "%Y-%m-%d")
-            selected = [run for run in runs if run.when < before]
-        else:
-            selected = list(runs)
-        files = sum(run.files for run in selected)
-        nbytes = sum(run.nbytes for run in selected)
+        before = datetime.strptime(args.before, "%Y-%m-%d") if args.before else None
+        selected = [(store, run) for store, runs, _foreign in listing for run in runs
+                    if before is None or run.when < before]
+        foreign = [path for _store, _runs, paths in listing for path in paths]
+        files = sum(run.files for _store, run in selected)
+        nbytes = sum(run.nbytes for _store, run in selected)
         which = f"taken out before {args.before}" if args.before else "everything"
         lines = ["", _top_rule(), f" EMPTY THE TRASH OF {dest} ({which})"]
         if selected:
             lines += _wrap(f"{_files(files)} ({_size(nbytes)}) will be DELETED FOR GOOD. They "
                            f"can NOT be recovered later.")
             lines.append(_RULE)
-            lines += _trash_table(selected)
+            for store, _runs, _paths in listing:
+                runs = [run for chosen, run in selected if chosen is store]
+                if runs:
+                    lines += [f"  {_store_title(store)}:"]
+                    lines += _trash_table(runs, store.days)
         else:
             lines += _wrap("Nothing to delete in the trash.")
         if foreign:
@@ -1813,15 +1886,48 @@ def _empty_trash(args, stamp, argv):
                                     "nothing to do: the trash is as it was"):
                 log.out(line)
             return 2
+        catalog = None
+        try:
+            catalog = sb._Catalog(dest, create=False)
+        except (FileNotFoundError, RuntimeError, OSError) as exc:
+            log.log(f"no catalog to update ({exc}): the originals rows stay")
+            catalog = None
         deleted = deleted_bytes = problems = 0
-        for run in selected:
-            count, size, trouble = _purge_trash_run(run, dest, log)
-            deleted += count
-            deleted_bytes += size
-            problems += trouble
+        stopped = commit_failed = None
+        try:
+            for store, run in selected:
+                if catalog is not None and catalog.write_failed:
+                    break                   # the rest stays (SF6 of the review 261126)
+                count, size, trouble = _purge_trash_run(run, dest, log, store.folder, catalog)
+                deleted += count
+                deleted_bytes += size
+                problems += trouble
+        finally:
+            if catalog is not None:
+                stopped = catalog.write_failed
+                try:
+                    catalog.commit()
+                except sqlite3.Error as exc:
+                    # a catalog locked by another program: the files are gone,
+                    # their originals rows stay (a row without its file is
+                    # tolerated); said, never a traceback (SF6)
+                    commit_failed = str(exc)
+                    log.log(f"ERROR the catalog could not be written ({exc}): the originals rows "
+                            f"of what was deleted stay")
+                finally:
+                    catalog.close()
         log.out(f" Trash: {_files(deleted)} ({_size(deleted_bytes)}) deleted for good"
                 + (f"; {_n(problems)} problems: see the log {log.path}" if problems else "."))
-        return 1 if problems else 0
+        if stopped:
+            for line in _wrap(f"The catalog could not be written ({stopped}): the deletion "
+                              f"stopped there and the rest of the trash stays. Run it again when "
+                              f"no backup or mirror is running.", indent=1):
+                log.out(line)
+        elif commit_failed:
+            for line in _wrap(f"The catalog could not be written ({commit_failed}): the files "
+                              f"above are deleted, their rows stay in the catalog.", indent=1):
+                log.out(line)
+        return 1 if (problems or stopped or commit_failed) else 0
     finally:
         if lock_text:
             drop_lock(dest, lock_text, log)
@@ -1853,6 +1959,19 @@ def build_parser():
     parser.add_argument("--total", action="store_true",
                         help="also remove what came from folders that are not in this run "
                              "(a person types the number of files)")
+    parser.add_argument("--keep-days", type=sb._keep_days_arg, default=MIRROR_KEEP_DAYS,
+                        metavar="N|never",
+                        help="days what the mirror removes stays in its trash; 0 = no trash "
+                             "(deleted at once, the number of files is typed); never = only "
+                             "when space is short (default: MIRROR_KEEP_DAYS)")
+    parser.add_argument("--versions-keep-days", type=sb._keep_days_arg,
+                        default=MIRROR_VERSIONS_KEEP_DAYS, metavar="N|never",
+                        help="the same for the old copies it replaces, in trash_versions "
+                             "(default: MIRROR_VERSIONS_KEEP_DAYS)")
+    parser.add_argument("--originals-keep-days", type=sb._keep_days_arg,
+                        default=MIRROR_ORIGINALS_KEEP_DAYS, metavar="N|never",
+                        help="the same for the TIFF copies a JXL replaces, in trash_originals "
+                             "(default: MIRROR_ORIGINALS_KEEP_DAYS)")
     parser.add_argument("--allow-mass-delete", action="store_true",
                         help="let a line remove or replace more than MIRROR_MAX_DELETE_PERCENT "
                              "of its files without typing the number")
@@ -1916,7 +2035,7 @@ def main(argv=None):
         if code is None:
             return 0
         return int(code) if isinstance(code, int) else 2
-    errors = _settings_errors() + _usage_errors(args, extra)
+    errors = _settings_errors() + sb._store_settings_errors() + _usage_errors(args, extra)
     if errors:
         for error in errors:
             print(error, file=sys.stderr)

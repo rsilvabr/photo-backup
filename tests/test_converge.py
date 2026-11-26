@@ -6,6 +6,7 @@ only with proof of its bytes. jxl-photo is played by tests/fake_jxlphoto.py."""
 import csv
 import io
 import os
+import re
 import shutil
 import stat
 import sqlite3
@@ -138,7 +139,8 @@ def test_a5_the_mirror_trashes_the_group_it_replaces(env, monkeypatch, capsys, p
     assert "JXL replaced by the file (to the trash)" in out
     rel = mirror_rel(env, EXPORT_JPG)
     assert rel in backed(env.dest) and rel + ".jxl" not in backed(env.dest)
-    assert rel + ".jxl" in under(env.dest, mir.MIRROR_TRASH_FOLDER)        # ours: the trash
+    # ours: the trash of old versions (261126, keep-days)
+    assert rel + ".jxl" in under(env.dest, mir.MIRROR_TRASH_VERSIONS_FOLDER)
     assert db(env.dest, "SELECT count(*) FROM converted") == [(0,)]
     rows = list(csv.DictReader(io.StringIO(latest_csv(photobackup_log_dir, "_actions.csv"))))
     retired = [row for row in rows if row["action"] == "retire"]
@@ -282,7 +284,7 @@ def test_b4_the_options_reach_the_backend_from_the_manifest_and_the_mirror(tmp_p
 def test_b5_the_menu_marker_asks_one_backup_to_make_them_again(monkeypatch, menu_config):
     # answers: jxl-photo? no; the work folder? no; the conversion off? no; try the failed
     # conversions again? no; make the TIFF JXL again? yes; forget the choices? no
-    script(monkeypatch, ["n", "n", "n", "n", "y", "n"])
+    script(monkeypatch, ["n", "n", "n", "n", "y", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert os.path.isfile(menu._reconvert_marker()) and not os.path.isfile(menu._retry_marker())
     commands = []
@@ -466,7 +468,8 @@ def fail_new_page_rename(monkeypatch, name):
 
     def failing(src, dst):
         parts = os.path.normcase(dst).split(os.sep)
-        if dst.endswith(name) and "versions" not in parts and "trash" not in parts:
+        # the stores of 261126 (keep-days): versions, the mirror's trash folders
+        if dst.endswith(name) and not {"versions", *mir._trash_folders()} & set(parts):
             raise PermissionError(32, "The process cannot access the file because it is "
                                       "being used by another process", dst)
         return real(src, dst)
@@ -503,16 +506,30 @@ def test_m1_reconvert_failure_after_the_old_group_left(env, monkeypatch, capsys,
     assert "2025/scans/000037.tiff" not in backed(env.dest)
 
 
+def type_what_is_asked(monkeypatch):
+    """A person who types the number each typed confirmation asks for."""
+    def answer(prompt=""):
+        found = re.search(r"type ([\d,]+) and press Enter", prompt)
+        if found is None:
+            raise EOFError
+        return found.group(1)
+    monkeypatch.setattr("builtins.input", answer)
+
+
 def test_m1_the_mirror_without_trash_keeps_a_copy(env, monkeypatch, photobackup_log_dir):
     from test_tiff_jxl import write_manifest
     monkeypatch.setattr(mir, "MIRROR_MAX_DELETE_PERCENT", 0)
-    monkeypatch.setattr(mir, "MIRROR_KEEP_DAYS", 0)             # the mirror's "no trash"
+    # the mirror's "no trash" for the old JXL (an old version: 261126, keep-days);
+    # deleting at once needs the typed number
+    monkeypatch.setattr(mir, "MIRROR_VERSIONS_KEEP_DAYS", 0)
     man = write_manifest(env.root / "jxl.csv", (env.src / "2025", "6", "", "", "jxl"))
     assert mir.main(["--manifest", str(man), "--dest", str(env.dest), "--yes"]) == 0
     new_jxl_photo(monkeypatch)
     fail_new_page_rename(monkeypatch, "000037.tiff.jxl")
+    type_what_is_asked(monkeypatch)
     assert mir.main(["--manifest", str(man), "--dest", str(env.dest), "--yes",
                      "--reconvert-older"]) == 1
+    assert not under(env.dest, mir.MIRROR_TRASH_VERSIONS_FOLDER)     # deleted, not kept
     rel = mirror_rel(env, "2025/scans/000037.tiff")
     assert rel in backed(env.dest)                       # deleted the old JXL, so copied it
     assert (env.dest / rel).read_bytes() == (env.src / "2025/scans/000037.tiff").read_bytes()
@@ -599,7 +616,9 @@ def test_s2_the_group_of_an_older_version_of_the_file_stays(env, capsys, photoba
     assert db(env.dest, "SELECT count(*) FROM converted") == [(1,)]
     assert not under(env.dest, VERSIONS)
     assert row_count(out, "JXL replaced by their plain copy") is None
-    assert log_lines(photobackup_log_dir, "UNDO SKIPPED " + os.path.join(*EXPORT_JPG.split("/")))
+    # final review 261126, SF1: the JXL of an older version waits for --update-changed
+    assert row_count(out, "JXL of an older version: waits for --update-changed") == "1"
+    assert log_lines(photobackup_log_dir, "UNDO WAITS " + os.path.join(*EXPORT_JPG.split("/")))
     assert not log_lines(photobackup_log_dir, "UNDONE ")
     assert backup(env, "--jpeg", "copy", "--dry-run") == 0   # never an orphan
     assert not [row for row in newest_csv(photobackup_log_dir, "orphans")
@@ -618,7 +637,9 @@ def test_s2_an_edit_of_the_same_size_is_proven_after_the_copy(env, photobackup_l
     assert (env.dest / EXPORT_JPG).read_bytes() == source.read_bytes()
     assert EXPORT_JPG + ".jxl" in backed(env.dest)
     assert db(env.dest, "SELECT count(*) FROM converted") == [(1,)]
-    assert log_lines(photobackup_log_dir, "UNDO SKIPPED ")
+    # the bytes this run copied are the source's: the JXL is of another version
+    # of the file, it waits for --update-changed (final review 261126, SF1)
+    assert log_lines(photobackup_log_dir, "UNDO WAITS ")
     assert not log_lines(photobackup_log_dir, "UNDONE ")
 
 
@@ -780,7 +801,9 @@ def test_mf1_the_verdict_never_sends_another_programs_copy_to_versions(
         env, monkeypatch, capsys, photobackup_log_dir, keep_days):
     from test_tiff_jxl import write_manifest
     monkeypatch.setattr(mir, "MIRROR_MAX_DELETE_PERCENT", 0)
-    monkeypatch.setattr(mir, "MIRROR_KEEP_DAYS", keep_days)
+    # a TIFF copy its JXL replaces: a TIFF original (261126, keep-days)
+    monkeypatch.setattr(mir, "MIRROR_ORIGINALS_KEEP_DAYS", keep_days)
+    type_what_is_asked(monkeypatch)
     rel = mirror_rel(env, "2025/scans/000037.tiff")
     target = env.dest / rel
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -795,4 +818,92 @@ def test_mf1_the_verdict_never_sends_another_programs_copy_to_versions(
     assert "to versions\\ when the backup did not write them" not in verdict
     assert rel not in under(env.dest, VERSIONS)
     assert not target.exists()
-    assert (rel in under(env.dest, mir.MIRROR_TRASH_FOLDER)) == (keep_days > 0)
+    assert (rel in under(env.dest, mir.MIRROR_TRASH_ORIGINALS_FOLDER)) == (keep_days > 0)
+
+
+# ---- final review 261126, SF1 (plan keep-days, section 1): the JXL of an OLDER
+# version of a file is the old copy of a changed file: it leaves with
+# --update-changed (the mirror: always), as an old version ------------------------
+def restore_rows(log_dir):
+    files = sorted(Path(log_dir).glob("*_restore*.csv"), key=lambda path: path.stat().st_mtime_ns)
+    return list(csv.DictReader(io.StringIO(files[-1].read_text(encoding="utf-8-sig"))))
+
+
+def test_sf1_an_older_versions_jxl_leaves_and_the_restore_gives_the_new_one(
+        env, capsys, photobackup_log_dir):
+    """(star) After an edit and --jpeg copy with --update-changed, the JXL of
+    the old version is in versions (UNDONE (older version)), and the restore
+    gives back the NEW version, exit 0 (review P1)."""
+    import restore_backup as rb
+    assert backup(env, "--jpeg", "jxl") == 0
+    source = env.src / EXPORT_JPG
+    old = source.read_bytes()
+    source.write_bytes(old + b" edited on the source")      # the JPEG changed since its JXL
+    before = snapshot(env.src)
+    capsys.readouterr()
+    assert backup(env, "--jpeg", "copy", "--update-changed") == 0
+    out = capsys.readouterr().out
+    assert snapshot(env.src) == before
+    assert row_count(out, "JXL of an older version (to versions\\)") == "1"
+    have = backed(env.dest)
+    assert EXPORT_JPG in have and EXPORT_JPG + ".jxl" not in have
+    assert EXPORT_JPG + ".jxl" in under(env.dest, VERSIONS)
+    assert db(env.dest, "SELECT count(*) FROM converted") == [(0,)]
+    assert log_lines(photobackup_log_dir, "UNDONE (older version) ")
+    code = rb.main(["--backup", str(env.dest), "--yes", "--to", str(env.out)])
+    assert (env.out / EXPORT_JPG).read_bytes() == source.read_bytes()
+    rows = [row["status"] for row in restore_rows(photobackup_log_dir)
+            if row["rel"].replace("\\", "/") == EXPORT_JPG]
+    assert code == 0 and rows == ["RESTORED"], rows
+
+
+def test_sf1_without_update_changed_it_waits(env, photobackup_log_dir):
+    """(star) Without --update-changed the older version's JXL stays (UNDO
+    WAITS); the next run with it sets it aside."""
+    assert backup(env, "--jpeg", "jxl") == 0
+    source = env.src / EXPORT_JPG
+    source.write_bytes(source.read_bytes() + b" edited")
+    assert backup(env, "--jpeg", "copy") == 0
+    assert EXPORT_JPG + ".jxl" in backed(env.dest)
+    assert log_lines(photobackup_log_dir, "UNDO WAITS ")
+    assert backup(env, "--jpeg", "copy", "--update-changed") == 0
+    assert EXPORT_JPG + ".jxl" not in backed(env.dest)
+    assert EXPORT_JPG + ".jxl" in under(env.dest, VERSIONS)
+
+
+def test_sf1_no_proof_still_keeps_it(env, photobackup_log_dir):
+    """Only "no proof" keeps it unconditionally: a plain copy of another
+    program with other bytes (no row) proves nothing of the source."""
+    assert backup(env, "--jpeg", "jxl") == 0
+    source, target = env.src / EXPORT_JPG, env.dest / EXPORT_JPG
+    target.write_bytes(b"y" * source.stat().st_size)
+    info = source.stat()
+    os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns))
+    assert backup(env, "--jpeg", "copy", "--update-changed") == 0
+    assert EXPORT_JPG + ".jxl" in backed(env.dest)
+    assert log_lines(photobackup_log_dir, "UNDO SKIPPED ")
+
+
+@pytest.mark.parametrize("policy", ["selection", "disk"])
+def test_sf1_the_mirror_sets_the_older_versions_jxl_aside(env, monkeypatch, policy,
+                                                         photobackup_log_dir):
+    """(star) A mirror (Mirror=selection or disk) moves the JXL of the old
+    version out again, to its trash of old versions (review P6)."""
+    monkeypatch.setattr(mir, "MIRROR_MAX_DELETE_PERCENT", 0)
+    jxl = env.root / "jxl.csv"
+    jxl.write_text("Folder,Mode,Originals,Mirror,Tiff,Jpeg\n"
+                   f'"{env.src / "2025"}",6,,{policy},,jxl\n', encoding="utf-8")
+    copy = env.root / "copy.csv"
+    copy.write_text("Folder,Mode,Originals,Mirror,Tiff,Jpeg\n"
+                    f'"{env.src / "2025"}",6,,{policy},,copy\n', encoding="utf-8")
+    assert mir.main(["--manifest", str(jxl), "--dest", str(env.dest), "--yes"]) == 0
+    source = env.src / EXPORT_JPG
+    source.write_bytes(source.read_bytes() + b" edited on the source")
+    before = snapshot(env.src)
+    assert mir.main(["--manifest", str(copy), "--dest", str(env.dest), "--yes"]) == 0
+    assert mir.main(["--manifest", str(copy), "--dest", str(env.dest), "--yes"]) == 0
+    assert snapshot(env.src) == before
+    rel = mirror_rel(env, EXPORT_JPG)
+    assert rel + ".jxl" not in backed(env.dest)
+    assert rel + ".jxl" in under(env.dest, mir.MIRROR_TRASH_VERSIONS_FOLDER)
+    assert (env.dest / rel).read_bytes() == source.read_bytes()

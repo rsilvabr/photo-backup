@@ -111,6 +111,12 @@ TEMP_SUFFIX = ".pbtmp"              # in-progress copy, next to its final name
 DEST_CHECK_AFTER_ERRORS = 20        # backup: after this many failed copies in a row, test the destination
                                     # (write and remove a temp file in CATALOG_FOLDER); it fails = stop; 0 = never
 CATALOG_FOLDER = "_photo_backup"    # under the destination: catalog.sqlite + versions\
+ORIGINALS_FOLDER = "originals"      # under CATALOG_FOLDER: the TIFF copies a JXL replaced, one folder per run
+VERSIONS_KEEP_DAYS = None           # days a run folder of versions\ (old copies of changed files, JXL undone or
+                                    # made again) is kept; then the first real backup on or after that day
+                                    # deletes it. None = never (offered only when space is short); 0 = not kept:
+                                    # deleted at once, after the number of files is typed (--yes stops).
+ORIGINALS_KEEP_DAYS = None         # the same for originals\ (the TIFF copies a JXL replaced)
 PROGRESS_EVERY_S = 5.0
 PROGRESS_RECENT_S = 600.0           # the progress's "last 10 min": its speed and its ETA, beside the whole run's
                                     # (which reacts slowly: RAW to small JPEGs, an SMR disk slowing down); long
@@ -810,6 +816,8 @@ class FileStatus:
     adopt_stat: tuple = None    # ... (source size, mtime_ns, atime_ns, backup size, mtime_ns) as read
     held: str = None            # ... why a CHANGED file is left as it is in this run (not copied):
                                 # read-only, its bytes the source's (review 261126, S5)
+    undo_older: bool = False    # `undoes` is the JXL group of ANOTHER version of the file (known while
+                                # planning): it leaves as an old version, with --update-changed (SF1)
 
 
 @dataclass
@@ -1641,6 +1649,7 @@ def _validate_usage(args):
     # negative one turned "not enough space" into "fits" (T8 of the 261112 sweep)
     if not math.isfinite(args.space_margin_gb) or args.space_margin_gb < 0:
         errors.append("--space-margin-gb must be a number, 0 or more")
+    errors += _store_settings_errors()
     errors += _tiff_profile_errors()
     asks = [f"--tiff {args.tiff}"] if getattr(args, "tiff", "copy") != "copy" else []
     asks += ["--jpeg jxl"] if getattr(args, "jpeg", "copy") == "jxl" else []
@@ -1872,12 +1881,15 @@ def _undo_groups(statuses, groups, rows, log=None):
     that is itself another planned file (a real file named like the JXL) is
     never retired.
 
-    Only a group of the very bytes the plain copy holds leaves (review 261126,
-    S2): what is already known to differ is decided here -- the group's
-    source has another size than the file (another version of it), the
-    catalog has no SHA-256 of the group's source, or an UP_TO_DATE copy's row
-    has another SHA-256 -- and logged `UNDO SKIPPED`; the rest is proven
-    after the copy (_retire_undone). A skipped group stays, its keys planned."""
+    Only a group of the very bytes the plain copy holds leaves as the file's
+    JXL (review 261126, S2). A group of ANOTHER version of the file is the old
+    copy of a changed file (final review 261126, SF1): it leaves as an old
+    version, only with --update-changed (_retire_undone). What is known here:
+    the catalog has no SHA-256 of the group's source (no proof: `UNDO
+    SKIPPED`, the group stays); the group's source has another size than the
+    file, or an UP_TO_DATE copy's row (our copy of the source) has another
+    SHA-256 (`undo_older`). The rest is proven after the copy. A group that
+    stays keeps its keys planned."""
     groups = groups or {}
     planned_keys = {status.planned.rel.casefold() for status in statuses}
     result = []
@@ -1888,22 +1900,22 @@ def _undo_groups(statuses, groups, rows, log=None):
             undoes = tuple(rows[item.key].rel for item in group
                            if item.key in rows and item.key not in planned_keys)
             why = None
+            older = False
             if undoes:
                 source_sha256 = group[0].source_sha256
                 row = rows.get(planned.rel.casefold())
                 if not source_sha256:
                     why = "the catalog has no SHA-256 of the file its JXL was made from"
                 elif group[0].source_size != planned.size:
-                    why = (f"its JXL was made from another version of the file "
-                           f"({_num(group[0].source_size)} bytes, now {_num(planned.size)})")
+                    older = True        # another version of the file: an old copy (SF1)
                 elif (status.status == ST_UP_TO_DATE and row is not None and row.sha256
                         and row.sha256 != source_sha256):
-                    why = "the copy in the backup holds other bytes than its JXL was made from"
+                    older = True
             if why is not None:
                 if log is not None:
                     log.log(f"UNDO SKIPPED {planned.rel}: {why}; its JXL stays")
                 undoes = ()
-            status = _replace_fields(status, undoes=undoes, extra_keys=(
+            status = _replace_fields(status, undoes=undoes, undo_older=older, extra_keys=(
                 status.extra_keys + tuple(item.key for item in group)))
         result.append(status)
     return result
@@ -1927,19 +1939,28 @@ def _undo_proof(status, copied, catalog):
         return None, f"the copy in the backup cannot be read ({exc})"
 
 
-def _retire_undone(statuses, copied_keys, dest, stamp, catalog, log, keep_old_file, info):
+def _retire_undone(statuses, copied_keys, dest, stamp, catalog, log, keep_old_file, info,
+                   update_changed=False):
     """After the copies: the JXL group of a file whose plain copy is in the
     backup (UP_TO_DATE, or recorded by this run: `copied_keys`, {key: the
     SHA-256 of the bytes copied}) leaves -- `keep_old_file` (versions\\, or the
-    mirror's trash for what is ours) -- and its rows go with it, only when the
-    plain copy holds the bytes the group was made from: its SHA-256 is the
-    group's `source_sha256` (_undo_proof; review 261126, S2). No proof: the
-    group stays (`UNDO SKIPPED`), its keys planned. A copy that failed or was
-    not made (a CHANGED one without --update-changed) keeps the group. A group
-    that cannot be moved stays from that file on (error, exit 1)."""
+    mirror's trash for what is ours) -- and its rows go with it, when the plain
+    copy holds the bytes the group was made from: its SHA-256 is the group's
+    `source_sha256` (_undo_proof; review 261126, S2). A group of ANOTHER
+    version of the file (`undo_older`, or a SHA-256 of the source's bytes --
+    copied by this run, adopted, or our row -- that differs) is the old copy of
+    a changed file (final review 261126, SF1): with `update_changed` it leaves
+    as an old version (`UNDONE (older version)`), else it waits (`UNDO
+    WAITS`). No proof -- no SHA-256 of the group's source, a copy that cannot
+    be read, a file of another program with other bytes -- keeps the group
+    (`UNDO SKIPPED`), its keys planned. A copy that failed or was not made (a
+    CHANGED one without --update-changed) keeps the group. A group that cannot
+    be moved stays from that file on (error, exit 1)."""
     keep_old_file = keep_old_file or _keep_old_file
     if not isinstance(copied_keys, dict):
         copied_keys = {key: None for key in copied_keys}
+    info.setdefault("undo_waits", 0)
+    info.setdefault("undone_older", 0)
     for status in statuses:
         if not status.undoes:
             continue
@@ -1948,14 +1969,28 @@ def _retire_undone(statuses, copied_keys, dest, stamp, catalog, log, keep_old_fi
             continue
         wanted = next((sha for sha in (catalog.converted_sha256(rel.casefold())
                                        for rel in status.undoes) if sha), None)
+        older = bool(status.undo_older)
         if not wanted:
             have, why = None, "the catalog has no SHA-256 of the file its JXL was made from"
+        elif older:
+            have, why = None, None
         else:
             have, why = _undo_proof(status, copied_keys, catalog)
-        if why is None and have != wanted:
-            why = "the copy in the backup holds other bytes than its JXL was made from"
+            if why is None and have != wanted:
+                # the bytes of the source (copied by this run, adopted by their
+                # hash, or our row): the JXL is of another version of the file;
+                # a file only read from the backup proves nothing of the source
+                if copied_keys.get(key) or status.adopt_sha256 or catalog.file_sha256(key):
+                    older = True
+                else:
+                    why = "the copy in the backup holds other bytes than its JXL was made from"
         if why is not None:
             log.log(f"UNDO SKIPPED {status.planned.rel}: {why}; its JXL stays")
+            continue
+        if older and not update_changed:
+            info["undo_waits"] += 1
+            log.log(f"UNDO WAITS {status.planned.rel}: the JXL is of an older version of the "
+                    f"file; --update-changed sets it aside")
             continue
         clean = True
         for rel in status.undoes:
@@ -1968,7 +2003,12 @@ def _retire_undone(statuses, copied_keys, dest, stamp, catalog, log, keep_old_fi
                 clean = False
                 break
             info["undone"] += 1
-            log.log(f"UNDONE {rel} (its plain copy {status.planned.rel} is in the backup)")
+            if older:
+                info["undone_older"] += 1
+                log.log(f"UNDONE (older version) {rel} (the plain copy {status.planned.rel} is "
+                        f"of the file as it is now)")
+            else:
+                log.log(f"UNDONE {rel} (its plain copy {status.planned.rel} is in the backup)")
         if clean:
             catalog.forget_not_converted(key)
     catalog.commit()
@@ -2422,6 +2462,7 @@ class _Catalog:
             os.makedirs(_io(self.dir), exist_ok=True)
         self.conn = None
         self.scratch = None
+        self.write_failed = None    # why a purge could not write it (_purge_store_run), or None
         self.writers = dict.fromkeys(("created_by", "created_at", "updated_by", "updated_at"), "")
         self._writer_recorded = True        # nothing to record until it is open to write
         self._changes_at_open = 0
@@ -2498,6 +2539,15 @@ class _Catalog:
                     "key TEXT PRIMARY KEY, rel TEXT NOT NULL, size INTEGER NOT NULL, "
                     "mtime_ns INTEGER NOT NULL, tool TEXT NOT NULL, settings TEXT NOT NULL, "
                     "reason TEXT NOT NULL, failures INTEGER NOT NULL, last_at TEXT NOT NULL)")
+                # 261126 (keep-days): the TIFF copies a JXL replaced, kept in a run folder of
+                # originals\ (or the mirror's trash_originals\). No new schema version either:
+                # an older program ignores the table. stored_rel = where the copy is now,
+                # source_rel = the rel it had in the backup's tree
+                self.conn.execute(
+                    "CREATE TABLE IF NOT EXISTS originals ("
+                    "key TEXT PRIMARY KEY, stored_rel TEXT NOT NULL, source_rel TEXT NOT NULL, "
+                    "size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, sha256 TEXT, "
+                    "stored_at TEXT NOT NULL)")
                 self.conn.commit()
             # A damaged page can sit where a plain read of the table never
             # goes (an index): a verify said OK with it, and the next backup
@@ -2602,6 +2652,16 @@ class _Catalog:
             why = _unsafe_rel(rel)
             if why is not None:
                 return rel, why
+        # the TIFF copies kept in originals\ (261126): both paths are joined to the
+        # backup's root by whatever reads them (round 2 renames them back)
+        if self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                             "AND name='originals'").fetchone() is not None:
+            for stored_rel, source_rel in self.conn.execute(
+                    "SELECT stored_rel, source_rel FROM originals"):
+                for rel in (stored_rel, source_rel):
+                    why = _unsafe_rel(rel)
+                    if why is not None:
+                        return rel, why
         return None
 
     def _first_unsafe_source_rel(self):
@@ -2711,6 +2771,38 @@ class _Catalog:
         """The SHA-256 a files row holds, or None (no row, or no hash)."""
         row = self.conn.execute("SELECT sha256 FROM files WHERE key=?", (key,)).fetchone()
         return row[0] if row else None
+
+    def file_row(self, key):
+        """(size, mtime_ns, sha256) of a files row, or None."""
+        row = self.conn.execute("SELECT size, mtime_ns, sha256 FROM files WHERE key=?",
+                                (key,)).fetchone()
+        return tuple(row) if row else None
+
+    def _has_originals(self):
+        return self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                 "AND name='originals'").fetchone() is not None
+
+    def record_original(self, stored_rel, source_rel, size, mtime_ns, sha256):
+        """A TIFF copy its JXL replaced, now kept at `stored_rel` (under the
+        backup's root) -- written in the same transaction as the move (261126)."""
+        if not self._has_originals():
+            return
+        self.conn.execute(
+            "INSERT OR REPLACE INTO originals(key, stored_rel, source_rel, size, mtime_ns, "
+            "sha256, stored_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (stored_rel.casefold(), stored_rel, source_rel, size, _db_ns(mtime_ns), sha256,
+             datetime.now().isoformat(timespec="seconds")))
+
+    def forget_original(self, stored_rel):
+        if self._has_originals():
+            self.conn.execute("DELETE FROM originals WHERE key=?", (stored_rel.casefold(),))
+
+    def originals_rows(self):
+        """[(stored_rel, source_rel, size, mtime_ns, sha256, stored_at)], or []."""
+        if not self._has_originals():
+            return []
+        return [tuple(row) for row in self.conn.execute(
+            "SELECT stored_rel, source_rel, size, mtime_ns, sha256, stored_at FROM originals")]
 
     def delete(self, key):
         self.conn.execute("DELETE FROM files WHERE key=?", (key,))
@@ -2907,12 +2999,30 @@ def _move_aside(src, target):
 
 
 def _move_file_to_versions(dest, stamp, rel, log):
-    """Move the backup file at `rel` into the versions folder of this run."""
-    target = os.path.join(dest, CATALOG_FOLDER, "versions", stamp, rel)
+    """Move the backup file at `rel` into the versions folder of this run.
+    Returns where it is now."""
+    return _move_file_to_store(dest, stamp, rel, log, _VERSIONS_FOLDER, "VERSION")
+
+
+def _move_file_to_store(dest, stamp, rel, log, folder, word):
+    """Move the backup file at `rel` into <CATALOG_FOLDER>\\<folder>\\<stamp>\\<rel>
+    (a name taken there: ' (2)', never replaced). Returns where it is now."""
+    target = os.path.join(dest, CATALOG_FOLDER, folder, stamp, rel)
     os.makedirs(_io(os.path.dirname(target)), exist_ok=True)
     used = _move_aside(os.path.join(dest, rel), target)
-    log.log(f"VERSION {rel}"
+    log.log(f"{word} {rel}"
             + ("" if used == target else f" (kept as {os.path.basename(used)})"))
+    return used
+
+
+def _delete_backup_file(path):
+    """Delete one file of the backup for good (Windows refuses a read-only
+    one: made writable first). Only for what the keep-days rules allow."""
+    try:
+        os.remove(_io(path))
+    except PermissionError:
+        os.chmod(_io(path), os.stat(_io(path)).st_mode | 0o200)
+        os.remove(_io(path))
 
 
 def _move_to_versions(dest, stamp, status, log):
@@ -2942,6 +3052,580 @@ def _handle_old_copy(dest, stamp, status, log, keep_old=None):
         log.log(f"IDENTICAL {status.planned.rel} (old copy not kept in versions)")
 
     return before_final
+
+
+# ---- What the backup sets aside, and for how long (261126, topic keep-days) -----------
+# Three kinds leave the backup's tree: `versions` (the old copy of a changed file, a
+# JXL group undone or made again, the JXL of an older version), `originals` (a TIFF
+# copy its JXL replaced) and, in the mirror only, `removed` (gone from the source).
+# Each has a folder per run (<CATALOG_FOLDER>\<store>\<stamp>\<rel>) and its days.
+_VERSIONS_FOLDER = "versions"           # under CATALOG_FOLDER (its name never changed)
+_STAMP_NAME = re.compile(r"[0-9]{6}_[0-9]{6}")    # a run folder: the stamp of the run, YYMMDD_HHMMSS
+_KEEP_SETTING = {"versions": "VERSIONS_KEEP_DAYS", "originals": "ORIGINALS_KEEP_DAYS"}
+_NEVER = "never"
+
+
+def _keep_days_arg(text):
+    """The value of a --*-keep-days option: a whole number of days, 0 or more,
+    or `never` (None). Anything else is refused (argparse: exit 2)."""
+    value = str(text).strip()
+    if value.casefold() == _NEVER:
+        return None
+    if value and value.isascii() and value.isdigit():
+        return int(value)
+    raise argparse.ArgumentTypeError(
+        f"must be a whole number of days, 0 or more, or {_NEVER} (not {text!r})")
+
+
+def _keep_days_text(days):
+    """What a *_KEEP_DAYS value is on a command line: N, or `never`."""
+    return _NEVER if days is None else str(days)
+
+
+def _keep_days_problem(name, value):
+    """Why a *_KEEP_DAYS setting cannot be used, or None (None = never)."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return (f"{name} must be a whole number of days, 0 or more, or None (never) "
+                f"(it is {value!r})")
+    return None
+
+
+def _plain_name_problem(name, value, reserved):
+    """Why a folder setting under CATALOG_FOLDER is not one plain name of its
+    own, or None."""
+    text = value.strip() if isinstance(value, str) else ""
+    if (not text or text != value or text in (".", "..")
+            or any(char in text for char in "\\/:%") or text.casefold() in reserved):
+        return (f"{name} must be one plain name, not one of the backup's other folders "
+                f"or files, not {value!r}")
+    return None
+
+
+def _reserved_names():
+    """The names under CATALOG_FOLDER that are taken: what a store folder can
+    never be called."""
+    return {_VERSIONS_FOLDER, ORPHANS_FOLDER.casefold(), TOOLS_FOLDER.casefold(),
+            BACKUP_ID_FILE.casefold(), _OLD_WORK_FOLDER.casefold(), "catalog.sqlite",
+            "catalog.sqlite-journal"}
+
+
+def _store_settings_errors():
+    """The keep-days settings and ORIGINALS_FOLDER of this script: refused
+    before anything is read (exit 2)."""
+    mirror_folders = {str(store.folder).casefold() for store in _mirror_stores()}
+    errors = [problem for problem in (
+        _keep_days_problem("VERSIONS_KEEP_DAYS", VERSIONS_KEEP_DAYS),
+        _keep_days_problem("ORIGINALS_KEEP_DAYS", ORIGINALS_KEEP_DAYS),
+        _plain_name_problem("ORIGINALS_FOLDER", ORIGINALS_FOLDER,
+                            _reserved_names() | mirror_folders))
+        if problem]
+    return errors
+
+
+@dataclass
+class _Store:
+    kind: str           # versions | originals | removed
+    label: str          # what the screen calls it
+    folder: str         # its name under CATALOG_FOLDER
+    days: object        # whole days, or None (never)
+    owner: str          # "backup" or "mirror": the runs that delete in it
+
+
+def _backup_stores(args=None):
+    """The normal backup's stores, with this run's days (its options, else
+    the settings)."""
+    versions = getattr(args, "versions_keep_days", VERSIONS_KEEP_DAYS) if args else VERSIONS_KEEP_DAYS
+    originals = (getattr(args, "originals_keep_days", ORIGINALS_KEEP_DAYS) if args
+                 else ORIGINALS_KEEP_DAYS)
+    return [_Store("versions", "old versions", _VERSIONS_FOLDER, versions, "backup"),
+            _Store("originals", "TIFF originals", ORIGINALS_FOLDER, originals, "backup")]
+
+
+def _mirror_stores():
+    """The mirror's stores as mirror_backup.py names them, with its settings
+    (the normal backup lists them -- the same disk -- and never deletes in
+    them); [] when that script cannot be read."""
+    try:
+        import mirror_backup
+        return list(mirror_backup.stores())
+    except Exception:
+        return []
+
+
+@dataclass
+class _StoreRun:
+    name: str           # the stamp of the run that filled it: YYMMDD_HHMMSS
+    path: str
+    when: datetime
+    files: int = 0
+    nbytes: int = 0
+    links: int = 0      # links/junctions inside: never followed, never removed
+    folders: object = None      # collections.Counter: where (the folder of a file) -> files
+    folder_bytes: object = None
+
+
+@dataclass
+class _StoreScan:
+    store: _Store
+    runs: list          # _StoreRun, oldest first
+    foreign: list       # paths in the store that no run made (never touched)
+    problem: str        # why it cannot be used, or None
+    owned: bool         # this run deletes in it (by age, or when space is short)
+    exists: bool = False
+
+
+def _store_root(dest, folder):
+    return os.path.join(dest, CATALOG_FOLDER, folder)
+
+
+def _store_problem(dest, folder):
+    """Why the backup's own folder or one of its stores cannot be used, or
+    None. Each must be where it says, by its real path: a junction planted
+    there would lead a move or a delete into another place -- a source even."""
+    real_dest = _real(dest)
+    for rel in (CATALOG_FOLDER, os.path.join(CATALOG_FOLDER, folder)):
+        path = os.path.join(dest, rel)
+        try:
+            present = os.path.lexists(_io(path))
+        except (OSError, ValueError):
+            present = False
+        if not present:
+            continue
+        real = _real(path)
+        expected = os.path.join(real_dest, rel)
+        if os.path.normcase(real).rstrip("\\/") != os.path.normcase(expected).rstrip("\\/"):
+            return f"{path} leads somewhere else ({real}): it is not used"
+    return None
+
+
+def _scan_tree(root):
+    """([(path relative to root, size)], [links], problems) of a folder:
+    links and junctions are never followed."""
+    files, links, problems = [], [], 0
+    stack = [root]
+    while stack:
+        folder = stack.pop()
+        try:
+            with os.scandir(_io(folder)) as listing:
+                entries = list(listing)
+        except OSError:
+            problems += 1
+            continue
+        for entry in entries:
+            path = os.path.join(folder, entry.name)
+            try:
+                if entry.is_symlink() or entry.is_junction():
+                    links.append(path)
+                elif entry.is_dir(follow_symlinks=False):
+                    stack.append(path)
+                else:
+                    files.append((os.path.relpath(path, root),
+                                  entry.stat(follow_symlinks=False).st_size))
+            except OSError:
+                problems += 1
+    return files, links, problems
+
+
+def _store_group(rel):
+    """The folder of a file in a run folder (a table cuts it in the middle)."""
+    return os.path.dirname(rel.replace("/", "\\")) or "(the backup's own root)"
+
+
+def _store_runs(dest, folder):
+    """(runs, foreign, problem): the run folders of a store, oldest first;
+    the paths in it that no run made (never touched); why it cannot be read.
+    A run folder is named like a stamp (YYMMDD_HHMMSS) and nothing else: two
+    runs of one second share it (_move_aside names a FILE ' (2)', never a run
+    folder)."""
+    root = _store_root(dest, folder)
+    runs, foreign = [], []
+    try:
+        with os.scandir(_io(root)) as listing:
+            entries = list(listing)
+    except FileNotFoundError:
+        return runs, foreign, None
+    except OSError as exc:
+        return runs, foreign, f"{root} cannot be read ({exc.strerror or exc})"
+    for entry in entries:
+        path = os.path.join(root, entry.name)
+        when = None
+        try:
+            plain = (not (entry.is_symlink() or entry.is_junction())
+                     and entry.is_dir(follow_symlinks=False))
+        except OSError:
+            plain = False
+        if plain and _STAMP_NAME.fullmatch(entry.name):
+            try:
+                when = datetime.strptime(entry.name, "%y%m%d_%H%M%S")
+            except ValueError:
+                when = None
+        if when is None:
+            foreign.append(path)
+            continue
+        files, links, _problems = _scan_tree(path)
+        folders = collections.Counter()
+        folder_bytes = collections.Counter()
+        for rel, size in files:
+            folders[_store_group(rel)] += 1
+            folder_bytes[_store_group(rel)] += size
+        runs.append(_StoreRun(entry.name, path, when, len(files),
+                              sum(size for _rel, size in files), len(links), folders,
+                              folder_bytes))
+    runs.sort(key=lambda run: (run.when, run.name))
+    return runs, foreign, None
+
+
+def _scan_stores(dest, owned, others=()):
+    """One _StoreScan per store: the ones this run owns, then the others it
+    only shows (the same disk)."""
+    scans = []
+    for stores, is_owned in ((owned, True), (others, False)):
+        for store in stores:
+            problem = _store_problem(dest, store.folder)
+            runs, foreign = [], []
+            exists = False
+            if problem is None:
+                runs, foreign, problem = _store_runs(dest, store.folder)
+                try:
+                    exists = os.path.isdir(_io(_store_root(dest, store.folder)))
+                except (OSError, ValueError):
+                    exists = False
+            else:
+                exists = True
+            scans.append(_StoreScan(store, runs, foreign, problem, is_owned, exists))
+    return scans
+
+
+def _expired_runs(scan, now=None):
+    """The run folders of a store past its days, by their DAY (the first run
+    on or after that day deletes them, at any hour); none for `never`."""
+    days = scan.store.days
+    if scan.problem or days is None:
+        return []
+    today = (now or datetime.now()).date()
+    return [run for run in scan.runs if (today - run.when.date()).days >= days]
+
+
+def _zero_day_runs(scan, expired=None):
+    """The run folders of a store that go only because their days are 0 --
+    what is already kept there, deleted at the next run: never without the
+    typed number (SF1 of the review 261126). Empty ones need nobody."""
+    runs = _expired_runs(scan) if expired is None else expired
+    if scan.store.days != 0:
+        return []
+    return [run for run in runs if run.files]
+
+
+def _expiry_text(run, days, at_next="at the next run"):
+    """When a run folder is deleted, in words."""
+    if days is None:
+        return "only when space is short"
+    until = run.when + timedelta(days=days)
+    left = (until.date() - datetime.now().date()).days
+    if days == 0 or left <= 0:
+        return at_next
+    return f"{until:%Y-%m-%d} (in {left} day{'s' if left != 1 else ''})"
+
+
+def _days_text(days):
+    if days is None:
+        return "never"
+    if days == 0:
+        return "0 (at once)"
+    return f"{days} day{'s' if days != 1 else ''}"
+
+
+def _purge_store_run(run, dest, folder, log, catalog=None):
+    """Delete one run folder of a store for good: (files, bytes, problems).
+    Only what is inside that run's folder, by its real path; a link or
+    junction inside is left where it is and never followed. The `originals`
+    row of each file deleted goes with it (`catalog`). A catalog that cannot
+    be written (locked by another program) stops the deletion there: what was
+    deleted is counted, the rest stays, `catalog.write_failed` says why and
+    the callers delete no further run folder (SF6 of the review 261126)."""
+    expected = os.path.join(_real(dest), CATALOG_FOLDER, folder, run.name)
+    real = _real(run.path)
+    if (not _STAMP_NAME.fullmatch(run.name)
+            or os.path.normcase(real).rstrip("\\/") != os.path.normcase(expected).rstrip("\\/")):
+        log.log(f"ERROR {folder} {run.path}: it leads somewhere else ({real}); not touched")
+        return 0, 0, 1
+    if catalog is not None and getattr(catalog, "write_failed", None):
+        log.log(f"NOT PURGED {folder} {run.path}: the catalog could not be written")
+        return 0, 0, 0
+    counts = [0, 0, 0]
+    stopped = []
+
+    def purge(path_folder):
+        try:
+            with os.scandir(_io(path_folder)) as listing:
+                entries = list(listing)
+        except OSError as exc:
+            log.log(f"ERROR {folder} {path_folder}: {exc}")
+            counts[2] += 1
+            return
+        for entry in entries:
+            if stopped:
+                return
+            path = os.path.join(path_folder, entry.name)
+            try:
+                if entry.is_symlink() or entry.is_junction():
+                    # left where it is, never followed; not a problem of each
+                    # later run either (finding 8 of the rc1 review)
+                    log.log(f"LINK left in {folder}: {path} (never followed)")
+                elif entry.is_dir(follow_symlinks=False):
+                    purge(path)
+                    if stopped:
+                        return
+                    try:
+                        os.rmdir(_io(path))
+                    except OSError:
+                        pass
+                else:
+                    size = entry.stat(follow_symlinks=False).st_size
+                    _delete_backup_file(path)
+                    counts[0] += 1
+                    counts[1] += size
+                    if catalog is not None:
+                        try:
+                            catalog.forget_original(os.path.relpath(path, dest))
+                        except sqlite3.Error as exc:
+                            catalog.write_failed = str(exc)
+                            log.log(f"ERROR {folder}: the catalog could not be written ({exc}) "
+                                    f"after deleting {path}; the deletion stops there, the rest "
+                                    f"stays")
+                            counts[2] += 1
+                            stopped.append(True)
+                            return
+            except OSError as exc:
+                log.log(f"ERROR {folder} {path}: {exc}")
+                counts[2] += 1
+
+    purge(run.path)
+    try:
+        os.rmdir(_io(run.path))
+    except OSError:
+        pass
+    log.log(f"PURGED {os.path.join(CATALOG_FOLDER, folder, run.name)}: {counts[0]} files / "
+            f"{_gb(counts[1])}" + (f", {counts[2]} problems" if counts[2] else ""))
+    return tuple(counts)
+
+
+def _typed_confirmation(lines, count, log):
+    """True only when the person types `count` (dots, commas and spaces are
+    ignored): a number that changes every time cannot be typed from habit, and
+    reading it is reading how much is at stake. Anything else -- Enter, 'y',
+    a closed console -- is a no."""
+    for line in lines:
+        print(line)
+    try:
+        answer = input(f"To go on, type {count} and press Enter (anything else cancels): ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        answer = ""
+    ok = count > 0 and re.sub(r"[\s.,]", "", answer) == str(count)
+    log.log(f"CONFIRMATION {'given' if ok else 'refused'} ({count} files): "
+            + " ".join(line.strip() for line in lines if line.strip()))
+    return ok
+
+
+def _set_aside_counts(statuses, args):
+    """{kind: files} this run would set aside (at most: an old copy found
+    identical to the new one stays nowhere; a JPEG copy proven by its JXL is
+    deleted): the old copies of changed files, the JXL groups undone or made
+    again, the TIFF copies a JXL replaces."""
+    counts = collections.Counter()
+    update_changed = bool(getattr(args, "update_changed", False))
+    for status in statuses:
+        copying = _will_copy(status, args)
+        if status.status == ST_CHANGED and copying and not status.planned.convert:
+            counts["versions"] += 1
+        if status.planned.convert and copying:
+            counts["versions"] += len(status.old_outputs)
+        if status.undoes and (status.status == ST_UP_TO_DATE or copying):
+            if not status.undo_older or update_changed:
+                counts["versions"] += len(status.undoes)
+        if status.planned.convert and status.replaces and (
+                status.status == ST_UP_TO_DATE or copying):
+            counts["originals" if status.planned.convert != JPEG_CONVERT else "versions"] += 1
+    return counts
+
+
+def _next_deletion_text(runs, days, dry_run=False):
+    """When the first of these run folders is deleted, in words."""
+    at_next = "at the next real run" if dry_run else "at this run"
+    if days is None:
+        return "only when space is short"
+    if not runs:
+        return "at once (0 days)" if days == 0 else "-"
+    if days == 0:
+        # a run folder stamped after today (a clock that was ahead) is never
+        # deleted by age: not "now" (N2 of the final review 261126)
+        today = datetime.now().date()
+        if not any(run.when.date() <= today for run in runs):
+            return "not yet: dated after today"
+        return f"{at_next}, after the typed number of files"
+    return _expiry_text(min(runs, key=lambda run: run.when), days, at_next)
+
+
+def _store_line_text(scan, dry_run=False):
+    """One row of the space block: label | files | size | kept | next deletion."""
+    store = scan.store
+    files = sum(run.files for run in scan.runs)
+    nbytes = sum(run.nbytes for run in scan.runs)
+    label = _room_label(scan)
+    if scan.problem:
+        return [f"    {label:<30}{_num(files):>9}{_gb(nbytes):>11}   {_days_text(store.days):<14} "
+                f"CANNOT BE USED: {scan.problem}"]
+    nxt = _next_deletion_text(scan.runs, store.days, dry_run)
+    return [f"    {label:<30}{_num(files):>9}{_gb(nbytes):>11}   {_days_text(store.days):<14} {nxt}"]
+
+
+def _space_block_lines(dest, free, needed, margin, scans, dry_run=False, owner="backup"):
+    """The block next to the Space line of every run (261126): what the
+    backup holds set aside, how long, and what deleting each would free."""
+    shown = [scan for scan in scans if scan.exists]
+    if not shown:
+        return []
+    drive = os.path.splitdrive(dest)[0] or dest
+    lines = ["", f"Space on {drive}   free {_gb(free)}   this run needs {_gb(needed)}   "
+                 f"margin {_gb(margin)}",
+             f"  {'set aside in the backup':<32}{'files':>9}{'size':>11}   {'kept':<14} next deletion"]
+    for scan in shown:
+        lines += _store_line_text(scan, dry_run)
+    expiring = [(scan, run) for scan in shown if scan.owned for run in _expired_runs(scan)]
+    if expiring:
+        by_store = collections.OrderedDict()
+        for scan, run in expiring:
+            by_store.setdefault(_room_label(scan), []).append(run)
+        parts = []
+        for label, runs in by_store.items():
+            days = sorted({_day_text(run.when) for run in runs})
+            count = sum(run.files for run in runs)
+            parts.append(f"{_num(count)} file{'' if count == 1 else 's'} "
+                         f"({_gb(sum(run.nbytes for run in runs))}) of {label} (taken out on "
+                         f"{days[0] if len(days) == 1 else days[0] + ' to ' + days[-1]})")
+        lines.append(f"  expire in this run{' (not in a dry-run)' if dry_run else ''}: "
+                     + "; ".join(parts))
+    with_content = [scan for scan in shown if any(run.nbytes or run.files for run in scan.runs)]
+    if with_content:
+        parts = [f"{_room_label(scan)} {_gb(free + sum(run.nbytes for run in scan.runs))}"
+                 for scan in with_content]
+        total = free + sum(run.nbytes for scan in with_content for run in scan.runs)
+        lines.append("  free after deleting: " + " · ".join(parts) + f" · all {_gb(total)}")
+    return lines
+
+
+def _day_text(moment):
+    return moment.strftime("%Y-%m-%d")
+
+
+@dataclass
+class _RoomOption:
+    label: str
+    scan: object
+    runs: list
+    files: int
+    nbytes: int
+    enough: bool
+
+
+def _room_options(scans, missing):
+    """What could be deleted for good to make room, the least first: for each
+    store this run owns that holds something (its runs that do not expire
+    anyway), its oldest run folders enough for what is missing (when that store
+    alone can cover it), and all of it."""
+    options = []
+    for scan in scans:
+        if not scan.owned or scan.problem:
+            continue
+        expired = {run.name for run in _expired_runs(scan)}
+        runs = [run for run in scan.runs if run.name not in expired]
+        if not runs or not sum(run.nbytes + run.files for run in runs):
+            continue
+        label = _room_label(scan)
+        oldest, total = [], 0
+        for run in runs:
+            oldest.append(run)
+            total += run.nbytes
+            if total >= missing:
+                break
+        if total >= missing and len(oldest) < len(runs):
+            first, last = _day_text(oldest[0].when), _day_text(oldest[-1].when)
+            days = first if first == last else f"{first} to {last}"
+            options.append(_RoomOption(f"{label}: the oldest ({days})", scan, oldest,
+                                       sum(run.files for run in oldest), total, True))
+        whole = sum(run.nbytes for run in runs)
+        options.append(_RoomOption(f"{label}: all of it", scan, runs,
+                                   sum(run.files for run in runs), whole, whole >= missing))
+    options.sort(key=lambda option: (option.nbytes, option.files))
+    return options
+
+
+def _room_label(scan):
+    if scan.store.owner == "mirror":
+        return "mirror trash" if scan.store.kind == "removed" else f"mirror trash: {scan.store.label}"
+    return scan.store.label
+
+
+def _room_lines(options, missing, free, drive, who="the backup"):
+    lines = ["", f"  !! NOT ENOUGH SPACE on {drive} - {_gb(missing)} missing."]
+    if not options:
+        lines.append("     Nothing is set aside in the backup that could make room.")
+        return lines
+    lines.append(f"     It fits if {who} deletes these FOR GOOD (no way back):")
+    recommended = next((index for index, option in enumerate(options, 1) if option.enough), None)
+    for index, option in enumerate(options, 1):
+        mark = ("  <- recommended" if index == recommended
+                else "" if option.enough else "  (not enough alone)")
+        lines.append(f"       {index}) {option.label:<44}{_num(option.files):>9} files"
+                     f"{_gb(option.nbytes):>10}   free after {_gb(free + option.nbytes)}{mark}")
+    lines.append("       Enter) cancel: nothing changes")
+    return lines
+
+
+def _choose_room(options, missing, log):
+    """Ask which options to delete for good (several: "1 3"; two of one store:
+    the larger), then the typed number of files. Returns the chosen options,
+    or (None, why) when nothing is to be deleted."""
+    try:
+        answer = input('Choose one or more (e.g. "1 3"), Enter = cancel: ')
+    except (EOFError, KeyboardInterrupt):
+        print()
+        answer = ""
+    tokens = answer.split()
+    if not tokens:
+        return None, "nothing was chosen to make room"
+    if not all(token.isascii() and token.isdigit() and 1 <= int(token) <= len(options)
+               for token in tokens):
+        return None, f"{answer.strip()!r} is not a list of the numbers shown"
+    chosen = {}
+    for token in tokens:
+        option = options[int(token) - 1]
+        key = (option.scan.store.owner, option.scan.store.folder)
+        if key not in chosen or option.nbytes > chosen[key].nbytes:
+            chosen[key] = option            # two options of one store: the larger wins
+    picked = list(chosen.values())
+    files = sum(option.files for option in picked)
+    nbytes = sum(option.nbytes for option in picked)
+    if nbytes < missing:
+        return None, (f"what was chosen frees {_gb(nbytes)}, and {_gb(missing)} is missing: "
+                      f"nothing was deleted")
+    names = "; ".join(f"{option.label} ({_num(option.files)} files, {_gb(option.nbytes)})"
+                      for option in picked)
+    sentence = (f"Everything in: {names} will be deleted and can NOT be recovered later. "
+                f"Are you sure?")
+    lines = ["", "!! DELETE FOR GOOD"] + [f" {line}" for line in _wrap_text(sentence, 78)]
+    if not _typed_confirmation(lines, files, log):
+        return None, "deleting for good to make room was not confirmed"
+    log.log(f"FREE SPACE chosen: {names}")
+    return picked, None
+
+
+def _wrap_text(text, width):
+    import textwrap
+    return textwrap.wrap(text, width=width, break_long_words=False, break_on_hyphens=False)
 
 
 class _SourceRead:
@@ -4765,17 +5449,102 @@ def _encode_one(status, work, jxlphoto, flush=True, servers=None):
                                 "proof": time.monotonic() - converted})
 
 
-def _keep_old_file(dest, stamp, rel, log):
-    """The default home of a backup file a TIFF's JXL replaces: the versions
-    folder (the mirror passes its own: the trash for what is ours)."""
-    _move_file_to_versions(dest, stamp, rel, log)
+class _SetAside:
+    """Where a file that leaves the backup's tree goes in a normal backup
+    (261126, keep-days), by its kind: `versions` -> versions\\<stamp>\\<rel>,
+    `originals` (a TIFF copy its JXL replaced) -> originals\\<stamp>\\<rel>,
+    `jpeg_proven` (a JPEG copy whose JXL gives its very bytes back) ->
+    deleted. A kind in `at_once` ({kind: files}: its *_KEEP_DAYS is 0, and a
+    person typed the number of files) is deleted instead of kept -- at most
+    that many files of the kind: the typed number is an upper bound, the rest
+    is moved (MF1/SF3 of the final review 261126). Called as keep_old_file:
+    returns (where the file went or None, the kind of store)."""
+
+    def __init__(self, at_once=None):
+        self.left = collections.Counter(dict(at_once or {}))
+        self.deleted = collections.Counter()
+
+    def __call__(self, dest, stamp, rel, log, kind="versions"):
+        path = os.path.join(dest, rel)
+        if kind == "jpeg_proven":
+            _delete_backup_file(path)
+            log.log(f"DELETED (its JXL gives these bytes back) {rel}")
+            self.deleted[kind] += 1
+            return None, None
+        if kind != "originals":
+            kind = "versions"
+        if self.left[kind] > 0:
+            self.left[kind] -= 1
+            _delete_backup_file(path)
+            log.log(f"DELETED ({_KEEP_SETTING[kind]} = 0) {rel}")
+            self.deleted[kind] += 1
+            return None, None
+        if kind == "originals":
+            return _move_file_to_store(dest, stamp, rel, log, ORIGINALS_FOLDER,
+                                       "ORIGINAL"), "originals"
+        return _move_file_to_versions(dest, stamp, rel, log), "versions"
+
+    def old_copy(self, dest, stamp, status, log):
+        """_copy_all's old_copy: _handle_old_copy, its old copy kept (or
+        deleted at once) as a `versions` file."""
+        def keep(dest_, stamp_, status_, log_):
+            self(dest_, stamp_, status_.planned.rel, log_, "versions")
+        return _handle_old_copy(dest, stamp, status, log, keep_old=keep)
 
 
-def _retire_file(dest, stamp, rel, catalog, log, keep_old_file):
-    """Move the backup file at `rel` aside (keep_old_file) and drop its row."""
-    if os.path.lexists(_io(os.path.join(dest, rel))):
-        keep_old_file(dest, stamp, rel, log)
+def _keep_old_file(dest, stamp, rel, log, kind="versions"):
+    """The default home of a backup file a JXL (or a plain copy) replaces:
+    versions\\, or originals\\ for a TIFF copy its JXL replaced (the mirror
+    passes its own: its trash for what is ours)."""
+    return _SetAside()(dest, stamp, rel, log, kind)
+
+
+def _retire_file(dest, stamp, rel, catalog, log, keep_old_file, kind="versions"):
+    """Move the backup file at `rel` aside (keep_old_file, by its `kind`) and
+    drop its row. A TIFF copy kept in an originals store gets its row in the
+    catalog's `originals` table, in the same transaction (261126)."""
+    path = os.path.join(dest, rel)
+    if os.path.lexists(_io(path)):
+        known = None
+        if kind == "originals":
+            known = catalog.file_row(rel.casefold())
+            if known is None:
+                try:
+                    info = os.stat(_io(path))
+                    known = (info.st_size, info.st_mtime_ns, None)
+                except OSError:
+                    known = None
+        result = keep_old_file(dest, stamp, rel, log, kind=kind)
+        used, stored = result if isinstance(result, tuple) else (result, None)
+        if stored == "originals" and used and known is not None:
+            catalog.record_original(os.path.relpath(used, dest), rel, *known)
     catalog.delete(rel.casefold())
+
+
+def _retire_replaced(status, dest, stamp, catalog, log, keep_old_file):
+    """The copy in the backup a JXL replaces (`status.replaces`), once the JXL
+    is in place: a TIFF copy is kept as a TIFF original (originals\\); a JPEG
+    copy is deleted when its bytes are the ones the JXL gives back (the file
+    itself read, = the group's source_sha256: proven when the JXL was made;
+    its row's SHA-256 alone is not enough, and a row that says other bytes is
+    no proof either -- SF5 of the review 261126), else kept as an old version
+    (no proof). Returns the kind."""
+    rel = status.replaces
+    if status.planned.convert != JPEG_CONVERT:
+        _retire_file(dest, stamp, rel, catalog, log, keep_old_file, "originals")
+        return "originals"
+    kind = "versions"
+    wanted = catalog.converted_sha256(status.planned.rel.casefold())
+    if wanted:
+        row_sha256 = catalog.file_sha256(rel.casefold())
+        try:
+            have = _sha256_file(os.path.join(dest, rel))
+        except OSError:
+            have = None
+        if have == wanted and (not row_sha256 or row_sha256 == wanted):
+            kind = "jpeg_proven"
+    _retire_file(dest, stamp, rel, catalog, log, keep_old_file, kind)
+    return kind
 
 
 def _old_group_whole(status, dest, catalog):
@@ -4919,13 +5688,18 @@ def _copy_as_is(status, dest, stamp, catalog, log, keep_old_file, args,
         size = 0
     else:
         in_the_way = there is not None or os.path.lexists(_io(dst))
+        # the copy a JXL would replace (`replaces`) leaves as the kind it was
+        # counted as and shown, whether or not the conversion happened: a TIFF
+        # one is a TIFF original (SF3 of the final review 261126)
+        old_kind = ("originals" if status.replaces and planned.convert != JPEG_CONVERT
+                    and status.replaces.casefold() == tiff_rel.casefold() else "versions")
 
         def retire_old(_new_sha256):
             # the old copy keeps its name until the new one is written, on the
             # disk and checked: the last step before the final name (v0.12.0's
             # rule; v0.14.0-rc6 review, M3: it left first, and a copy that then
             # failed left no file and no row under that name)
-            _retire_file(dest, stamp, tiff_rel, catalog, log, keep_old_file)
+            _retire_file(dest, stamp, tiff_rel, catalog, log, keep_old_file, old_kind)
 
         digest, size, mtime_ns = _copy_file(copy, dst, args.verify_copy,
                                             before_final=retire_old if in_the_way else None)
@@ -5181,8 +5955,8 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
     backup's disk is. A file that cannot be converted is copied as it is.
     Returns True when interrupted (Ctrl+C)."""
     info = {} if info is None else info
-    for name in ("converted", "failed", "retired", "bytes_in", "bytes_out", "errors",
-                 "as_is", "bytes_as_is"):
+    for name in ("converted", "failed", "retired", "retired_deleted", "bytes_in", "bytes_out",
+                 "errors", "as_is", "bytes_as_is"):
         info.setdefault(name, 0)
     keep_old_file = keep_old_file or _keep_old_file
     todo = [status for status in statuses
@@ -5192,8 +5966,10 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
                    and status.status == ST_UP_TO_DATE]
     for status in retire_only:          # the JXL is there: only the old TIFF copy goes
         try:
-            _retire_file(dest, stamp, status.replaces, catalog, log, keep_old_file)
+            with _ctrl_c_after():       # the move (or delete) and the rows go together
+                kind = _retire_replaced(status, dest, stamp, catalog, log, keep_old_file)
             info["retired"] += 1
+            info["retired_deleted"] += kind == "jpeg_proven"
         except OSError as exc:
             info["errors"] += 1
             log.log(f"ERROR retiring {status.replaces}: {exc}")
@@ -5301,8 +6077,10 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
             # own, never a failed conversion)
             retiring = time.monotonic()
             try:
-                _retire_file(dest, stamp, status.replaces, catalog, log, keep_old_file)
+                with _ctrl_c_after():
+                    kind = _retire_replaced(status, dest, stamp, catalog, log, keep_old_file)
                 info["retired"] += 1
+                info["retired_deleted"] += kind == "jpeg_proven"
             except OSError as exc:
                 info["errors"] += 1
                 log.log(f"ERROR retiring {status.replaces}: {exc}")
@@ -5561,7 +6339,8 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_cop
             for name in ("undone", "errors"):
                 convert_info.setdefault(name, 0)
             _retire_undone(statuses, copied_keys, dest, stamp, catalog, log,
-                           keep_old_file or _keep_old_file, convert_info)
+                           keep_old_file or _keep_old_file, convert_info,
+                           bool(getattr(args, "update_changed", False)))
             if _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file,
                             convert_info):
                 raise KeyboardInterrupt
@@ -5608,12 +6387,14 @@ _CATEGORY_LABELS = {
 
 def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_paths,
                    dest_error=None, extra_lines=(), freed=0, catalog_note="", orphan_lines=(),
-                   lists=()):
+                   lists=(), space_block=(), replace_label=None):
     """The summary a person reads before the question (v0.14.0-rc4, PENDENCIAS
     of 16/11: tables of label | files | size, one fact per line, counts with
     separators, TB from 1,000 GB on, the lists named once at the end, the space
     last). `extra_lines`: more rows of "This run"; `orphan_lines`: rows of the
-    orphans' block; `lists`: (file name, what it holds) of the CSVs."""
+    orphans' block; `lists`: (file name, what it holds) of the CSVs;
+    `space_block`: what is set aside in the backup (261126), after the Space
+    line; `replace_label`: the label of the changed files' row."""
     new = [status for status in statuses if status.status == ST_NEW]
     changed = [status for status in statuses if status.status == ST_CHANGED
                and not getattr(status, "held", None)]      # a held one has its own row
@@ -5653,7 +6434,7 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
             lines.append(_summary_row(f"  {label}", len(selected),
                                       sum(s.planned.size for s in selected)))
     lines.append(_summary_row(
-        "replace (changed; the old copy to versions\\)", len(changed),
+        replace_label or "replace (changed; the old copy to versions\\)", len(changed),
         sum(s.planned.size for s in changed) if changed else None,
         f"{_num(len(auto))} of them edit settings/sidecars, updated by themselves" if auto
         else ""))
@@ -5730,6 +6511,7 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
         freed_note = f" + {_gb(freed)} freed by this run" if freed else ""
         lines.append(f"Space: need {_gb(needed)}, free {_gb(free)}{freed_note}, "
                      f"margin {_gb(margin)} -> " + ("fits" if fits else "DOES NOT FIT"))
+    lines.extend(space_block)
     return lines
 
 
@@ -5869,6 +6651,29 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                          "take that link or junction out of the backup (the backup never "
                          "writes one), then run the mirror again")
         return 2
+    # what the backup holds set aside, for how long (261126, keep-days): the
+    # stores this run owns (it deletes in them by age, or when space is short)
+    # and the others it only shows -- the same disk
+    listing_started = time.monotonic()
+    own_stores = mirror.stores() if mirror is not None else _backup_stores(args)
+    other_stores = _backup_stores(None) if mirror is not None else _mirror_stores()
+    scans = _scan_stores(dest, own_stores, other_stores) if dest_error is None else []
+    log.log(f"SET ASIDE: the folders listed in {time.monotonic() - listing_started:.1f} s "
+            f"({_num(sum(run.files for scan in scans for run in scan.runs))} files)")
+    owned_scans = [scan for scan in scans if scan.owned]
+    expired = [(scan, run) for scan in owned_scans for run in _expired_runs(scan)]
+    at_once = {}
+    zero_runs = []              # (scan, run) already kept in a store of 0 days: typed (SF1)
+    if mirror is None:
+        counts = _set_aside_counts(statuses, args)
+        at_once = {scan.store.kind: counts[scan.store.kind] for scan in owned_scans
+                   if scan.store.days == 0 and counts.get(scan.store.kind)}
+        zero_runs = [(scan, run) for scan in owned_scans
+                     for run in _zero_day_runs(scan, [run for scan_, run in expired
+                                                      if scan_ is scan])]
+        # a normal backup frees what expires in this run before it copies
+        freed_by_age = sum(run.nbytes for _scan, run in expired)
+        fits = dest_error is None and (needed == 0 or needed <= free + freed_by_age - margin)
     if rows and args.detect_moves:
         candidates = _find_move_candidates(statuses, rows, dest, planned.sources)
     prefixes = _source_prefixes(planned)
@@ -5934,18 +6739,38 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     # this run converts -- a changed one waits for --update-changed (rc6 review, S3)
     retire = [status for status in converts if status.replaces
               and (status.status == ST_UP_TO_DATE or _will_copy(status, args))]
-    if retire:
-        where = "the mirror's trash" if mirror is not None else "versions\\"
-        extra_lines.append(_summary_row(f"copies their JXL replaces (to {where})", len(retire)))
+    retire_tiff = [status for status in retire if status.planned.convert != JPEG_CONVERT]
+    retire_jpeg = [status for status in retire if status.planned.convert == JPEG_CONVERT]
+    versions_where = ("the mirror's trash" if mirror is not None
+                      else "deleted at once" if "versions" in at_once else "versions\\")
+    if retire_tiff:
+        where = ("the mirror's trash" if mirror is not None
+                 else "deleted at once" if "originals" in at_once
+                 else f"{ORIGINALS_FOLDER}\\")
+        extra_lines.append(_summary_row(f"copies their JXL replaces (to {where})",
+                                        len(retire_tiff)))
+    if retire_jpeg:
+        extra_lines.append(_summary_row(
+            "JPEG copies their JXL replaces", len(retire_jpeg), None,
+            f"deleted when their JXL gives the same bytes back (else to {versions_where})"))
     # the JXL groups the manifest no longer wants, whose plain copy will be there
-    undoing = [status for status in statuses if status.undoes
+    undoing = [status for status in statuses if status.undoes and not status.undo_older
                and (status.status == ST_UP_TO_DATE or _will_copy(status, args))]
     if undoing:
-        where = "the mirror's trash" if mirror is not None else "versions\\"
         extra_lines.append(_summary_row(
-            f"JXL replaced by their plain copy (to {where})",
+            f"JXL replaced by their plain copy (to {versions_where})",
             sum(len(status.undoes) for status in undoing),
             sum(rows_by_key[key].size for status in undoing for key in
+                (rel.casefold() for rel in status.undoes) if key in rows_by_key)))
+    # ... and those of an older version of the file: old copies (SF1)
+    older = [status for status in statuses if status.undoes and status.undo_older
+             and (status.status == ST_UP_TO_DATE or _will_copy(status, args))]
+    if older:
+        label = (f"JXL of an older version (to {versions_where})" if args.update_changed
+                 else "JXL of an older version: waits for --update-changed")
+        extra_lines.append(_summary_row(
+            label, sum(len(status.undoes) for status in older),
+            sum(rows_by_key[key].size for status in older for key in
                 (rel.casefold() for rel in status.undoes) if key in rows_by_key)))
     if getattr(args, "adopt_by_hash", False):
         adopting = [status for status in statuses if status.adopt_sha256 is not None]
@@ -6003,12 +6828,17 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                       "the exports without a matching original"))
     lists.append((os.path.basename(log_paths["log"]),
                   "the log: links, folders skipped by name, errors"))
-    freed = 0
+    freed = 0 if mirror is not None else freed_by_age
     mirror_lines = []
     if mirror is not None:
         mirror_lines, freed = mirror.review(planned, statuses, rows, prefixes, tentative_orphans,
-                                            tentative_used, listings, dest, log, possible)
+                                            tentative_used, listings, dest, log, possible,
+                                            store_scans=owned_scans)
         fits = dest_error is None and (needed == 0 or needed <= free + freed - margin)
+    space_block = (_space_block_lines(dest, free, needed, margin, scans, args.dry_run)
+                   if dest_error is None else [])
+    replace_label = ("replace (changed; the old copy deleted at once: VERSIONS_KEEP_DAYS = 0)"
+                     if "versions" in at_once else None)
     orphans_blocked = (f"nothing moved: {_num(len(planned.errors))} errors in the plan of this "
                        f"run (a source that cannot be read is not one that is gone)")
     if args.move_orphans and args.dry_run:
@@ -6020,7 +6850,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                 f"{os.path.join(dest, CATALOG_FOLDER, ORPHANS_FOLDER, stamp)}")
     for line in _summary_lines(args, planned, statuses, needed, free, margin, fits, log_paths,
                                dest_error, extra_lines, freed, catalog_note, orphan_lines,
-                               lists):
+                               lists, space_block, replace_label):
         log.out(line)
     # the mirror's own block comes last: it is what is on the screen when the
     # question is asked
@@ -6068,6 +6898,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
         print(message, file=sys.stderr)
         log.log(message)
         return 2
+    room_runs = []                      # (_StoreScan, _StoreRun) a person chose to delete
     if not fits:
         freed_note = f" + {_gb(freed)} freed by this run" if freed else ""
         message = (f"Not enough space: need {_gb(needed)}, free {_gb(free)}{freed_note}, "
@@ -6080,23 +6911,131 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                           f"may be files moved inside the backup (possible moves, confirmed "
                           f"by hash when copying), which would need no new space")
         message += moves_note
-        if mirror is not None:
-            for line in mirror.space_lines(needed, free + freed, margin):
-                log.out(line)
+        # room on demand (261126): what this run owns set aside in the backup,
+        # deleted for good only by a person who chose it and typed the number
+        missing = needed - (free + freed - margin)
+        drive = os.path.splitdrive(dest)[0] or dest
+        options = _room_options(owned_scans, missing)
+        for line in _room_lines(options, missing, free + freed, drive,
+                                "the mirror" if mirror is not None else "the backup"):
+            log.out(line)
+        if options:
+            path = log.csv("_free_space.csv", ["option", "run_folder", "taken_out", "files",
+                                               "size"],
+                           [(f"{index}) {option.label}", run.path, _day_text(run.when), run.files,
+                             run.nbytes)
+                            for index, option in enumerate(options, 1) for run in option.runs])
+            log.out(f"     What each option deletes: {os.path.basename(path)}")
+            log.out(f"       in {os.path.dirname(path)}")
         if args.dry_run:
             print(f"WARNING: would not fit ({_gb(needed)} needed, {_gb(free)} free{freed_note}, "
                   f"{_gb(margin)} margin{moves_note})")
             log.log("WARNING: would not fit")
             return read_errors
-        if mirror is None or not mirror.free_space(needed, free + freed, margin):
+        can_ask = (not mirror.unattended) if mirror is not None else not args.yes
+        held = "; ".join(f"{_room_label(scan)} {_gb(sum(run.nbytes for run in scan.runs))}"
+                         for scan in owned_scans if scan.runs)
+        why = todo = None
+        if not options:
+            why = (f"there is not enough space on {drive} ({_gb(missing)} missing), and nothing "
+                   f"set aside in the backup can make room")
+            todo = f"make room on {drive} or choose a smaller mode"
+        elif not can_ask:
+            why = (f"there is not enough space on {drive} ({_gb(missing)} missing), and nothing "
+                   f"is deleted for good without a person at the console (set aside: {held})")
+            todo = ("run the mirror by hand (photo_backup.py -> [8] Mirror) and choose what to "
+                    "delete for good, or empty the trash ([8] -> [4], or --empty-trash)"
+                    if mirror is not None else
+                    "run the backup by hand (without --yes) and choose what to delete for good; "
+                    "the menu's [9] Backup space (or --space-report) shows what is set aside")
+        else:
+            picked, why = _choose_room(options, missing, log)
+            if picked:
+                room_runs = [(option.scan, run) for option in picked for run in option.runs]
+            else:
+                todo = "make room another way, then run again"
+        if why is not None:
             print(message, file=sys.stderr)
             log.log(message)
+            log.out(f"Not enough space: {why}. What to do: {todo}.")
+            if mirror is not None:
+                mirror._stop(why, todo)
             return 2
+        if mirror is not None:
+            mirror.purge_runs = [(scan.store.folder, run) for scan, run in room_runs]
+    # a store of this run that leads somewhere else (a link, a junction) is
+    # never written, moved into or deleted in (the mirror's review stops it)
+    # -- and so is every other folder of CATALOG_FOLDER this run writes into:
+    # orphans\ (--move-orphans), tools\ (KEEP_TOOLS_IN_BACKUP); the mirror
+    # checks its own in its review (SF1 of the final review 261126)
+    store_stop = None
+    if mirror is None and dest_error is None:
+        written = [scan.store.folder for scan in owned_scans]
+        if args.move_orphans:
+            written.append(ORPHANS_FOLDER)
+        if KEEP_TOOLS_IN_BACKUP:
+            written.append(TOOLS_FOLDER)
+        store_stop = next((problem for problem in (_store_problem(dest, folder)
+                                                   for folder in written) if problem), None)
+    # 0 days: what this run sets aside (at most: at_once) and what is already
+    # kept in such a store (zero_runs) are deleted only after the typed
+    # number; --yes stops (SF1 of the review 261126)
+    at_once_lines = []
+    zero_files = sum(run.files for _scan, run in zero_runs)
+    typed_total = sum(at_once.values()) + zero_files
+    zero_kinds = list(at_once) + [kind for kind in dict.fromkeys(scan.store.kind
+                                                                 for scan, _run in zero_runs)
+                                  if kind not in at_once]
+    if typed_total:
+        names = " and ".join(f"{_KEEP_SETTING[kind]} = 0" for kind in zero_kinds)
+        parts = []
+        if at_once:
+            parts.append(f"Up to {_num(sum(at_once.values()))} files that leave the backup's "
+                         f"tree in this run (old copies of changed files, JXL replaced, TIFF "
+                         f"copies a JXL replaced) are DELETED at once, not kept.")
+        if zero_runs:
+            folders = " and ".join(dict.fromkeys(
+                f"{os.path.join(CATALOG_FOLDER, scan.store.folder)}\\" for scan, _run in zero_runs))
+            days = sorted(_day_text(run.when) for _scan, run in zero_runs)
+            parts.append(f"The {_num(zero_files)} file{'' if zero_files == 1 else 's'} already "
+                         f"kept in {folders} (taken out "
+                         f"{days[0] if len(days) == 1 else 'from ' + days[0] + ' to ' + days[-1]})"
+                         f" are DELETED now.")
+        at_once_lines = ["", f"!! NOT KEPT: {names}"] + [f" {line}" for line in _wrap_text(
+            " ".join(parts) + " They can NOT be recovered later.", 78)]
     if args.dry_run:
+        if store_stop:
+            print(f"WARNING: {store_stop}; a real run stops")
+        if typed_total:
+            log.out(f"A real run asks you to type the number of files deleted at once "
+                    f"({_num(typed_total)} files"
+                    + (f", {_num(zero_files)} of them already kept" if zero_files else "")
+                    + "); with --yes it stops.")
         log.log("dry run: nothing copied")
         return read_errors
+    if store_stop:
+        message = f"{store_stop}. Make it a plain folder again (or move it away), then run again."
+        print(message, file=sys.stderr)
+        log.log(f"ERROR {message}")
+        return 2
     if mirror is not None and not mirror.confirm():
         return 2
+    if typed_total:
+        total = typed_total
+        if args.yes:
+            message = (f"{' and '.join(_KEEP_SETTING[kind] for kind in zero_kinds)} = 0: "
+                       f"{_num(total)} files would be deleted at once"
+                       + (f" ({_num(zero_files)} of them already kept in the backup)"
+                          if zero_files else "")
+                       + ", and that needs a person who types the number (not --yes). Nothing "
+                         "was changed.")
+            print(message, file=sys.stderr)
+            log.log(f"ERROR {message}")
+            return 2
+        if not _typed_confirmation(at_once_lines, total, log):
+            print("Aborted.")
+            log.log("Aborted: deleting at once was not confirmed")
+            return 2
     if not args.yes:
         try:
             answer = input("Proceed? [y/N, Enter = no] " if mirror is None
@@ -6134,7 +7073,56 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     mirror_problems = False
     convert_info = {}
     adopt_errors = 0
+    purge_problems = 0
+    keeper = _SetAside(at_once) if mirror is None else None
+    # the fit counted on what this run deletes before it copies (expired run
+    # folders, what a person chose, the mirror's removals): the disk is asked
+    # again after deleting, and the run stops before the first byte when that
+    # did not free enough (MF2 of the review 261126)
+    fit_counted_on_deleting = bool(room_runs) or (needed > 0 and needed > free - margin)
     try:
+        if mirror is None and (expired or room_runs):
+            # 261126: the run folders of versions\ and originals\ past their
+            # days, and what a person chose to delete to make room -- right
+            # after the question, before the first copy
+            purged = [0, 0]
+            seen = set()
+            try:
+                for scan, run in expired + room_runs:
+                    if run.path in seen:
+                        continue
+                    if catalog.write_failed:
+                        break               # the rest stays (SF6)
+                    seen.add(run.path)
+                    files, nbytes, problems = _purge_store_run(run, dest, scan.store.folder, log,
+                                                               catalog)
+                    purged[0] += files
+                    purged[1] += nbytes
+                    purge_problems += problems
+            except KeyboardInterrupt:
+                with _ctrl_c_after():
+                    catalog.commit()
+                log.log("INTERRUPTED while deleting what was set aside")
+                interrupted = True
+                return 130
+            deleted_line = (f"Set aside in the backup, deleted for good: {_num(purged[0])} files "
+                            f"({_gb(purged[1])})"
+                            + (f"; {_num(purge_problems)} problems (see the log)"
+                               if purge_problems else ""))
+            if catalog.write_failed:
+                try:
+                    catalog.commit()
+                except sqlite3.Error:
+                    pass
+                log.out(deleted_line)
+                log.out(f"ERROR the catalog could not be written ({catalog.write_failed}): the "
+                        f"deletion stopped, the rest stays; nothing was copied. Run again when no "
+                        f"other program holds {catalog.path}.")
+                return 1
+            catalog.commit()
+            log.out(deleted_line)
+        if mirror is None and fit_counted_on_deleting and not _fits_now(dest, needed, margin, log):
+            return 2
         _ensure_backup_id(dest, log)
         for line in _keep_tools(dest, log, getattr(args, "jxlphoto", None) or JXLPHOTO):
             log.out(line)
@@ -6162,10 +7150,38 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                 # what was removed before Ctrl+C, and where it is (finding 6)
                 mirror.finish(log, 0, 0, adopt_errors + move_errors, interrupted=True)
                 return 130
+            failed = getattr(mirror, "catalog_failed", None)
+            if failed:
+                # its purge met a catalog it cannot write: nothing more left
+                # the backup; the box says what did (SF2 of the final review)
+                why = f"the catalog could not be written ({failed})"
+                todo = f"run the mirror again when no other program holds {catalog.path}"
+                if mirror.changed_something:
+                    mirror.finish(log, 0, 0, adopt_errors + move_errors, stopped=why, todo=todo)
+                else:
+                    mirror._stop(why, todo)
+                return 2
+            # what the copy itself frees later (a replaced copy deleted at once)
+            # is not on the disk yet: only that is still counted
+            later = mirror.freed_during_copy() if hasattr(mirror, "freed_during_copy") else 0
+            if fit_counted_on_deleting and not _fits_now(dest, needed - later, margin, log):
+                why = "there is still not enough space after deleting what was set aside"
+                todo = "make room another way, then run the mirror again"
+                if mirror.changed_something:
+                    # files left the backup before it stopped: the box says
+                    # what and where they are (SF2 of the review 261126)
+                    mirror.finish(log, 0, 0, adopt_errors + move_errors, stopped=why)
+                else:
+                    mirror._stop(why, todo)
+                return 2
+        if mirror is not None:
+            old_copy, keep_old_file = mirror.old_copy, mirror.keep_old_file
+        else:
+            old_copy = keeper.old_copy if "versions" in at_once else None
+            keep_old_file = keeper
         done, done_bytes, error_count, interrupted = _copy_all(
-            args, statuses, dest, stamp, catalog, log, stop_info,
-            mirror.old_copy if mirror is not None else None,
-            mirror.keep_old_file if mirror is not None else None, convert_info)
+            args, statuses, dest, stamp, catalog, log, stop_info, old_copy, keep_old_file,
+            convert_info)
         log.log(f"moved {moved} files / {_gb(moved_bytes)}")
         log.out(f"copied {done} files / {_gb(done_bytes)}; {error_count} errors")
         if any(convert_info.get(name) for name in ("converted", "failed", "retired")):
@@ -6175,16 +7191,31 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                     + (f" ({made})" if made else "")
                     + f", {_gb(convert_info['bytes_in'])} -> {_gb(convert_info['bytes_out'])}")
             if convert_info["retired"]:
+                deleted = convert_info.get("retired_deleted", 0)
+                kept = convert_info["retired"] - deleted
+                parts = []
+                if kept:
+                    parts.append(f"{_num(kept)} to "
+                                 + ("the trash" if mirror is not None else
+                                    f"{ORIGINALS_FOLDER} (a TIFF) or versions (a JPEG)"))
+                if deleted:
+                    parts.append(f"{_num(deleted)} JPEG deleted: their JXL gives the same "
+                                 f"bytes back")
                 log.out(f"  {_num(convert_info['retired'])} copies in the backup replaced by "
-                        f"their JXL (to {'the trash' if mirror is not None else 'versions'})")
+                        f"their JXL ({'; '.join(parts)})")
             if convert_info["failed"]:
                 log.out(f"  {_num(convert_info['failed'])} copied as they are: the conversion "
                         f"failed (CONVERT FAILED in the log)"
                         + (f"; one that fails in {CONVERT_GIVE_UP_AFTER} runs in a row is not "
                            f"tried again" if CONVERT_GIVE_UP_AFTER > 0 else ""))
         if convert_info.get("undone"):
+            older = convert_info.get("undone_older", 0)
             log.out(f"  {_num(convert_info['undone'])} JXL in the backup replaced by their plain "
-                    f"copy (to {'the trash' if mirror is not None else 'versions'})")
+                    f"copy (to {'the trash' if mirror is not None else 'versions'})"
+                    + (f"; {_num(older)} of them of an older version of the file" if older else ""))
+        if convert_info.get("undo_waits"):
+            log.out(f"  {_num(convert_info['undo_waits'])} JXL of an older version of their file "
+                    f"stay: --update-changed sets them aside (UNDO WAITS in the log)")
         if convert_info.get("reconvert_failed"):
             log.out(f"  {_num(convert_info['reconvert_failed'])} TIFF could not be made again "
                     f"(RECONVERT FAILED in the log): their JXL stays as it was")
@@ -6228,6 +7259,14 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
         # outside the copy itself (_copy_all has its own): recording the files
         # already there, the moves, the orphans
         log.out(f"ERROR the catalog could not be read or written ({exc}): {catalog.path}")
+        if (mirror is not None and not done and getattr(mirror, "changed_something", False)
+                and not getattr(mirror, "finished", True)):
+            # files left the backup before it stopped: the mirror's box says
+            # what and where (SF2 of the final review 261126)
+            mirror.finish(log, 0, 0, adopt_errors + move_errors,
+                          stopped=f"the catalog could not be read or written ({exc})",
+                          todo=f"run the mirror again when no other program holds "
+                               f"{catalog.path}")
         return 1 if done or moved else 2
     finally:
         catalog.close()
@@ -6237,7 +7276,107 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             _tell(STOPPED_SAYING)
     return 1 if (error_count or move_errors or adopt_errors or planned.errors or stop_info
                  or mirror_problems or convert_info.get("failed")
-                 or convert_info.get("errors")) else 0
+                 or convert_info.get("errors") or purge_problems) else 0
+
+
+def _space_report(args):
+    """--space-report (261126): what the backup at --dest holds set aside --
+    old versions, TIFF originals, the mirror's trash --, run folder by run
+    folder, when each is deleted and what deleting it would free. Reads only
+    the destination: no source, no plan, no catalog; nothing is opened for
+    writing there (the log is in LOG_DIR). Exit 0; 1 when a folder cannot be
+    read; 2 when the destination is not there."""
+    dest = os.path.abspath(args.dest)
+    stamp = time.strftime("%y%m%d_%H%M%S")
+    try:
+        log = _Logger(os.path.join(LOG_DIR, f"{stamp}_space"))
+    except OSError as exc:
+        print(f"cannot write the log directory {LOG_DIR}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        log.log("selective_backup " + __version__ + " --space-report")
+        if not os.path.isdir(_io(dest)):
+            log.out(f"Not a folder that exists: {dest}")
+            return 2
+        try:
+            free = shutil.disk_usage(_io(dest)).free
+        except OSError as exc:
+            log.out(f"Destination not available: {dest} ({exc.strerror or exc})")
+            return 2
+        started = time.monotonic()
+        scans = _scan_stores(dest, _backup_stores(args), _mirror_stores())
+        log.log(f"SET ASIDE: the folders listed in {time.monotonic() - started:.1f} s")
+        drive = os.path.splitdrive(dest)[0] or dest
+        lines = [_program_name(), f"Backup space of {dest} (read only: nothing is changed)",
+                 f"Free now on {drive} {_gb(free)}", ""]
+        problems = 0
+        total_all = 0
+        after = []
+        for scan in scans:
+            store = scan.store
+            who = "backup" if store.owner == "backup" else "mirror"
+            label = _room_label(scan)
+            root = _store_root(dest, store.folder)
+            lines.append(f"{label}  ({root})   kept: {_days_text(store.days)}"
+                         + ("" if store.owner == "backup" else "   (the mirror deletes it)"))
+            if scan.problem:
+                problems += 1
+                lines.append(f"  CANNOT BE READ: {scan.problem}")
+                lines.append("")
+                continue
+            if not scan.runs:
+                lines.append("  (empty)" if scan.exists else "  (none yet)")
+            else:
+                lines.append(f"  {'taken out on':<21}{'deleted on':<32}{'days left':>10}"
+                             f"{'files':>10}{'size':>11}")
+                expired = {run.name for run in _expired_runs(scan)}
+                days = store.days
+                for run in scan.runs:
+                    if days is None:
+                        until, left = "only when space is short", ""
+                    else:
+                        day = run.when + timedelta(days=days)
+                        left_days = (day.date() - datetime.now().date()).days
+                        until = f"{day:%Y-%m-%d}"
+                        left = str(max(left_days, 0))
+                        if run.name in expired:
+                            until += (f" (expires at the next {who} run"
+                                      + (", typed" if days == 0 else "") + ")")
+                    lines.append(f"  {run.when:%Y-%m-%d %H:%M:%S}  {until:<32}{left:>10}"
+                                 f"{_num(run.files):>10}{_gb(run.nbytes):>11}")
+                files = sum(run.files for run in scan.runs)
+                nbytes = sum(run.nbytes for run in scan.runs)
+                total_all += nbytes
+                lines.append(f"  {'total':<63}{_num(files):>10}{_gb(nbytes):>11}")
+                lines.append(f"  free after deleting it: {_gb(free + nbytes)}")
+                after.append(f"{label} {_gb(free + nbytes)}")
+            for path in scan.foreign[:SUMMARY_INSIDE_NAMES]:
+                lines.append(f"  not made by a run (never touched): {path}")
+            lines.append("")
+        lines.append("Free after deleting: " + (" · ".join(after + [f"all {_gb(free + total_all)}"])
+                                                if after else "nothing is set aside"))
+        for line in lines:
+            log.out(line)
+        return 1 if problems else 0
+    finally:
+        log.close()
+
+
+def _fits_now(dest, needed, margin, log):
+    """After deleting what the fit counted on (expired run folders, what a
+    person chose to make room, the mirror's removals): the free space asked
+    again. Still not enough: said, and the run stops before the first byte
+    (no second question; MF2 of the review 261126)."""
+    try:
+        free = shutil.disk_usage(_io(_existing_ancestor(dest))).free
+    except OSError as exc:
+        log.out(f"Destination not available: {dest} ({exc.strerror or exc})")
+        return False
+    if needed <= free - margin:
+        return True
+    log.out(f"Still not enough space after deleting what was set aside: need {_gb(needed)}, "
+            f"free {_gb(free)}, margin {_gb(margin)}. Nothing was copied.")
+    return False
 
 
 @dataclass
@@ -6705,8 +7844,8 @@ def _build_parser():
     parser = argparse.ArgumentParser(
         prog="selective_backup.py",
         description="Selective backup of a photo archive (source is read-only).")
-    parser.add_argument("--source", action="append", required=True, metavar="PATH",
-                        help="folder to back up (repeatable)")
+    parser.add_argument("--source", action="append", default=None, metavar="PATH",
+                        help="folder to back up (repeatable; required but with --space-report)")
     parser.add_argument("--dest", required=True, metavar="PATH",
                         help="destination root")
     parser.add_argument("--base", default=None, metavar="PATH",
@@ -6789,6 +7928,20 @@ def _build_parser():
                         help="abort unless the destination holds this backup ID")
     parser.add_argument("--space-margin-gb", type=float, default=SPACE_MARGIN_GB, metavar="N",
                         help="free space kept on the destination (default: %(default)s)")
+    parser.add_argument("--versions-keep-days", type=_keep_days_arg, default=VERSIONS_KEEP_DAYS,
+                        metavar="N|never",
+                        help="days a run folder of versions\\ is kept, then deleted by the next "
+                             "real run; 0 = not kept (deleted at once, the number of files is "
+                             "typed); never = only when space is short (default: "
+                             "VERSIONS_KEEP_DAYS)")
+    parser.add_argument("--originals-keep-days", type=_keep_days_arg,
+                        default=ORIGINALS_KEEP_DAYS, metavar="N|never",
+                        help="the same for originals\\, the TIFF copies a JXL replaced "
+                             "(default: ORIGINALS_KEEP_DAYS)")
+    parser.add_argument("--space-report", action="store_true",
+                        help="with --dest only: what the backup holds set aside (old versions, "
+                             "TIFF originals, the mirror's trash), when each is deleted and what "
+                             "deleting it would free; reads only the destination")
     parser.add_argument("--dry-run", action="store_true",
                         help="plan and log, copy nothing")
     parser.add_argument("--verify", choices=("quick", "full"), default=None,
@@ -6810,11 +7963,23 @@ def main(argv=None):
         args = parser.parse_args(argv)
         if args.reconvert_older and args.no_convert:
             parser.error("--reconvert-older cannot be combined with --no-convert")
+        if args.space_report and (args.source or args.verify or args.dry_run):
+            parser.error("--space-report takes only --dest (it reads the destination, nothing "
+                         "else)")
+        if not args.space_report and not args.source:
+            parser.error("the following arguments are required: --source")
     except SystemExit as exc:
         code = exc.code
         if code is None:
             return 0
         return int(code) if isinstance(code, int) else 2
+    if args.space_report:
+        errors = _store_settings_errors()
+        if errors:
+            for error in errors:
+                print(error, file=sys.stderr)
+            return 2
+        return _space_report(args)
     errors = _validate_usage(args)
     if errors:
         for error in errors:

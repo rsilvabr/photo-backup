@@ -396,7 +396,11 @@ def _backend_args(parsed, rows, dest):
              "--unselected", "skip",
              "--export-formats", parsed.export_formats,
              "--verify-copy", parsed.verify_copy,
-             "--space-margin-gb", str(parsed.space_margin_gb)]
+             "--space-margin-gb", str(parsed.space_margin_gb),
+             "--versions-keep-days", sb._keep_days_text(
+                 getattr(parsed, "versions_keep_days", sb.VERSIONS_KEEP_DAYS)),
+             "--originals-keep-days", sb._keep_days_text(
+                 getattr(parsed, "originals_keep_days", sb.ORIGINALS_KEEP_DAYS))]
     if parsed.update_changed:
         argv.append("--update-changed")
     if getattr(parsed, "no_convert", False):
@@ -621,6 +625,14 @@ def build_parser():
                         help="free space kept on the destination (default: %(default)s)")
     parser.add_argument("--export-formats", default=sb.EXPORT_FORMATS, metavar="SPEC",
                         help="all, a>b>c fallback, or a+b multiple (default: %(default)s)")
+    parser.add_argument("--versions-keep-days", type=sb._keep_days_arg,
+                        default=sb.VERSIONS_KEEP_DAYS, metavar="N|never",
+                        help="days a run folder of versions\\ is kept; 0 = not kept (typed); "
+                             "never = only when space is short (default: VERSIONS_KEEP_DAYS)")
+    parser.add_argument("--originals-keep-days", type=sb._keep_days_arg,
+                        default=sb.ORIGINALS_KEEP_DAYS, metavar="N|never",
+                        help="the same for originals\\, the TIFF copies a JXL replaced "
+                             "(default: ORIGINALS_KEEP_DAYS)")
     parser.add_argument("--expect-backup-id", default=None, metavar="ID",
                         help="abort unless the destination holds this backup ID")
     parser.add_argument("--jxlphoto", default=sb.JXLPHOTO, metavar="PATH",
@@ -673,6 +685,11 @@ def main(argv=None):
         return 2
     if args.analyze and args.verify:
         print("--verify cannot be combined with --analyze", file=sys.stderr)
+        return 2
+    setting_errors = sb._store_settings_errors()
+    if setting_errors:
+        for error in setting_errors:
+            print(error, file=sys.stderr)
         return 2
     try:
         modes = read_modes(args.modes)

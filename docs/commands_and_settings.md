@@ -59,6 +59,9 @@ selective_backup.py --source PATH [--source PATH ...] --dest PATH [options]
 | `--work-dir PATH` | where the conversions of `--tiff` and `--jpeg` run, jxl-photo's temp files too (default `JXL_WORK_DIR`; empty = the system's temp folder); never inside or above a source or the backup, exit 2 *(v0.14.0-rc5)* |
 | `--expect-backup-id ID` | abort (exit 2) unless the destination holds this backup ID; also applies to `--verify` and `--dry-run` |
 | `--space-margin-gb N` | free space kept on the destination, in GB (default `20.0`) |
+| `--versions-keep-days N\|never` | days a run folder of `versions\` is kept, then deleted by the first real run on or after that day; `0` = not kept (deleted at once, the number of files is typed; `--yes` stops); `never` = only when space is short (default `VERSIONS_KEEP_DAYS`; [what the backup sets aside](reruns_and_moves.md#what-the-backup-sets-aside-and-for-how-long)) |
+| `--originals-keep-days N\|never` | the same for `originals\`, the TIFF copies a JXL replaced (default `ORIGINALS_KEEP_DAYS`) |
+| `--space-report` | with `--dest` only: what the backup holds set aside (old versions, TIFF originals, the mirror's trash), run folder by run folder, when each is deleted and what deleting it would free; reads only the destination (exit 0; 1 when a folder cannot be read) |
 | `--dry-run` | plan, print the summary and write the logs/CSVs; copy nothing |
 | `--verify {quick,full}` | verify an existing backup; no copy ([verifying.md](verifying.md)) |
 | `--max-gb N` | with `--verify full`: verify at most N GB, oldest verification first (default `0.0` = everything; [Rolling verify](verifying.md#rolling-verify)) |
@@ -111,6 +114,9 @@ default everywhere — the menu reads them from there too.
 | `TEMP_SUFFIX` | `.pbtmp` | in-progress copy suffix |
 | `DEST_CHECK_AFTER_ERRORS` | `20` | backup: after this many failed copies in a row, the destination is tested (a file of its own, `*.pbtmp` in `CATALOG_FOLDER`, written and removed); when the test fails the backup stops (`0` = never test) *(v0.12.1)* |
 | `CATALOG_FOLDER` | `_photo_backup` | catalog and versions folder under the destination |
+| `ORIGINALS_FOLDER` | `originals` | under `CATALOG_FOLDER`: the TIFF copies a JXL replaced, one folder per run (listed in the catalog's `originals` table) |
+| `VERSIONS_KEEP_DAYS` | `None` | days a run folder of `versions\` is kept (`--versions-keep-days`); `None` = never (only when space is short), `0` = not kept (deleted at once, typed; what is already there too) ([what the backup sets aside](reruns_and_moves.md#what-the-backup-sets-aside-and-for-how-long)) |
+| `ORIGINALS_KEEP_DAYS` | `None` | the same for `originals\` (`--originals-keep-days`) |
 | `PROGRESS_EVERY_S` | `5.0` | console progress interval: the copy's, the conversion's, the full verify's and the restore's lines, and while a plan reads the sources (a dry-run of a whole archive takes minutes), the folders and files read so far — that last one on a console only, never in a log *(v0.14.0-rc4)* |
 | `PROGRESS_RECENT_S` | `600.0` | the progress shows the speed over the whole run and over these last seconds, each with its ETA (`whole run 85 MB/s (ETA 2h10m), last 10 min 40 MB/s (ETA 3h05m)`): when the two disagree, the pace is changing (small files to big ones, a disk slowing down), and the recent one is usually nearer; `ETA ?` = nothing finished in that time. While a batch of small files goes to the disk it says so instead of repeating itself *(v0.14.0-rc4; both ETAs and 10 min: rc6)* |
 | `AUTO_UPDATE` | `True` | changed edit settings/sidecars are updated without `--update-changed` (`--no-auto-update` turns it off) |

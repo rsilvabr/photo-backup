@@ -191,8 +191,8 @@ as it is leaves as above.
 Its source edited later is a **changed file**, as any other original: the
 summary counts it under "replace (changed)", and only `--update-changed` (the
 mirror always) converts the new version or copies it as it is; the old copy
-keeps its name until the new one is on the disk, then goes to `versions\` (the
-mirror: its trash).
+keeps its name until the new one is on the disk, then goes to `originals\` (a
+TIFF, converted or not; a JPEG: `versions\`; the mirror: its trash).
 
 ## How the conversions run: serve mode
 
@@ -291,10 +291,16 @@ The reverse also happens by itself: when the manifest's `Tiff` or `Jpeg` column 
 leaves (`versions\`, a mirror: its trash) only after that copy is in place and only
 with proof that it is the same file: the SHA-256 of the plain copy (the bytes this
 run copied, its row's, or the backup file read) must be the one the JXL was made from
-(`UNDONE` in the log). A copy that failed, a changed copy that waits for
-`--update-changed`, a source that changed since the JXL was made, or a plain copy of
-another program with other bytes keeps the JXL (`UNDO SKIPPED` in the log; its JXL is
-never an orphan).
+(`UNDONE` in the log). A JXL proven to be of an older version of the file (its
+source had another size, or the bytes of the source -- copied by this run, adopted,
+or our row -- differ) is the old copy of a changed file: with `--update-changed` (the
+mirror: always) it goes to `versions\` as an old version (`UNDONE (older version)`),
+without it it waits (`UNDO WAITS`; the summary: *JXL of an older version: waits for
+--update-changed*). A copy that failed, a changed copy that waits for
+`--update-changed`, or a plain copy of another program with other bytes (no proof of
+which one is current) keeps the JXL (`UNDO SKIPPED` in the log; its JXL is never an
+orphan). A JXL that stays competes with the plain copy in a restore: `--only` on the
+plain file, or `--convert-back none`, gets the current one.
 
 ## The conversion off: a trip with a slow computer
 
@@ -314,21 +320,38 @@ nothing in this run: no jxl-photo, no djxl, no work folder needed.
   `versions\` (the mirror: to its trash).
 - **A second run with it** finds those copies current and leaves them.
 - **Back home, a run with the conversion on** converts what was copied as it
-  is, and the copy goes to `versions\` (the mirror: its trash) once its JXL is
+  is, and the copy goes to `originals\` (the mirror: its `trash_originals\`; a
+  JPEG copy is deleted when its JXL gives its bytes back) once its JXL is
   in place — the same as [a backup that already holds the TIFF](#a-backup-that-already-holds-the-tiff-or-the-jpeg).
 
 ## A backup that already holds the TIFF or the JPEG
 
 When a line gets a profile (or `Jpeg=jxl`), the copies already in the backup
 are replaced: the JXL is written first, recorded, and only then the old copy
-leaves — to `versions\` in a normal backup, to the trash in a mirror. That
-holds for a copy this tool wrote and for one another program wrote with the
+leaves *(261126, keep-days)*:
+
+- **a TIFF copy** is a *TIFF original*: to `originals\<run>\` (`ORIGINALS_FOLDER`,
+  kept `ORIGINALS_KEEP_DAYS`, by default never) in a normal backup, to
+  `trash_originals\<run>\` (`MIRROR_ORIGINALS_KEEP_DAYS`) in a mirror; each is
+  listed in the catalog's `originals` table (where it is now, the name it had, its
+  size, date and SHA-256), and its row goes when the file is deleted. TIFF copies
+  a JXL replaced before v0.14.0-rc9 were set aside in `versions\` and follow
+  `VERSIONS_KEEP_DAYS`;
+- **a JPEG copy** is deleted when the file itself, read, holds the bytes its JXL
+  gives back (the JXL's `source_sha256`, proven when the JXL was made) and its row
+  does not say other bytes: `DELETED (its JXL gives these bytes back)` in the log.
+  Without that proof it is kept as an old version (`versions\`, the mirror's
+  `trash_versions\`).
+
+How long each is kept, and how to see it: [what the backup sets
+aside](reruns_and_moves.md#what-the-backup-sets-aside-and-for-how-long). The
+replacement holds for a copy this tool wrote and for one another program wrote with the
 source's size and date (FreeFileSync, robocopy): the same files a run adopts as
 its own. A file in the backup that differs from the source is not a copy of it
 and is left where it is.
 
-The summary says how many before the question: `copies in the backup that
-their JXL replaces: N (to versions\)`.
+The summary says how many before the question: `copies their JXL replaces (to
+originals\)` for the TIFF and `JPEG copies their JXL replaces` for the JPEG.
 
 ## Moving from FreeFileSync to the mirror
 
@@ -341,8 +364,9 @@ photo-backup's mirror take that backup over instead: a manifest line with mode
 
 - adopts every file FreeFileSync copied with the source's size and date —
   nothing is copied again;
-- converts the TIFFs and JPEGs and moves FreeFileSync's copies of them to the
-  trash (`MIRROR_KEEP_DAYS` days, then deleted);
+- converts the TIFFs and JPEGs and moves FreeFileSync's TIFF copies to the
+  mirror's `trash_originals\` (`MIRROR_ORIGINALS_KEEP_DAYS` days, then deleted);
+  its JPEG copies, whose JXL gives their very bytes back, are deleted;
 - leaves anything FreeFileSync copied that is not in the plan (a Capture One
   `Cache`, say) where it is: not written by the backup, never removed.
 

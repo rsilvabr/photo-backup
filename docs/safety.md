@@ -8,7 +8,25 @@ added the newer parts. The restore has its own guarantees
 - **The source is READ-ONLY.** No code path opens a source file for writing,
   renames, deletes, touches or changes attributes on anything under a
   `--source`.
-- **Nothing on the destination is ever deleted.** A file whose source changed
+- **The normal backup deletes only four things, each with proof or a person
+  (261126, keep-days):** (a) a run folder of `versions\` or `originals\` past
+  its `VERSIONS_KEEP_DAYS` / `ORIGINALS_KEEP_DAYS` (never when it is `never`,
+  the default); (b) what a person chose when space was short, after
+  typing the number of files; (c) with a `*_KEEP_DAYS` of `0`, a file at the
+  moment it would be set aside and the run folders already in that folder, after
+  the typed number, and never more files of a kind than that number (anything
+  more is moved, and the next run asks for it); (d) a JPEG copy whose JXL gives its very bytes back (the copy
+  itself read: its SHA-256 = the JXL's `source_sha256`). Never in a dry-run,
+  `--verify` or `--analyze`; never without a person for (b) and (c) (`--yes`
+  stops, exit 2, nothing changed); never through a link (a store, `orphans\`
+  with `--move-orphans` or `tools\` that is a link stops a real run before the
+  first byte); only folders named like a run stamp, only by their real
+  path. When the space check counted on what is deleted first, the disk is asked
+  again after deleting it: not enough, exit 2 before the first byte. The
+  mirror's trash folders are the mirror's: the normal backup lists them and
+  never deletes in them. Every run shows what is set aside and when it goes
+  ([what the backup sets aside](reruns_and_moves.md#what-the-backup-sets-aside-and-for-how-long)).
+- **Otherwise nothing on the destination is deleted.** A file whose source changed
   is reported; with `--update-changed` the old copy is MOVED to the versions
   folder first, never overwritten in place. The one exception is a new file
   identical byte for byte to the old one, which takes its place: nothing is
@@ -27,11 +45,18 @@ added the newer parts. The restore has its own guarantees
   the same file is in the backup (UP_TO_DATE, or recorded by this run) and
   holds the very bytes the JXL was made from (its SHA-256 is the catalog's
   `source_sha256`); a failed or skipped copy, or one without that proof, keeps
-  it *(v0.14.0)*. With `--reconvert-older`, a TIFF whose new JXL fails keeps
+  it *(v0.14.0)*. A JXL group proven to be of ANOTHER version of the file (the
+  file's size differs from the one it was made from, or the bytes of the source
+  -- copied by this run, adopted by their hash, or our row -- differ) is the old
+  copy of a changed file: with `--update-changed` (the mirror: always) it goes
+  to the versions folder as an old version, without it it waits (`UNDO WAITS`);
+  a backup file of another program with other bytes proves nothing and keeps
+  it (`UNDO SKIPPED`) *(final review 261126, SF1)*. With `--reconvert-older`, a TIFF whose new JXL fails keeps
   its old JXL while that is still whole in the backup; once part of it has
   left, the TIFF is copied as it is; if that copy fails too, the TIFF has no
   copy in the backup's tree until the next run (the old JXL is in `versions\`
-  or the mirror's trash; a mirror with no trash deleted it), exit 1. With
+  or the mirror's trash; a mirror with no trash, or a normal backup with
+  `VERSIONS_KEEP_DAYS = 0` typed, deleted it), exit 1. With
   `--adopt-by-hash` the backup sets the date of a file it did not write (no
   row, never through a link) to the source's, and only when both were read,
   their SHA-256 is the same and neither changed since; its bytes are never
@@ -180,15 +205,24 @@ exception to "nothing on the destination is ever deleted". Every rule in full:
   with read errors** (without a manifest: in a run with read errors).
 - **Only what the summary showed:** each source is asked again right before;
   what changed reason stays, what appeared later waits for the next run.
-- **Through a trash:** what leaves and the old copy of what is replaced go to
-  `_photo_backup\trash\<run>\` for `MIRROR_KEEP_DAYS` days; nothing in it is
-  deleted before that date except after a typed number (`--empty-trash`, the
-  space question). Only folders named like a run are deleted, by their real
-  path; a link inside is never followed; a trash or `_photo_backup` that is a
-  link stops every real run (exit 2).
+- **Through a trash, three folders (261126, keep-days):** what leaves goes to
+  `_photo_backup\trash\<run>\` for `MIRROR_KEEP_DAYS` days, the old copy of
+  what is replaced to `trash_versions\<run>\` for `MIRROR_VERSIONS_KEEP_DAYS`,
+  a TIFF copy a JXL replaces to `trash_originals\<run>\` for
+  `MIRROR_ORIGINALS_KEEP_DAYS` (a JPEG copy whose JXL gives its very bytes
+  back, the copy read, is deleted); what it did not write goes to `versions\`. Nothing in them
+  is deleted before its date except after a typed number (`--empty-trash`, the
+  shared space chooser). Only folders named like a run are deleted, by their
+  real path; a link inside is never followed; a trash folder, `versions\`,
+  `tools\` or `_photo_backup` that is a link stops every real run (exit 2). A
+  catalog another program holds while the mirror deletes its trash stops it
+  there: nothing more leaves the backup, the `MIRROR STOPPED` box says what was
+  deleted (exit 1).
 - **Typed numbers:** a line over `MIRROR_MAX_DELETE_PERCENT`, a total mirror,
-  deleting for good to make room and emptying the trash need the number of
-  files typed; anything else cancels and changes nothing. `--unattended`
+  deleting for good to make room, a trash folder with `0` days that would
+  delete something, and emptying the trash need the number of files typed; anything else cancels and changes nothing. A
+  folder with `0` days then deletes at once at most the number typed for it;
+  anything more goes to that folder, and the next run asks for it. `--unattended`
   never asks: those cases stop the run (exit 2), nothing changed. The limit
   counts what a line removes **and** what of ours it replaces (a program that
   rewrites every file in place — ransomware — sends every old copy to the
