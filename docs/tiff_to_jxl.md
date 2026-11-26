@@ -246,6 +246,56 @@ says `serve mode`, and its end `jxl-photo serve: N processes for M files`.
   gives the same JPEG back, so a JPEG already kept as JXL stays as it is.
 - **A page missing in the backup**: the group is made again.
 
+## A new jxl-photo
+
+A TIFF kept as JXL stays as it is when jxl-photo is updated: the catalog
+remembers which jxl-photo made each JXL (`jxl-photo 2.30.0`), and a run with
+another one does not touch it. To make them again with the new one, once:
+
+- `--reconvert-older` (`selective_backup.py`, `manifest_backup.py`,
+  `mirror_backup.py`), or the menu's **[4] Settings**, "Make again the TIFF JXL
+  made by an older jxl-photo (next backup only)" (a file beside the menu's own
+  file asks for it; it goes once a backup has really run, exit 0 or 1 — never a
+  dry-run, a verify, an analysis or the mirror's trash commands; a backup whose
+  manifest keeps no TIFF as JXL, `Tiff` = copy, takes it too, with nothing to make
+  again).
+- Every TIFF whose group in the catalog was made by a jxl-photo OLDER than the one
+  this run uses is converted again (test versions come before their release:
+  2.31.0-rc3 < 2.31.0). A group made by the same or a newer jxl-photo is left
+  alone; one whose jxl-photo says no version counts as older (a `RECONVERT` line
+  in the log names it). The new group is made and proven first; only then does the
+  old one leave, to `versions\` (a mirror: its trash).
+- A TIFF that cannot be made again: when the failure came before the old JXL
+  left (jxl-photo failed, its proof failed), the old JXL stays as it was
+  (`RECONVERT FAILED ...: the JXL made by the older jxl-photo stays`, exit 1) and
+  nothing is copied as it is. When it came after the old JXL (or part of it) had
+  left — the new one could not take its name, say a file held open by an
+  antivirus — the TIFF is copied as it is, as for any failed conversion, and what
+  is left of the old JXL follows it to `versions\` (`RECONVERT FAILED ...: the old
+  JXL had already left: the TIFF is copied as it is`, exit 1); the next run
+  converts it again. If the copy as it is fails too (a disk that stopped
+  taking writes), the TIFF has no copy in the backup's tree until the next run:
+  the old JXL is in `versions\` (a mirror: its trash; a mirror with no trash,
+  `MIRROR_KEEP_DAYS = 0`, deleted it).
+- A JPEG's JXL is never made again: it gives the same bytes back, whoever made it.
+- A jxl-photo this program refuses (older than the minimum, or one that does not say
+  its version) is exit 2 before anything is written. Not with `--no-convert`.
+- The summary says how many (`TIFF kept as JXL: made again (--reconvert-older)`, already
+  counted in "to convert"), and the log has one `RECONVERT` line with the versions found.
+- In a mirror each old JXL counts in its line's `MIRROR_MAX_DELETE_PERCENT`: a line
+  with many TIFFs asks for the number of files to be typed, and an unattended mirror
+  stops (exit 2, the menu's request stays for the next run).
+
+The reverse also happens by itself: when the manifest's `Tiff` or `Jpeg` column says
+`copy` for a file whose JXL is in the backup, the plain copy is made and the JXL
+leaves (`versions\`, a mirror: its trash) only after that copy is in place and only
+with proof that it is the same file: the SHA-256 of the plain copy (the bytes this
+run copied, its row's, or the backup file read) must be the one the JXL was made from
+(`UNDONE` in the log). A copy that failed, a changed copy that waits for
+`--update-changed`, a source that changed since the JXL was made, or a plain copy of
+another program with other bytes keeps the JXL (`UNDO SKIPPED` in the log; its JXL is
+never an orphan).
+
 ## The conversion off: a trip with a slow computer
 
 `--no-convert` (*v0.14.0-rc5*; in the menu, `[4] Settings` → "Turn the
@@ -388,6 +438,7 @@ Python 3.12 with libjxl's `cjxl` / `djxl` and ExifTool on the other computer
 | `--jpeg copy\|jxl` | `selective_backup.py`, `mirror_backup.py --source` | the JPEGs of this run: copied as they are (default) or kept as JXL, byte for byte |
 | `--jxlphoto PATH` | every script but the menu | jxl-photo's `jxl_photo.py` or `jxl-photo.exe` (default `JXLPHOTO`) |
 | `--retry-conversions` | `selective_backup.py`, `manifest_backup.py`, `mirror_backup.py` | try again the TIFFs and JPEGs jxl-photo could not convert in `CONVERT_GIVE_UP_AFTER` runs in a row ([above](#a-file-jxl-photo-cannot-convert)) *(v0.14.0-rc6)* |
+| `--reconvert-older` | `selective_backup.py`, `manifest_backup.py`, `mirror_backup.py` | make again every TIFF whose JXL was made by an older jxl-photo ([a new jxl-photo](#a-new-jxl-photo)) *(v0.14.0)* |
 | `--no-convert` | `selective_backup.py`, `manifest_backup.py`, `mirror_backup.py` | the conversion off for this run: what would be converted is copied as it is, the JXL already there stay ([above](#the-conversion-off-a-trip-with-a-slow-computer)); the menu passes it when the conversion is off on this computer *(v0.14.0-rc5)* |
 | `--work-dir PATH` | `selective_backup.py`, `manifest_backup.py`, `mirror_backup.py` | where this run's conversions run (default `JXL_WORK_DIR`; empty = the system's temp folder), checked as that setting is; the menu gives the one it remembers *(v0.14.0-rc5)* |
 | `--convert-back all\|lossless\|none` | `restore_backup.py` | which files kept as JXL come back in their own format (above) |

@@ -51,7 +51,22 @@ from the command line. A future job (e.g. a full mirror) is a new
   leaves the pages already renamed without a row, which the next run moves
   aside), else by a rename —, then a TIFF copy it replaces is retired
   (`replaces` → `keep_old_file`: versions, or the mirror's own); a failure is
-  `_copy_as_is`. `_keep_tools` keeps photo-backup, jxl-photo
+  `_copy_as_is`. A plain copy planned for a file whose JXL group is in the
+  catalog (`Jpeg`/`Tiff` = copy now) carries `undoes`: the group leaves
+  (keep_old_file) only after that copy is in place AND its SHA-256 is the
+  group's `source_sha256` (`_undo_groups` decides what is known while
+  planning, `_retire_undone` / `_undo_proof` after the copy: the digest this
+  run copied, `adopt_sha256`, the row's, else the backup file read; never the
+  source); no proof = `UNDO SKIPPED`, the group stays, its keys planned (review
+  261126, S2). `--reconvert-older` (`_reconvert_older`, `FileStatus.reconvert`)
+  makes again the TIFF JXL of an OLDER jxl-photo (`_version_key`; no version =
+  older, logged; newer or equal: left alone, S1); a new group that fails keeps
+  the old one only while `_old_group_whole` (every file and row still there),
+  else `_copy_as_is` (M1). `--adopt-by-hash` / `ADOPT_BY_HASH` (`_adopt_by_hash`,
+  `_apply_hash_adoptions`, `FileStatus.adopt_sha256`) adopts a backup file
+  without a row only with proof of its bytes; a read-only one whose date would
+  have to change gets `FileStatus.held` (`_will_copy` False: not adopted, not
+  replaced, no error; S5). `_keep_tools` keeps photo-backup, jxl-photo
   and `KEEP_TOOLS_EXTRA` in `_photo_backup\tools` on every real run. jxl-photo
   always runs through `_run_jxlphoto` (`_jxlphoto_env`: `JXLPHOTO_LOG_DIR` =
   the conversion's own folder, its log copied to our `Logs\jxl-photo` by
@@ -201,7 +216,11 @@ from the command line. A future job (e.g. a full mirror) is a new
   `add_done_callback` (rc6 review, S2: no scan of every pending future per
   item). The menu's "try them again" is a marker file beside its config
   (`photo_backup._retry_marker`), never a config key: the menu writes its
-  config from memory. A backend may import the catalog and the copier from
+  config from memory; so is "make them again" (`_reconvert_marker`,
+  `--reconvert-older`). Both go only to a run that backs up (never one with an
+  option of `_NOT_A_BACKUP`: `--verify`, `--analyze`, `--show-trash`,
+  `--empty-trash`) and are spent only by one that really ran (no dry-run,
+  exit 0 or 1). A backend may import the catalog and the copier from
   `selective_backup.py` (`import selective_backup as sb`); never duplicate
   the catalog format or the copy routine — they exist once. A TIFF or JPEG
   kept as JXL is one entry (`_JxlGroup`): its JXL files are copied (hash
@@ -303,7 +322,12 @@ from the command line. A future job (e.g. a full mirror) is a new
   string-only for the catalog's own paths.
 - **Nothing on the destination is ever deleted** — except by `mirror_backup.py`
   (v0.14.0), see its rule below; its trash is the one folder inside
-  `CATALOG_FOLDER` where files are deleted. A file whose source changed
+  `CATALOG_FOLDER` where files are deleted. With `--adopt-by-hash` the backup
+  sets the date of a file it did not write (no row; never through a link) to
+  the source's, and only when both were read and their SHA-256 is the same, and
+  neither changed since (`_apply_hash_adoptions`). Its bytes are never written;
+  a read-only one whose date would have to change is left as it is in that run
+  (`held`: not adopted, not replaced, never made writable). A file whose source changed
   is reported; with `--update-changed` the old copy is MOVED to the versions
   folder first, never overwritten in place. A new file identical byte for byte
   to the old copy takes its place instead: `_handle_old_copy` compares the old
@@ -389,6 +413,17 @@ from the command line. A future job (e.g. a full mirror) is a new
   under `tools` are the only folders this removes (`_remove_own_folder`,
   never a link), plus the empty `JXL_WORK_FOLDER` itself
   (`_remove_empty_work_parent`: `os.rmdir`, never a link). Nothing in `tools` is replaced or deleted otherwise.
+  The reverse: a JXL group leaves only after the plain copy of the same file is
+  in the backup (UP_TO_DATE, or recorded by this run) and holds the bytes the
+  group was made from (SHA-256 = `source_sha256`); a failed or skipped copy, or
+  no proof, keeps it (`_retire_undone`). `--reconvert-older`: when the new
+  conversion fails, the old JXL stays only while it is whole in the backup
+  (`_old_group_whole`); once part of it has left (`_place_group` retires it
+  before the new names), the TIFF is copied as it is (`_copy_as_is`, which
+  retires what is left of the old group after the copy); if that copy fails
+  too, the TIFF has no copy in the backup's tree until the next run (the old
+  JXL is in `versions\` or the mirror's trash; a mirror with no trash deleted
+  it), exit 1 (final review 261126, SF2).
 - **The restore never writes to the backup.** `restore_backup.py` opens the
   catalog read-only, never writes, moves or deletes anything under `--backup`,
   and never overwrites a target file that already exists. An empty `--to` or

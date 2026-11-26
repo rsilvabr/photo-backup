@@ -183,7 +183,7 @@ def test_s3_the_mirror_shows_the_old_copy_as_retired_not_as_a_stranger(env, monk
 def test_s5_the_menu_asks_the_next_backup_to_try_again(monkeypatch, menu_config):
     # answers: jxl-photo? no; the work folder? no; the conversion off? no; try the failed
     # conversions again? yes; forget the choices? no
-    script(monkeypatch, ["n", "n", "n", "y", "n"])
+    script(monkeypatch, ["n", "n", "n", "y", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert os.path.isfile(menu._retry_marker())
     commands = []

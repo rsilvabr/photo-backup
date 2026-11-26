@@ -97,6 +97,9 @@ SYSTEM_SKIP_FOLDERS = "$RECYCLE.BIN;System Volume Information"
 
 # ---- Copy and verify ------------------------------------------------------------
 VERIFY_COPY = "hash"                # default --verify-copy: none | size | hash
+ADOPT_BY_HASH = False               # default --adopt-by-hash: adopt a backup file that has no row only when its
+                                    # bytes are the source's (both are read); same size, other date: adopted, its
+                                    # date set to the source's (a backup made by another program)
 SPACE_MARGIN_GB = 20.0              # free space kept on the destination (default --space-margin-gb)
 MTIME_TOLERANCE_S = 2.0             # FAT/exFAT store mtimes in 2 s steps
 COPY_CHUNK_MB = 8
@@ -800,6 +803,13 @@ class FileStatus:
     settings_only: bool = False # ... CHANGED only because the settings differ: the JXL group is
                                 # whole and of this very file (--no-convert keeps it, rc5)
     given_up: bool = False      # ... kept as the copy as it is: jxl-photo could not convert it (rc6)
+    undoes: tuple = ()          # a plain copy of a file whose JXL group is in the catalog (the manifest
+                                # says copy now): the rels of that group, retired once the copy is there
+    reconvert: bool = False     # a TIFF kept as JXL by an older jxl-photo, made again (--reconvert-older)
+    adopt_sha256: str = None    # --adopt-by-hash: the SHA-256 both files have (no row yet)
+    adopt_stat: tuple = None    # ... (source size, mtime_ns, atime_ns, backup size, mtime_ns) as read
+    held: str = None            # ... why a CHANGED file is left as it is in this run (not copied):
+                                # read-only, its bytes the source's (review 261126, S5)
 
 
 @dataclass
@@ -1852,6 +1862,282 @@ def _not_converted_again(statuses, dest, rows, tool, retry=False):
     return result
 
 
+def _undo_groups(statuses, groups, rows, log=None):
+    """The manifest is the state the backup goes to (v0.14.0, 261126): a plain
+    file planned for a TIFF or JPEG whose JXL group is in the catalog (`Jpeg` /
+    `Tiff` say copy now) carries the rels of that group in `undoes`; the group
+    leaves once the plain copy is in place (`_retire_undone`), never before.
+    The group's keys are planned too: never orphans, whatever happens to the
+    copy. `groups` = _converted_groups(converted), `rows` = {key: _Row}. A rel
+    that is itself another planned file (a real file named like the JXL) is
+    never retired.
+
+    Only a group of the very bytes the plain copy holds leaves (review 261126,
+    S2): what is already known to differ is decided here -- the group's
+    source has another size than the file (another version of it), the
+    catalog has no SHA-256 of the group's source, or an UP_TO_DATE copy's row
+    has another SHA-256 -- and logged `UNDO SKIPPED`; the rest is proven
+    after the copy (_retire_undone). A skipped group stays, its keys planned."""
+    groups = groups or {}
+    planned_keys = {status.planned.rel.casefold() for status in statuses}
+    result = []
+    for status in statuses:
+        planned = status.planned
+        group = None if planned.convert else groups.get(planned.rel.casefold())
+        if group and status.status in (ST_NEW, ST_CHANGED, ST_UP_TO_DATE):
+            undoes = tuple(rows[item.key].rel for item in group
+                           if item.key in rows and item.key not in planned_keys)
+            why = None
+            if undoes:
+                source_sha256 = group[0].source_sha256
+                row = rows.get(planned.rel.casefold())
+                if not source_sha256:
+                    why = "the catalog has no SHA-256 of the file its JXL was made from"
+                elif group[0].source_size != planned.size:
+                    why = (f"its JXL was made from another version of the file "
+                           f"({_num(group[0].source_size)} bytes, now {_num(planned.size)})")
+                elif (status.status == ST_UP_TO_DATE and row is not None and row.sha256
+                        and row.sha256 != source_sha256):
+                    why = "the copy in the backup holds other bytes than its JXL was made from"
+            if why is not None:
+                if log is not None:
+                    log.log(f"UNDO SKIPPED {planned.rel}: {why}; its JXL stays")
+                undoes = ()
+            status = _replace_fields(status, undoes=undoes, extra_keys=(
+                status.extra_keys + tuple(item.key for item in group)))
+        result.append(status)
+    return result
+
+
+def _undo_proof(status, copied, catalog):
+    """(the SHA-256 the plain copy in the backup holds, why not known): the
+    hash of the bytes this run copied (`copied`), else the one --adopt-by-hash
+    read, else the copy's row, else the backup file read now. Never the source."""
+    key = status.planned.rel.casefold()
+    if copied.get(key):
+        return copied[key], None
+    if status.adopt_sha256:
+        return status.adopt_sha256, None
+    known = catalog.file_sha256(key)
+    if known:
+        return known, None
+    try:
+        return _sha256_file(status.dst), None
+    except OSError as exc:
+        return None, f"the copy in the backup cannot be read ({exc})"
+
+
+def _retire_undone(statuses, copied_keys, dest, stamp, catalog, log, keep_old_file, info):
+    """After the copies: the JXL group of a file whose plain copy is in the
+    backup (UP_TO_DATE, or recorded by this run: `copied_keys`, {key: the
+    SHA-256 of the bytes copied}) leaves -- `keep_old_file` (versions\\, or the
+    mirror's trash for what is ours) -- and its rows go with it, only when the
+    plain copy holds the bytes the group was made from: its SHA-256 is the
+    group's `source_sha256` (_undo_proof; review 261126, S2). No proof: the
+    group stays (`UNDO SKIPPED`), its keys planned. A copy that failed or was
+    not made (a CHANGED one without --update-changed) keeps the group. A group
+    that cannot be moved stays from that file on (error, exit 1)."""
+    keep_old_file = keep_old_file or _keep_old_file
+    if not isinstance(copied_keys, dict):
+        copied_keys = {key: None for key in copied_keys}
+    for status in statuses:
+        if not status.undoes:
+            continue
+        key = status.planned.rel.casefold()
+        if not (status.status == ST_UP_TO_DATE or key in copied_keys):
+            continue
+        wanted = next((sha for sha in (catalog.converted_sha256(rel.casefold())
+                                       for rel in status.undoes) if sha), None)
+        if not wanted:
+            have, why = None, "the catalog has no SHA-256 of the file its JXL was made from"
+        else:
+            have, why = _undo_proof(status, copied_keys, catalog)
+        if why is None and have != wanted:
+            why = "the copy in the backup holds other bytes than its JXL was made from"
+        if why is not None:
+            log.log(f"UNDO SKIPPED {status.planned.rel}: {why}; its JXL stays")
+            continue
+        clean = True
+        for rel in status.undoes:
+            try:
+                with _ctrl_c_after():       # the move and the row go together (N2)
+                    _retire_file(dest, stamp, rel, catalog, log, keep_old_file)
+            except OSError as exc:
+                info["errors"] += 1
+                log.log(f"ERROR retiring {rel}: {exc}")
+                clean = False
+                break
+            info["undone"] += 1
+            log.log(f"UNDONE {rel} (its plain copy {status.planned.rel} is in the backup)")
+        if clean:
+            catalog.forget_not_converted(key)
+    catalog.commit()
+
+
+def _reconvert_older(statuses, groups, tool, rows_by_key, log=None):
+    """--reconvert-older: a TIFF kept as JXL by a jxl-photo OLDER than the one
+    this run uses (`tool`, ordered by _version_key; review 261126, S1: a newer
+    or the same jxl-photo is left alone) is made again. A group whose tool says
+    no version counts as older (logged). It is UP_TO_DATE only by name, so it
+    becomes CHANGED with `reconvert` (the owner's consent: no --update-changed)
+    and its group as `old_outputs`; the old group leaves after the new one is
+    in place (_place_group). When the new one cannot be made, the old group
+    stays if it is still whole (_old_group_whole), else the TIFF is copied as
+    it is. A JPEG is never made again (its JXL gives the same bytes back)."""
+    current = _version_key(tool)
+    result = []
+    unknown = set()
+    for status in statuses:
+        planned = status.planned
+        if (planned.convert and planned.convert != JPEG_CONVERT
+                and status.status == ST_UP_TO_DATE):
+            group = (groups or {}).get(planned.rel[:-len(".jxl")].casefold())
+            if group:
+                old_key = _version_key(group[0].tool)
+                if old_key is None:
+                    unknown.add(str(group[0].tool))
+                if old_key is None or (current is not None and old_key < current):
+                    old = tuple(rows_by_key[item.key].rel for item in group
+                                if item.key in rows_by_key)
+                    status = _replace_fields(status, status=ST_CHANGED, old_outputs=old,
+                                             settings_only=True, reconvert=True)
+        result.append(status)
+    if unknown and log is not None:
+        log.log(f"RECONVERT: JXL made by a jxl-photo that says no version "
+                f"({', '.join(sorted(unknown))}): counted as older")
+    return result
+
+
+_S_IWRITE = 0o200                   # st_mode: the file is not read-only
+
+
+def _adopt_by_hash(statuses, row_keys, dest, log, report=None):
+    """--adopt-by-hash: a backup file with no catalog row (made by another
+    program) that the plan finds the source's size (and date, or not) is
+    adopted only when its bytes ARE the source's: both are read, SHA-256. Same
+    bytes: UP_TO_DATE with `adopt_sha256` (its date is set to the source's in
+    the write phase). Same size and date, other bytes: CHANGED. Anything that
+    cannot be read, or changes while it is read, is left as it is. Reads only:
+    the source and the backup are not written here. `report["refused"]`
+    receives the statuses that were refused."""
+    wanted = [index for index, status in enumerate(statuses)
+              if not status.planned.convert and status.status in (ST_UP_TO_DATE, ST_CHANGED)
+              and status.planned.rel.casefold() not in row_keys]
+    if not wanted:
+        return statuses
+    tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
+    result = list(statuses)
+    last_report = time.monotonic()
+    for number, index in enumerate(wanted, 1):
+        now = time.monotonic()
+        if now - last_report >= PROGRESS_EVERY_S:
+            print(f"Checking files to adopt [{number}/{len(wanted)}] {statuses[index].planned.rel}",
+                  flush=True)
+            last_report = now
+        status = statuses[index]
+        planned = status.planned
+        try:
+            d0 = os.lstat(_io(status.dst))
+            if (_is_reparse(status.dst) or (d0.st_mode & 0o170000) != 0o100000
+                    or d0.st_size != planned.size):
+                continue                                    # left as it is
+            s0 = os.stat(_io(planned.src))
+            if (s0.st_size != planned.size
+                    or abs(s0.st_mtime_ns - planned.mtime_ns) > tolerance):
+                log.log(f"ADOPT SKIPPED {planned.rel}: the source changed since it was planned")
+                continue
+            source_digest = _sha256_file(planned.src)
+            s1 = os.stat(_io(planned.src))
+            if (s0.st_size, s0.st_mtime_ns) != (s1.st_size, s1.st_mtime_ns):
+                log.log(f"ADOPT SKIPPED {planned.rel}: the source changed while it was read")
+                continue
+            backup_digest = _sha256_file(status.dst)
+            d1 = os.lstat(_io(status.dst))
+            if (d0.st_size, d0.st_mtime_ns) != (d1.st_size, d1.st_mtime_ns):
+                log.log(f"ADOPT SKIPPED {planned.rel}: the backup file changed while it was read")
+                continue
+        except OSError as exc:
+            log.log(f"ADOPT SKIPPED {planned.rel}: {exc}")
+            continue
+        if (source_digest == backup_digest and not d0.st_mode & _S_IWRITE
+                and abs(d0.st_mtime_ns - s0.st_mtime_ns) > tolerance):
+            # read-only, and its date would have to change: never made writable
+            # (review 261126, S5). Its bytes ARE the source's: it is left as it
+            # is in this run -- not adopted, not replaced -- and that is no error
+            result[index] = _replace_fields(
+                status, held="read-only, the source's bytes with another date")
+            log.log(f"ADOPT SKIPPED {planned.rel}: read-only (its date cannot be set; never made "
+                    f"writable); the same bytes as the source: left as it is")
+            if report is not None:
+                report.setdefault("held", []).append(result[index])
+        elif source_digest == backup_digest:
+            result[index] = _replace_fields(
+                status, status=ST_UP_TO_DATE, adopt_sha256=source_digest,
+                adopt_stat=(s0.st_size, s0.st_mtime_ns, s0.st_atime_ns, d0.st_size,
+                            d0.st_mtime_ns))
+            log.log(f"ADOPT BY HASH {planned.rel}"
+                    + (" (date set to the source's)" if status.status == ST_CHANGED else ""))
+        elif status.status == ST_UP_TO_DATE:
+            result[index] = _replace_fields(status, status=ST_CHANGED)
+            log.log(f"ADOPT REFUSED {planned.rel}: same size and date as the source, other bytes")
+            if report is not None:
+                report.setdefault("refused", []).append(result[index])
+    return result
+
+
+def _apply_hash_adoptions(statuses, dest, catalog, log):
+    """The write phase of --adopt-by-hash, in the one place a file that this
+    backup did not write is touched: its date is set to the source's, when
+    both were read, their SHA-256 is the same and neither changed since
+    (re-stated here), and the file is not a link or read-only (never made
+    writable). Its bytes are never written. A file that fails stays as it was,
+    without a row, and CHANGED. Returns (adopted, errors, statuses)."""
+    tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
+    adopted = errors = uncommitted = 0
+    result = []
+    for status in statuses:
+        if status.adopt_sha256 is None:
+            result.append(status)
+            continue
+        planned = status.planned
+        stat0 = status.adopt_stat
+        failure = held = None
+        try:
+            source = os.stat(_io(planned.src))
+            backup = os.lstat(_io(status.dst))
+            if ((source.st_size, source.st_mtime_ns) != tuple(stat0[:2])
+                    or (backup.st_size, backup.st_mtime_ns) != tuple(stat0[3:5])
+                    or _is_reparse(status.dst)):
+                failure = f"ADOPT SKIPPED {planned.rel}: changed since it was read"
+            else:
+                if abs(backup.st_mtime_ns - stat0[1]) > tolerance:
+                    if not backup.st_mode & _S_IWRITE:
+                        # made read-only since it was read (a race: the plan
+                        # leaves a read-only file out, _adopt_by_hash): it is
+                        # not replaced in this run either (review 261126, S5)
+                        held = "read-only, the source's bytes with another date"
+                        raise PermissionError(f"{status.dst} is read-only (never made writable)")
+                    os.utime(_io(status.dst), ns=(stat0[2], stat0[1]))
+                catalog.upsert(planned, status.adopt_sha256, stat0[0], stat0[1])
+        except OSError as exc:
+            failure = f"ADOPT FAILED {planned.rel}: {exc}"
+        if failure is not None:
+            log.log(failure)
+            errors += 1
+            result.append(_replace_fields(status, status=ST_CHANGED, adopt_sha256=None,
+                                          adopt_stat=None, held=held))
+            continue
+        adopted += 1
+        uncommitted += 1
+        result.append(status)
+        if uncommitted >= max(FLUSH_BATCH_FILES, 1):
+            catalog.commit()
+            uncommitted = 0
+    if adopted or errors:
+        catalog.commit()
+    return adopted, errors, result
+
+
 def _file_statuses(files, dest, listings=None, groups=None, catalog_rows=None):
     """_file_status of every planned file, in the same order, with one listing
     per destination folder instead of one question per file (6 times faster on
@@ -2396,6 +2682,15 @@ class _Catalog:
                                 (key,)).fetchone()
         return row[0] if row else None
 
+    def converted_sha256(self, key):
+        """The SHA-256 of the TIFF or JPEG whose JXL is the backup file `key`
+        (its source when it was converted), or None."""
+        if not self.has_converted:
+            return None
+        row = self.conn.execute("SELECT source_sha256 FROM converted WHERE key=?",
+                                (key,)).fetchone()
+        return row[0] if row else None
+
     def record_converted(self, converted):
         """Record one file of a TIFF's JXL group (its files row is upserted
         apart, with the JXL's own size, date and hash)."""
@@ -2407,6 +2702,15 @@ class _Catalog:
              _db_ns(converted.source_mtime_ns), converted.source_sha256, converted.page,
              converted.pages, converted.tool, converted.settings, converted.kind,
              None if converted.lossless is None else int(bool(converted.lossless))))
+
+    def has_file(self, key):
+        """A files row with this key (review 261126, M1)."""
+        return self.conn.execute("SELECT 1 FROM files WHERE key=?", (key,)).fetchone() is not None
+
+    def file_sha256(self, key):
+        """The SHA-256 a files row holds, or None (no row, or no hash)."""
+        row = self.conn.execute("SELECT sha256 FROM files WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
 
     def delete(self, key):
         self.conn.execute("DELETE FROM files WHERE key=?", (key,))
@@ -2914,15 +3218,21 @@ def _auto_updated(status, args):
 
 
 def _will_copy(status, args):
+    if getattr(status, "held", None):
+        return False                    # left as it is in this run (S5 of the review 261126)
     if status.status == ST_NEW:
         return True
+    if status.status == ST_CHANGED and getattr(status, "reconvert", False):
+        return True                     # --reconvert-older is the owner's consent
     return status.status == ST_CHANGED and (args.update_changed or _auto_updated(status, args))
 
 
 def _adopt_rows(catalog, statuses):
     for status in statuses:
-        # a TIFF kept as JXL is in the catalog already, as its group
-        if status.status == ST_UP_TO_DATE and not status.planned.convert:
+        # a TIFF kept as JXL is in the catalog already, as its group; a file
+        # adopted by its hash has its row (with the hash) already
+        if (status.status == ST_UP_TO_DATE and not status.planned.convert
+                and status.adopt_sha256 is None):
             catalog.adopt(status.planned)
     catalog.commit()
 
@@ -4468,6 +4778,28 @@ def _retire_file(dest, stamp, rel, catalog, log, keep_old_file):
     catalog.delete(rel.casefold())
 
 
+def _old_group_whole(status, dest, catalog):
+    """--reconvert-older, after the new group failed: is every file of the old
+    group (`status.old_outputs`) still in the backup, with its files row and
+    its converted row of this very TIFF? The same connection sees what
+    _place_group retired before it failed (review 261126, M1). Anything else
+    -- a page gone, a row gone, a name that cannot be asked -- is False: the
+    TIFF is then copied as it is."""
+    if not status.old_outputs:
+        return False
+    source_key = status.planned.rel[:-len(".jxl")].casefold()
+    try:
+        for rel in status.old_outputs:
+            key = rel.casefold()
+            if not os.path.lexists(_io(os.path.join(dest, rel))):
+                return False
+            if catalog.converted_source(key) != source_key or not catalog.has_file(key):
+                return False
+    except (OSError, sqlite3.Error):
+        return False
+    return True
+
+
 def _write_jxl_temp(path, target, size, mtime_ns, sha256, verify):
     """One JXL of a finished conversion, copied from its work folder (another
     disk) to a temp file next to `target`: written, on the disk, its date the
@@ -4975,9 +5307,27 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
                 info["errors"] += 1
                 log.log(f"ERROR retiring {status.replaces}: {exc}")
             timing["retire"] += time.monotonic() - retiring
-        if conversion is None:
-            info["failed"] += 1
-            log.log(f"CONVERT FAILED {status.planned.rel[:-len('.jxl')]}: {why}")
+        if conversion is None and status.reconvert and _old_group_whole(status, dest, catalog):
+            # --reconvert-older: the JXL made by the older jxl-photo is still whole
+            # in the backup, with its rows (the failure came before any of it
+            # left): it stays; nothing is copied as it is, nothing is retired
+            info["errors"] += 1
+            info["reconvert_failed"] = info.get("reconvert_failed", 0) + 1
+            log.log(f"RECONVERT FAILED {status.planned.rel[:-len('.jxl')]}: {why}; the JXL "
+                    f"made by the older jxl-photo stays")
+        elif conversion is None:
+            if status.reconvert:
+                # the old group (or part of it) had already left when the new one
+                # failed (review 261126, M1): the TIFF is copied as it is, as for
+                # any failed conversion, and what is left of the old group follows
+                # it once that copy is in place (_copy_as_is)
+                info["errors"] += 1
+                info["reconvert_as_is"] = info.get("reconvert_as_is", 0) + 1
+                log.log(f"RECONVERT FAILED {status.planned.rel[:-len('.jxl')]}: {why}; the old "
+                        f"JXL had already left: the TIFF is copied as it is")
+            else:
+                info["failed"] += 1
+                log.log(f"CONVERT FAILED {status.planned.rel[:-len('.jxl')]}: {why}")
             if recordable:              # written at the end, with proof (M2)
                 failures.append((status, why))
             copying = time.monotonic()
@@ -5081,6 +5431,8 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_cop
     last_said = (0, 0)
     speed = _Speed()
     log.log(f"Copying {_num(len(to_copy))} files / {_gb(total_bytes)}")
+    copied_keys = {}                    # the plain copies this run recorded: their SHA-256
+                                        # (_retire_undone's proof, review 261126 S2)
     pending = []
     read_ahead = None
     if READ_AHEAD_MB > 0 and to_copy:
@@ -5112,6 +5464,7 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_cop
 
     def record(status, sha256, size, mtime_ns):
         nonlocal done, done_bytes, uncommitted, in_a_row, unrecorded
+        copied_keys[status.planned.rel.casefold()] = sha256
         done += 1
         done_bytes += status.planned.size
         in_a_row = 0
@@ -5203,6 +5556,12 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_cop
                 in_a_row = 0
         finish_pending()
         if stopped is None and catalog_error is None:
+            if convert_info is None:
+                convert_info = {}
+            for name in ("undone", "errors"):
+                convert_info.setdefault(name, 0)
+            _retire_undone(statuses, copied_keys, dest, stamp, catalog, log,
+                           keep_old_file or _keep_old_file, convert_info)
             if _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file,
                             convert_info):
                 raise KeyboardInterrupt
@@ -5256,7 +5615,8 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
     last). `extra_lines`: more rows of "This run"; `orphan_lines`: rows of the
     orphans' block; `lists`: (file name, what it holds) of the CSVs."""
     new = [status for status in statuses if status.status == ST_NEW]
-    changed = [status for status in statuses if status.status == ST_CHANGED]
+    changed = [status for status in statuses if status.status == ST_CHANGED
+               and not getattr(status, "held", None)]      # a held one has its own row
     auto = [status for status in changed if _auto_updated(status, args)]
     up_to_date = [status for status in statuses if status.status == ST_UP_TO_DATE]
     sources = [os.path.abspath(source) for source in args.source]
@@ -5438,14 +5798,33 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     # the state of every planned file (a TIFF kept as JXL: from its group, which
     # only the catalog knows -- so the catalog is read first)
     listings = {} if mirror is not None else None
-    statuses = _file_statuses(planned.files, dest, listings, _converted_groups(converted),
-                              {row.key: row for row in rows})
+    groups = _converted_groups(converted)
+    rows_by_key = {row.key: row for row in rows}
+    statuses = _file_statuses(planned.files, dest, listings, groups, rows_by_key)
+    # the manifest is the state: a plain copy planned for a file whose JXL group
+    # is in the catalog takes that group away once it is in place (261126)
+    statuses = _undo_groups(statuses, groups, rows_by_key, log)
     if getattr(args, "no_convert", False):
         statuses = _without_conversion(statuses, dest)
     if not getattr(args, "no_convert", False) and any(s.planned.convert for s in statuses):
         jxlphoto = getattr(args, "jxlphoto", None) or JXLPHOTO
-        tool = (_jxlphoto_version(jxlphoto)
-                if jxlphoto and _jxlphoto_problem(jxlphoto) is None else None)
+        problem = (_jxlphoto_problem(jxlphoto) if jxlphoto
+                   else "no jxl-photo is named (JXLPHOTO, --jxlphoto)")
+        tool = _jxlphoto_version(jxlphoto) if jxlphoto and problem is None else None
+        if getattr(args, "reconvert_older", False):
+            if tool is None:
+                message = (f"--reconvert-older: jxl-photo cannot be used ({problem}); "
+                           f"nothing was changed")
+                print(message, file=sys.stderr)
+                log.log(f"ERROR {message}")
+                return 2
+            statuses = _reconvert_older(statuses, groups, tool, rows_by_key, log)
+            again = [status for status in statuses if status.reconvert]
+            if again:
+                found = sorted({str(groups[status.planned.rel[:-len(".jxl")].casefold()][0].tool)
+                                for status in again})
+                log.log(f"RECONVERT {len(again)} TIFF made by an older jxl-photo than {tool} "
+                        f"(versions found: {', '.join(found)})")
         statuses = _not_converted_again(statuses, dest, not_converted, tool,
                                         getattr(args, "retry_conversions", False))
         for status in statuses:
@@ -5454,6 +5833,9 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                 row = not_converted[rel.casefold()]
                 log.log(f"NOT CONVERTED AGAIN {rel}: jxl-photo could not convert it in "
                         f"{row.failures} runs in a row ({row.tool}); last: {row.reason}")
+    adopt_report = {}
+    if getattr(args, "adopt_by_hash", False):
+        statuses = _adopt_by_hash(statuses, set(rows_by_key), dest, log, adopt_report)
     to_copy = [status for status in statuses if _will_copy(status, args)]
     needed =sum(status.planned.size for status in to_copy)
     dest_error = None
@@ -5536,6 +5918,12 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                                         sum(status.planned.size for status in to_make),
                                         settings))
         extra_lines.append(_summary_row(f"{kind} kept as JXL: already in the backup", len(same)))
+        again = [status for status in these if status.reconvert]
+        if again:
+            extra_lines.append(_summary_row(
+                f"{kind} kept as JXL: made again (--reconvert-older)", len(again),
+                sum(status.planned.size for status in again),
+                "made by an older jxl-photo; included above"))
         if given:
             extra_lines.append(_summary_row(
                 f"{kind}: not converted again", len(given),
@@ -5549,6 +5937,35 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     if retire:
         where = "the mirror's trash" if mirror is not None else "versions\\"
         extra_lines.append(_summary_row(f"copies their JXL replaces (to {where})", len(retire)))
+    # the JXL groups the manifest no longer wants, whose plain copy will be there
+    undoing = [status for status in statuses if status.undoes
+               and (status.status == ST_UP_TO_DATE or _will_copy(status, args))]
+    if undoing:
+        where = "the mirror's trash" if mirror is not None else "versions\\"
+        extra_lines.append(_summary_row(
+            f"JXL replaced by their plain copy (to {where})",
+            sum(len(status.undoes) for status in undoing),
+            sum(rows_by_key[key].size for status in undoing for key in
+                (rel.casefold() for rel in status.undoes) if key in rows_by_key)))
+    if getattr(args, "adopt_by_hash", False):
+        adopting = [status for status in statuses if status.adopt_sha256 is not None]
+        dated = [status for status in adopting
+                 if abs(status.adopt_stat[4] - status.adopt_stat[1])
+                 > int(MTIME_TOLERANCE_S * 1_000_000_000)]
+        extra_lines.append(_summary_row(
+            "adopted by their bytes (no row; same as the source)", len(adopting),
+            sum(status.planned.size for status in adopting),
+            f"{_num(len(dated))} of them get the source's date"))
+        refused = adopt_report.get("refused", [])
+        if refused:
+            extra_lines.append(_summary_row(
+                "same size and date as the source, other bytes", len(refused),
+                sum(status.planned.size for status in refused), "CHANGED"))
+        held = adopt_report.get("held", [])
+        if held:
+            extra_lines.append(_summary_row(
+                "the source's bytes, read-only: left as they are", len(held),
+                sum(status.planned.size for status in held), "never made writable"))
     folder_rows = _folder_rows(to_copy)
     if len(folder_rows) >= 2:
         extra_lines.append("  to copy by folder (cumulative):")
@@ -5716,10 +6133,17 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     stop_info = {}
     mirror_problems = False
     convert_info = {}
+    adopt_errors = 0
     try:
         _ensure_backup_id(dest, log)
         for line in _keep_tools(dest, log, getattr(args, "jxlphoto", None) or JXLPHOTO):
             log.out(line)
+        adopted_by_hash, adopt_errors, statuses = _apply_hash_adoptions(
+            statuses, dest, catalog, log)
+        if adopted_by_hash or adopt_errors:
+            log.out(f"Adopted by their bytes: {_num(adopted_by_hash)} files"
+                    + (f"; {_num(adopt_errors)} could not be (ADOPT FAILED / ADOPT SKIPPED in "
+                       f"the log)" if adopt_errors else ""))
         _adopt_rows(catalog, statuses)
         if candidates:
             moved, moved_bytes, move_errors, interrupted = _apply_moves(
@@ -5736,7 +6160,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             mirror.remove(dest, stamp, catalog, orphans, log)
             if mirror.interrupted:
                 # what was removed before Ctrl+C, and where it is (finding 6)
-                mirror.finish(log, 0, 0, 0, interrupted=True)
+                mirror.finish(log, 0, 0, adopt_errors + move_errors, interrupted=True)
                 return 130
         done, done_bytes, error_count, interrupted = _copy_all(
             args, statuses, dest, stamp, catalog, log, stop_info,
@@ -5758,6 +6182,16 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                         f"failed (CONVERT FAILED in the log)"
                         + (f"; one that fails in {CONVERT_GIVE_UP_AFTER} runs in a row is not "
                            f"tried again" if CONVERT_GIVE_UP_AFTER > 0 else ""))
+        if convert_info.get("undone"):
+            log.out(f"  {_num(convert_info['undone'])} JXL in the backup replaced by their plain "
+                    f"copy (to {'the trash' if mirror is not None else 'versions'})")
+        if convert_info.get("reconvert_failed"):
+            log.out(f"  {_num(convert_info['reconvert_failed'])} TIFF could not be made again "
+                    f"(RECONVERT FAILED in the log): their JXL stays as it was")
+        if convert_info.get("reconvert_as_is"):
+            log.out(f"  {_num(convert_info['reconvert_as_is'])} TIFF could not be made again "
+                    f"after their old JXL had left: copied as it is (RECONVERT FAILED in the "
+                    f"log); the next run converts it again")
         if convert_info.get("as_is"):
             log.out(f"Conversion off: {_num(convert_info['as_is'])} TIFF/JPEG kept as they are "
                     f"({_gb(convert_info['bytes_as_is'])} copied); a run without --no-convert "
@@ -5777,7 +6211,9 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                         f"names and the next run adopts them by their size and date")
         if mirror is not None:
             mirror.convert_info = convert_info
-            mirror_problems = mirror.finish(log, done, done_bytes, error_count, interrupted)
+            # every error that makes the exit 1 is in its box (review 261126, S5)
+            mirror_problems = mirror.finish(log, done, done_bytes,
+                                            error_count + adopt_errors + move_errors, interrupted)
         if interrupted:
             return 130
         if args.move_orphans and stop_info:
@@ -5799,8 +6235,9 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             # only now, with the catalog closed: the disk may go (v0.14.0-rc5)
             log.log("STOPPED by Ctrl+C")
             _tell(STOPPED_SAYING)
-    return 1 if (error_count or move_errors or planned.errors or stop_info or mirror_problems
-                 or convert_info.get("failed") or convert_info.get("errors")) else 0
+    return 1 if (error_count or move_errors or adopt_errors or planned.errors or stop_info
+                 or mirror_problems or convert_info.get("failed")
+                 or convert_info.get("errors")) else 0
 
 
 @dataclass
@@ -6335,6 +6772,19 @@ def _build_parser():
     parser.add_argument("--retry-conversions", action="store_true",
                         help="try again the TIFFs and JPEGs jxl-photo could not convert in "
                              "CONVERT_GIVE_UP_AFTER runs in a row (after a new libjxl, say)")
+    parser.add_argument("--reconvert-older", action="store_true",
+                        help="make again every TIFF kept as JXL whose JXL was made by an older "
+                             "jxl-photo than the one this run uses (a version it cannot read "
+                             "counts as older; a newer or the same one is left alone); the old "
+                             "JXL goes to versions (a mirror: its trash). One run; a JPEG's JXL "
+                             "is never made again (the same bytes come back). Not with "
+                             "--no-convert")
+    parser.add_argument("--adopt-by-hash", action=argparse.BooleanOptionalAction,
+                        default=ADOPT_BY_HASH,
+                        help="a backup file with no catalog row (made by another program) is "
+                             "adopted only when its bytes are the source's (both are read); "
+                             "the same size with another date is adopted too, its date set to "
+                             "the source's (default: ADOPT_BY_HASH)")
     parser.add_argument("--expect-backup-id", default=None, metavar="ID",
                         help="abort unless the destination holds this backup ID")
     parser.add_argument("--space-margin-gb", type=float, default=SPACE_MARGIN_GB, metavar="N",
@@ -6358,6 +6808,8 @@ def main(argv=None):
     parser = _build_parser()
     try:
         args = parser.parse_args(argv)
+        if args.reconvert_older and args.no_convert:
+            parser.error("--reconvert-older cannot be combined with --no-convert")
     except SystemExit as exc:
         code = exc.code
         if code is None:

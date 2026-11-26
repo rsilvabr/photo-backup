@@ -22,6 +22,22 @@ added the newer parts. The restore has its own guarantees
   once and never replaced, also when it cannot be read for a moment
   *(v0.13.2)*. The one folder the tool removes is one left empty by its own
   move inside the backup ([reruns_and_moves.md](reruns_and_moves.md#moved-and-renamed-folders)).
+  A JXL group the manifest no longer wants (`Tiff` / `Jpeg` say copy now) goes
+  to the versions folder (the mirror: its trash) only after the plain copy of
+  the same file is in the backup (UP_TO_DATE, or recorded by this run) and
+  holds the very bytes the JXL was made from (its SHA-256 is the catalog's
+  `source_sha256`); a failed or skipped copy, or one without that proof, keeps
+  it *(v0.14.0)*. With `--reconvert-older`, a TIFF whose new JXL fails keeps
+  its old JXL while that is still whole in the backup; once part of it has
+  left, the TIFF is copied as it is; if that copy fails too, the TIFF has no
+  copy in the backup's tree until the next run (the old JXL is in `versions\`
+  or the mirror's trash; a mirror with no trash deleted it), exit 1. With
+  `--adopt-by-hash` the backup sets the date of a file it did not write (no
+  row, never through a link) to the source's, and only when both were read,
+  their SHA-256 is the same and neither changed since; its bytes are never
+  written. A read-only file whose date would have to change is left as it is
+  in that run: not adopted, not replaced, never made writable (its bytes are
+  the source's) *(v0.14.0; [reruns_and_moves.md](reruns_and_moves.md#a-backup-made-by-another-program))*.
   **The exception is the mirror** (`mirror_backup.py`), whose job is to remove
   from the backup what is gone from the source: its own rules are
   [at the end of this page](#the-mirror-mirror_backuppy).

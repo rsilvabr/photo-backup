@@ -98,6 +98,13 @@ And in every mode:
 - **A changed file** is replaced. Its old copy goes to the trash when the
   backup wrote it, and to `versions\` (as in a normal backup) when it did not.
   An old copy identical byte for byte to the new one is not kept.
+- **A JXL the manifest no longer wants** (the line's `Tiff` or `Jpeg` says copy
+  now) leaves like the old copy of a changed file, to the trash when the backup
+  wrote it, only after the plain copy of the same file is in the backup and
+  holds the bytes the JXL was made from (SHA-256; else it stays, `UNDO SKIPPED`
+  in the log); it is counted in the line's limit (`MIRROR_MAX_DELETE_PERCENT`)
+  and shown in the box (*JXL replaced by the file*). With no trash
+  (`MIRROR_KEEP_DAYS = 0`) it frees no room for the copies: it leaves after them.
 - **Never behind a link**: a file whose source is behind a link or junction
   the backup does not follow stays.
 - **A line with read errors removes nothing** in that run (without a
@@ -117,7 +124,8 @@ is on the screen when the question is asked. Its first lines say what matters:
 == mirror_backup 0.14.0-rc2 ====================================================
  MIRROR (scoped) - what changes in H:\BACKUP
  1,204 files (34.1 GB) will be removed from the backup: to the trash until
- 2026-12-19.
+ 2026-12-19. 37 files (2.0 GB) leave the backup, replaced by a newer form of the
+ same file: to the trash until 2026-12-19.
 ================================================================================
                                                          files        size
   already the same                                     98,765      3.21 TB
@@ -146,6 +154,15 @@ is on the screen when the question is asked. Its first lines say what matters:
 ================================================================================
 Mirror now? copy 1,234, replace 39, remove 1,204 [y/N, Enter = no]
 ```
+
+What leaves because a newer form of the same file takes its place (the old copy
+of a changed file, a copy its JXL replaces, a JXL its plain copy replaces) is in
+those first lines too, even when nothing is removed ("No file is removed for
+being gone or unselected. 1 file (0.4 KB) leaves the backup, replaced by a newer
+form of the same file: to the trash until ..."), and the trash folder is printed
+whenever something goes there *(v0.14.0)*. A file left as it is by
+`--adopt-by-hash` (read-only, the source's bytes) has its own row, *left as they
+are*.
 
 Anything that needs attention follows in its own lines marked `!!` (the trash
 cannot be used, read errors, a line over the limit, a total mirror). After the
@@ -249,6 +266,8 @@ mirror of its manifest with `--unattended` ([menu.md](menu.md#unattended-runs-ta
 | `--allow-mass-delete` | let a line remove or replace more than `MIRROR_MAX_DELETE_PERCENT` of its files without typing the number |
 | `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, for the lines that keep TIFF or JPEG as JXL (default `JXLPHOTO`) *(v0.14.0-rc2)* |
 | `--retry-conversions` | try again what jxl-photo could not convert in `CONVERT_GIVE_UP_AFTER` runs in a row *(v0.14.0-rc6; [a file jxl-photo cannot convert](tiff_to_jxl.md#a-file-jxl-photo-cannot-convert))* |
+| `--reconvert-older` | make again every TIFF kept as JXL whose JXL was made by an older jxl-photo; the old JXL goes to the trash (each counts in its line's limit). One run; not with `--no-convert` ([a new jxl-photo](tiff_to_jxl.md#a-new-jxl-photo)) |
+| `--adopt-by-hash` \| `--no-adopt-by-hash` | adopt a backup file that has no row only when its bytes are the source's (both are read); the same size with another date is adopted, its date set to the source's (default `ADOPT_BY_HASH`; [a backup made by another program](reruns_and_moves.md#a-backup-made-by-another-program)) |
 | `--no-convert` | the conversion off for this run: what would be converted is copied as it is; the JXL already in the backup stay, unless their file changed *(v0.14.0-rc5; [the conversion off](tiff_to_jxl.md#the-conversion-off-a-trip-with-a-slow-computer))* |
 | `--work-dir PATH` | where the conversions run (default `JXL_WORK_DIR`; empty = the system's temp folder) *(v0.14.0-rc5)* |
 | `--unattended` | nobody at the console: never ask; what needs a typed number stops the run (implies `--yes`) |

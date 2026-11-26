@@ -53,6 +53,8 @@ selective_backup.py --source PATH [--source PATH ...] --dest PATH [options]
 | `--jpeg {copy,jxl}` | the JPEGs (exports too): copied as they are (`copy`, default) or kept as JXL by jxl-photo's lossless transcode, proven byte for byte *(v0.14.0-rc3)* |
 | `--jxlphoto PATH` | jxl-photo's `jxl_photo.py` or `jxl-photo.exe`, for `--tiff` and `--jpeg` (default `JXLPHOTO`). A run that asks for either without jxl-photo is refused before anything is read, exit 2 |
 | `--retry-conversions` | try again the TIFFs and JPEGs jxl-photo could not convert in `CONVERT_GIVE_UP_AFTER` runs in a row (after a new libjxl, say) *(v0.14.0-rc6; [a file jxl-photo cannot convert](tiff_to_jxl.md#a-file-jxl-photo-cannot-convert))* |
+| `--reconvert-older` | make again every TIFF kept as JXL whose JXL was made by an older jxl-photo than the one this run uses (a version that cannot be read counts as older; a newer or the same one is left alone); the old JXL goes to `versions\` (a mirror: its trash). One run; a JPEG's JXL is never made again; not with `--no-convert` *(v0.14.0; [a new jxl-photo](tiff_to_jxl.md#a-new-jxl-photo))* |
+| `--adopt-by-hash` \| `--no-adopt-by-hash` | a backup file with no catalog row (made by another program) is adopted only when its bytes are the source's: both are read (SHA-256). The same size with another date is adopted too, its date set to the source's. Default `ADOPT_BY_HASH` *(v0.14.0; [a backup made by another program](reruns_and_moves.md#a-backup-made-by-another-program))* |
 | `--no-convert` | the conversion off for this run (a slow computer, a trip): a TIFF or JPEG that `--tiff`/`--jpeg` would convert is copied as it is, not a failure; the JXL already in the backup stay unless their file changed; no jxl-photo needed *(v0.14.0-rc5; [the conversion off](tiff_to_jxl.md#the-conversion-off-a-trip-with-a-slow-computer))* |
 | `--work-dir PATH` | where the conversions of `--tiff` and `--jpeg` run, jxl-photo's temp files too (default `JXL_WORK_DIR`; empty = the system's temp folder); never inside or above a source or the backup, exit 2 *(v0.14.0-rc5)* |
 | `--expect-backup-id ID` | abort (exit 2) unless the destination holds this backup ID; also applies to `--verify` and `--dry-run` |
@@ -98,6 +100,7 @@ default everywhere — the menu reads them from there too.
 | `EXCLUDE_FOLDERS` | (empty) | `;`-separated folder names skipped anywhere |
 | `SYSTEM_SKIP_FOLDERS` | `$RECYCLE.BIN;System Volume Information` | always skipped |
 | `VERIFY_COPY` | `hash` | default `--verify-copy` |
+| `ADOPT_BY_HASH` | `False` | default `--adopt-by-hash`: adopt a backup file that has no row only when its bytes are the source's (both are read) |
 | `SPACE_MARGIN_GB` | `20.0` | free space kept on the destination |
 | `MTIME_TOLERANCE_S` | `2.0` | mtime tolerance (FAT/exFAT stores 2 s steps) |
 | `COPY_CHUNK_MB` | `8` | read/write block size, at most: a smaller file is read with a block of its own size *(v0.13.1; 2.5 ms less per small file)* |

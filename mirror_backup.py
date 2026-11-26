@@ -261,6 +261,10 @@ def _plain_backend_args(args, extra):
         argv.append("--no-convert")
     if getattr(args, "retry_conversions", False):
         argv.append("--retry-conversions")
+    if getattr(args, "reconvert_older", False):
+        argv.append("--reconvert-older")
+    argv.append("--adopt-by-hash" if getattr(args, "adopt_by_hash", sb.ADOPT_BY_HASH)
+                else "--no-adopt-by-hash")
     if args.expect_backup_id:
         argv += ["--expect-backup-id", args.expect_backup_id]
     if args.dry_run:
@@ -858,8 +862,8 @@ class MirrorJob:
         # changed files: ours go to the trash, any other old copy to versions\
         self.ours_changed = {}
         for status in statuses:
-            if status.status != sb.ST_CHANGED:
-                continue
+            if status.status != sb.ST_CHANGED or status.held:
+                continue                # a held file is left as it is (review 261126, S5)
             if status.planned.convert and not status.old_outputs and status.replaces:
                 # a copy as it is whose source changed (v0.14.0-rc6 review, S3): no JXL
                 # is there yet; its old copy is the "retire" item below
@@ -875,6 +879,21 @@ class MirrorJob:
                 self.items.append(_Item("versions", "not_catalogued" if row is None else "changed",
                                         None, status.planned.rel, size or 0, status.planned.src,
                                         "not written by the backup: the old copy goes to versions\\"))
+        for status in statuses:
+            # a JXL group the manifest no longer wants: it leaves once the plain
+            # copy is in place (the mirror always replaces what changed), like
+            # a copy its JXL replaces
+            for rel in status.undoes:
+                row = self.rows_by_key.get(rel.casefold())
+                folder = os.path.dirname(os.path.join(dest, rel))
+                found = sb._listed_or_stat(os.path.join(dest, rel), listings.get(folder))
+                item = _Item("retire", "replaced_by_plain",
+                             self.line_of(row.source_path) if row is not None else None, rel,
+                             found[0] if found else 0,
+                             row.source_path if row is not None else status.planned.src,
+                             "a JXL that its plain copy replaces", row=row)
+                self.items.append(item)
+                self.retire_items[rel.casefold()] = item
         # the limit per line counts what is removed and what of ours is replaced
         self._check_limit(rows)
         # files the backup did not write, in the folders the mirror touches
@@ -927,11 +946,14 @@ class MirrorJob:
                                                                   status.planned.mtime_ns)
         freed = sum(run.nbytes for run in self.expired)
         if self.for_good and self.trash_problem is None:
-            freed += sum(item.size for item in self._items("remove", "replace", "retire"))
+            # a JXL its plain copy replaces leaves only after every copy (N3 of
+            # the review 261126): it frees no room for them
+            freed += sum(item.size for item in self._items("remove", "replace", "retire")
+                         if item.reason != "replaced_by_plain")
         new = [status for status in statuses
                if status.status == sb.ST_NEW and not status.planned.convert]
-        changed = [status for status in statuses
-                   if status.status == sb.ST_CHANGED and not status.planned.convert]
+        changed = [status for status in statuses if status.status == sb.ST_CHANGED
+                   and not status.planned.convert and not status.held]
         converts = [status for status in statuses if status.planned.convert
                     and status.status in (sb.ST_NEW, sb.ST_CHANGED)]
         self.numbers = {"new": len(new), "changed": len(changed),
@@ -948,8 +970,8 @@ class MirrorJob:
         self.over_limit = []
         removes = collections.Counter()
         nbytes = collections.Counter()
-        for item in self._items("remove", "replace"):
-            if item.line is None:
+        for item in self._items("remove", "replace", "retire"):
+            if item.line is None or (item.action == "retire" and item.reason != "replaced_by_plain"):
                 continue
             if (item.action == "replace"
                     and os.path.splitext(item.rel)[1].casefold() in sb.AUTO_UPDATE_EXTENSIONS):
@@ -995,7 +1017,9 @@ class MirrorJob:
         what is on the screen when the question comes."""
         same = [s for s in statuses if s.status == sb.ST_UP_TO_DATE]
         new = [s for s in statuses if s.status == sb.ST_NEW and not s.planned.convert]
-        changed = [s for s in statuses if s.status == sb.ST_CHANGED and not s.planned.convert]
+        changed = [s for s in statuses if s.status == sb.ST_CHANGED and not s.planned.convert
+                   and not s.held]
+        held = [s for s in statuses if s.held]
         converts = [s for s in statuses if s.planned.convert
                     and s.status in (sb.ST_NEW, sb.ST_CHANGED)]
         jpegs = [s for s in converts if s.planned.convert == sb.JPEG_CONVERT]
@@ -1003,9 +1027,21 @@ class MirrorJob:
         removes = self._items("remove")
         removed_bytes = sum(item.size for item in removes)
         mode = "total" if self.total else "scoped"
+        # what leaves because a newer form of the same file takes its place: the
+        # old copy of a changed file, a copy its JXL replaces, a JXL its plain
+        # copy replaces (review 261126, S4: they were left out of the verdict)
+        leaving = self._items("replace", "retire")
+        leaving_bytes = sum(item.size for item in leaving)
+        replaced = ""
+        if leaving:
+            replaced = (f"{_files(len(leaving))} ({_size(leaving_bytes)}) "
+                        f"{'leaves' if len(leaving) == 1 else 'leave'} the backup, "
+                        f"replaced by a newer form of the same file: {self._fate()}.")
         if removes:
             verdict = (f"{_files(len(removes))} ({_size(removed_bytes)}) will be removed from "
-                       f"the backup: {self._fate()}.")
+                       f"the backup: {self._fate()}." + (f" {replaced}" if replaced else ""))
+        elif leaving:
+            verdict = f"No file is removed for being gone or unselected. {replaced}"
         else:
             verdict = "Nothing will be removed from the backup."
         lines = ["", _top_rule(), f" MIRROR ({mode}) - what changes in {self.dest}"]
@@ -1029,13 +1065,21 @@ class MirrorJob:
             if others:
                 lines.append(_table_line("old copy to versions\\ (not written by the backup)",
                                          len(others), sum(item.size for item in others), indent=4))
+        if held:
+            lines.append(_table_line("left as they are (read-only, the source's bytes)",
+                                     len(held), sum(s.planned.size for s in held)))
         if tiffs:
             lines.append(_table_line("convert TIFF to JXL (the TIFF's size)", len(tiffs),
                                      sum(s.planned.size for s in tiffs)))
         if jpegs:
             lines.append(_table_line("convert JPEG to JXL (lossless)", len(jpegs),
                                      sum(s.planned.size for s in jpegs)))
-        retires = self._items("retire")
+        undone = [item for item in self._items("retire") if item.reason == "replaced_by_plain"]
+        if undone:
+            where = "deleted (no trash)" if self.for_good else "to the trash"
+            lines.append(_table_line(f"JXL replaced by the file ({where})", len(undone),
+                                     sum(item.size for item in undone), indent=4))
+        retires = [item for item in self._items("retire") if item.reason != "replaced_by_plain"]
         if retires:
             where = "deleted (no trash)" if self.for_good else "to the trash"
             lines.append(_table_line(f"old copy replaced by its JXL ({where})", len(retires),
@@ -1075,7 +1119,7 @@ class MirrorJob:
             lines += ["", "  Where the files to remove are (the folders with the most):"]
             for folder, count in groups.most_common(MIRROR_SUMMARY_LINES):
                 lines.append(_table_line(folder, count, group_bytes[folder], indent=4))
-        if (removes or self._items("replace")) and not self.for_good:
+        if (removes or leaving) and not self.for_good:
             lines += ["", f"  Removed and replaced files can be copied back from this folder "
                           f"until {_until()}:", f"    {os.path.join(_trash_root(self.dest), self.stamp)}"]
         if strays:
@@ -1447,31 +1491,35 @@ class MirrorJob:
         if row is None and rel.casefold() in self.adoptable:
             source_size, source_mtime_ns = self.adoptable[rel.casefold()]
             row = SimpleNamespace(size=source_size, mtime_ns=sb._db_ns(source_mtime_ns))
+        item = self.retire_items.get(rel.casefold())
+        # what takes its place: a JXL (a TIFF copy it replaces), or the plain copy
+        # (a JXL group the manifest no longer wants)
+        by, kind = (("its plain copy", "undone") if item is not None
+                    and item.reason == "replaced_by_plain" else ("its JXL", "jxl"))
         state, size, mtime_ns = _dest_stat(path)
         if state == "unreadable":
             raise OSError(f"cannot be read in the backup; it stays: {rel}")
         if state == "ok" and row is not None and _ours(row, size, mtime_ns):
             if self.for_good:
                 _delete_file(path)
-                log.log(f"MIRROR DELETED {rel} (replaced by its JXL)")
-                self.replaced["jxl_for_good"] += 1
-                result = "deleted for good (replaced by its JXL)"
+                log.log(f"MIRROR DELETED {rel} (replaced by {by})")
+                self.replaced[f"{kind}_for_good"] += 1
+                result = f"deleted for good (replaced by {by})"
             else:
                 target = os.path.join(_trash_root(dest), stamp, rel)
                 os.makedirs(sb._io(os.path.dirname(target)), exist_ok=True)
                 used = sb._move_aside(path, target)
-                log.log(f"MIRROR TRASH {rel} (replaced by its JXL)"
+                log.log(f"MIRROR TRASH {rel} (replaced by {by})"
                         + ("" if used == target else f" (kept as {os.path.basename(used)})"))
-                self.replaced["jxl_trash"] += 1
-                result = "to the trash (replaced by its JXL)"
+                self.replaced[f"{kind}_trash"] += 1
+                result = f"to the trash (replaced by {by})"
             self.changed_something = True
         elif state == "ok":
             sb._move_file_to_versions(dest, stamp, rel, log)
-            self.replaced["jxl_versions"] += 1
+            self.replaced[f"{kind}_versions"] += 1
             result = "to versions\\ (not written by the backup)"
         else:
             result = "already missing"
-        item = self.retire_items.get(rel.casefold())
         if item is not None:
             item.result = result
 
@@ -1485,6 +1533,10 @@ class MirrorJob:
         not_now = [item for item in self._items("remove", "drop_row")
                    if item.result.startswith(("not removed", "kept"))]
         errors = self.errors + error_count
+        info = self.convert_info or {}
+        # the headline says what the "errors" row and the exit code say: every
+        # error of the run, and a failed conversion (review 261126, S5)
+        all_errors = errors + self.purged[2] + info.get("errors", 0)
         title = "MIRROR INTERRUPTED" if interrupted else "MIRROR DONE"
         replaced = self.replaced["done"]
         fate = "deleted for good" if self.for_good else f"in the trash until {_until()}"
@@ -1492,8 +1544,14 @@ class MirrorJob:
                  + (f" ({_n(replaced)} of them replacing a changed file)" if replaced else "")]
         parts.append(f"{_n(len(removed))} removed from the backup ({fate})" if removed
                      else "nothing removed from the backup")
-        headline = ("; ".join(parts) + ". "
-                    + ("No errors." if not errors else f"{_n(errors)} ERRORS: see the log."))
+        if all_errors:
+            ending = f"{_n(all_errors)} ERRORS: see the log."
+        elif info.get("failed"):
+            ending = (f"{_n(info['failed'])} could not be converted (copied as they are): see "
+                      f"the log.")
+        else:
+            ending = "No errors."
+        headline = "; ".join(parts) + ". " + ending
         lines = ["", _top_rule(), f" {title} - {self.dest}"]
         lines += _wrap(headline)
         lines += [_RULE, _table_head()]
@@ -1517,7 +1575,6 @@ class MirrorJob:
         if not_now:
             lines.append(_table_line("not removed after all (changed since the plan)",
                                      len(not_now), sum(item.size for item in not_now)))
-        info = self.convert_info or {}
         if info.get("converted") or info.get("failed") or info.get("retired"):
             kinds = ", ".join(f"{info[kind]} {kind.upper()}" for kind in ("tiff", "jpeg")
                               if info.get(kind))
@@ -1533,10 +1590,16 @@ class MirrorJob:
             if info.get("failed"):
                 lines.append(_table_line("copied as they are (the conversion failed)",
                                          info["failed"]))
+        for key, label in (("undone_trash", "JXL replaced by their plain copy: to the trash"),
+                           ("undone_for_good", "JXL replaced by their plain copy: deleted (no trash)"),
+                           ("undone_versions", "JXL replaced by their plain copy: to versions\\")):
+            if self.replaced[key]:
+                lines.append(_table_line(label, self.replaced[key]))
         if self.purged[0] or self.purged[2]:
             lines.append(_table_line("trash deleted for good", self.purged[0], self.purged[1]))
         lines.append(_table_line("errors", errors + self.purged[2] + info.get("errors", 0)))
-        if (removed or self.replaced["trash"] or self.replaced["jxl_trash"]) and not self.for_good:
+        if (removed or self.replaced["trash"] or self.replaced["jxl_trash"]
+                or self.replaced["undone_trash"]) and not self.for_good:
             lines += ["", f"  Removed and replaced files are in this folder until {_until()};",
                       "  to get one back, copy it from there (the folders are the same as in the backup):",
                       f"    {os.path.join(_trash_root(self.dest), self.stamp)}"]
@@ -1824,6 +1887,15 @@ def build_parser():
     parser.add_argument("--retry-conversions", action="store_true",
                         help="try again the TIFFs and JPEGs jxl-photo could not convert in "
                              "CONVERT_GIVE_UP_AFTER runs in a row (after a new libjxl, say)")
+    parser.add_argument("--reconvert-older", action="store_true",
+                        help="make again every TIFF kept as JXL whose JXL was made by an older "
+                             "jxl-photo; the old JXL goes to the trash. One run; not with "
+                             "--no-convert")
+    parser.add_argument("--adopt-by-hash", action=argparse.BooleanOptionalAction,
+                        default=sb.ADOPT_BY_HASH,
+                        help="adopt a backup file that has no row only when its bytes are the "
+                             "source's (both are read); the same size with another date is "
+                             "adopted, its date set to the source's (default: ADOPT_BY_HASH)")
     parser.add_argument("--expect-backup-id", default=None, metavar="ID",
                         help="abort unless the destination holds this backup ID")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -1837,6 +1909,8 @@ def main(argv=None):
     parser = build_parser()
     try:
         args, extra = parser.parse_known_args(argv)
+        if args.reconvert_older and args.no_convert:
+            parser.error("--reconvert-older cannot be combined with --no-convert")
     except SystemExit as exc:
         code = exc.code
         if code is None:

@@ -135,6 +135,11 @@ def _remembered_jxlphoto():
     return _remembered("jxlphoto")
 
 
+# the options of a run that backs nothing up: it never gets nor spends the
+# one-run markers (_retry_marker, _reconvert_marker; review 261126, S3)
+_NOT_A_BACKUP = ("--verify", "--analyze", "--show-trash", "--empty-trash")
+
+
 def _run_child(script, argv):
     """Run one of the scripts with `argv`; its output (and its questions) go
     straight to the console. A script that converts or restores files kept as
@@ -145,7 +150,8 @@ def _run_child(script, argv):
     `--no-convert`. Asked to try again the files jxl-photo could not convert
     ([4] Settings: _retry_marker, v0.14.0-rc6), the backups get
     `--retry-conversions` until one of them really runs (no dry-run, exit 0
-    or 1)."""
+    or 1); the same for `--reconvert-older` (_reconvert_marker). A verify, an
+    analysis or the mirror's trash commands get neither (_NOT_A_BACKUP)."""
     argv = list(argv)
     remembered = _remembered_jxlphoto()
     if (remembered and "--jxlphoto" not in argv
@@ -159,11 +165,21 @@ def _run_child(script, argv):
             and script in (BACKEND, MANIFEST_BACKEND, MIRROR_BACKEND)
             and "--verify" not in argv):
         argv.append("--no-convert")
+    # the one-run markers go only to a run that backs up: never a verify, an
+    # analysis or the mirror's trash commands, which would accept the flag and
+    # spend the marker without converting anything (review 261126, S3)
+    backs_up = (script in (BACKEND, MANIFEST_BACKEND, MIRROR_BACKEND)
+                and not any(flag in argv for flag in _NOT_A_BACKUP)
+                and "--no-convert" not in argv)
     retry = (os.path.isfile(_retry_marker()) and "--retry-conversions" not in argv
-             and script in (BACKEND, MANIFEST_BACKEND, MIRROR_BACKEND)
-             and "--verify" not in argv and "--no-convert" not in argv)
+             and backs_up)
     if retry:
         argv.append("--retry-conversions")
+    # the same for "make again the TIFF JXL made by an older jxl-photo" (261126)
+    reconvert = (os.path.isfile(_reconvert_marker()) and "--reconvert-older" not in argv
+                 and backs_up)
+    if reconvert:
+        argv.append("--reconvert-older")
     code = 130
     try:
         code = subprocess.run([sys.executable, script, *argv]).returncode
@@ -177,6 +193,18 @@ def _run_child(script, argv):
                 os.remove(_retry_marker())
             except OSError:
                 pass
+        if reconvert and "--dry-run" not in argv and code in (0, 1):
+            try:                # that one run made them again: done
+                os.remove(_reconvert_marker())
+            except OSError:
+                pass
+
+
+def _reconvert_marker():
+    """The file that asks the next backup to make again the TIFFs kept as JXL
+    by an older jxl-photo (--reconvert-older, 261126): beside the menu's own
+    file, apart from it, like _retry_marker."""
+    return CONFIG_PATH + ".reconvert-older"
 
 
 def _retry_marker():
@@ -1170,7 +1198,7 @@ def settings_menu(config):
     for name in ("EXPORT_FORMATS", "EXPORT_NAME_CONTAINS", "EXCLUDE_EXPORT_SUBFOLDERS",
                  "UNSELECTED", "UNEXPORTED", "COPY_CAPTUREONE_CACHE",
                  "COPY_JXLPHOTO_DERIVATIVES", "AUTO_UPDATE",
-                 "AUTO_UPDATE_EXTENSIONS", "SPACE_MARGIN_GB", "VERIFY_COPY"):
+                 "AUTO_UPDATE_EXTENSIONS", "SPACE_MARGIN_GB", "VERIFY_COPY", "ADOPT_BY_HASH"):
         say(f"    {name:<26} {_setting(name)!r}")
     say("  TIFF and JPEG kept as JXL in the backup (a manifest's Tiff and Jpeg columns):")
     for name in ("JXLPHOTO", "JXLPHOTO_MIN_VERSION", "TIFF_JXL_PROFILES", "JPEG_JXL_EXTENSIONS",
@@ -1227,6 +1255,23 @@ def settings_menu(config):
                                  f"(--retry-conversions); removed when it has run\n")
             say("  Cancelled." if asked else
                 "  The next backup (or manifest, or mirror) tries them again.")
+        except OSError as exc:
+            say(f"  Not saved: {exc}", "yellow")
+    again = os.path.isfile(_reconvert_marker())
+    say(f"  TIFF kept as JXL by an older jxl-photo: "
+        f"{'made again by the next backup' if again else 'kept as they are'}")
+    if yes_no("Cancel making them again?" if again else
+              "Make again the TIFF JXL made by an older jxl-photo (next backup only)?", False):
+        try:
+            if again:
+                os.remove(_reconvert_marker())
+            else:
+                with open(_reconvert_marker(), "w", encoding="utf-8") as handle:
+                    handle.write(f"{datetime.datetime.now().isoformat(timespec='seconds')}: the "
+                                 f"next backup makes again the TIFF JXL made by an older "
+                                 f"jxl-photo (--reconvert-older); removed when it has run\n")
+            say("  Cancelled." if again else
+                "  The next backup (or manifest, or mirror) makes them again.")
         except OSError as exc:
             say(f"  Not saved: {exc}", "yellow")
     say("  Defaults of mirror_backup.py (edit the top of that file to change them):")

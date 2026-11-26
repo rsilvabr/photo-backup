@@ -403,6 +403,10 @@ def _backend_args(parsed, rows, dest):
         argv.append("--no-convert")
     if getattr(parsed, "retry_conversions", False):
         argv.append("--retry-conversions")
+    if getattr(parsed, "reconvert_older", False):
+        argv.append("--reconvert-older")
+    argv.append("--adopt-by-hash" if getattr(parsed, "adopt_by_hash", sb.ADOPT_BY_HASH)
+                else "--no-adopt-by-hash")
     if not parsed.auto_update:
         argv.append("--no-auto-update")
     if parsed.expect_backup_id:
@@ -632,6 +636,15 @@ def build_parser():
     parser.add_argument("--retry-conversions", action="store_true",
                         help="try again the TIFFs and JPEGs jxl-photo could not convert in "
                              "CONVERT_GIVE_UP_AFTER runs in a row (after a new libjxl, say)")
+    parser.add_argument("--reconvert-older", action="store_true",
+                        help="make again every TIFF kept as JXL whose JXL was made by an older "
+                             "jxl-photo; the old JXL goes to versions. One run; not with "
+                             "--no-convert")
+    parser.add_argument("--adopt-by-hash", action=argparse.BooleanOptionalAction,
+                        default=sb.ADOPT_BY_HASH,
+                        help="adopt a backup file that has no row only when its bytes are the "
+                             "source's (both are read); the same size with another date is "
+                             "adopted, its date set to the source's (default: ADOPT_BY_HASH)")
     parser.add_argument("--verify", choices=("quick", "full"), default=None,
                         help="verify the backup against what the manifest selects (no copy)")
     parser.add_argument("--max-gb", type=float, default=sb.VERIFY_MAX_GB, metavar="N",
@@ -648,6 +661,8 @@ def main(argv=None):
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
+        if args.reconvert_older and args.no_convert:
+            parser.error("--reconvert-older cannot be combined with --no-convert")
     except SystemExit as exc:
         code = exc.code
         if code is None:

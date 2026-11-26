@@ -63,6 +63,36 @@ how much of what is needed may be moves *(v0.12.1)*: `Not enough space: need
 (possible moves, ...)`. Make room, or use `--no-detect-moves` knowing that
 everything is then copied again.
 
+## A backup made by another program
+
+A folder half copied by FreeFileSync, or by hand, holds files this backup did not write:
+no catalog row. Today a file there with the source's size and date is adopted (a row
+without a hash, `--verify full` fills it); the same size with another date is a
+changed file (reported, or moved to `versions\` and copied again with
+`--update-changed`).
+
+`--adopt-by-hash` (or `ADOPT_BY_HASH = True` at the top of `selective_backup.py`) asks
+for proof instead: for every such file the source and the backup file are both read
+and their SHA-256 compared (the cost: twice the size of those files, read once per
+run; the menu's dry-run reads them too, so a menu backup reads them twice before it
+copies anything).
+
+- Same bytes: adopted, its row has the hash. When its date was another, the backup
+  sets it to the source's (the file's bytes are never written), so it is current.
+- Same bytes, another date, and the file is read-only: left as it is in that run —
+  not adopted, not replaced (not even with `--update-changed` or by the mirror),
+  never made writable; `ADOPT SKIPPED ...: read-only` in the log, a row *the
+  source's bytes, read-only: left as they are* in the summary, and no error.
+  Clear its read-only attribute to let the next run adopt it.
+- Same size and date as the source, other bytes: a changed file (`ADOPT REFUSED`).
+  Nothing remembers it: a later run without the option adopts it by its size and
+  date, as before.
+- Anything unreadable, a link, or a file that changed while it was read: left as it
+  is, without a row (`ADOPT SKIPPED`). A file that changed between the reading and
+  the write (or was made read-only meanwhile) is left without a row too (`ADOPT
+  SKIPPED` / `ADOPT FAILED`): an error, exit 1.
+- A dry-run does the reading too and says in the summary what would be adopted.
+
 ## Orphans
 
 A backup file whose source no longer exists is an **orphan** (an original you

@@ -322,13 +322,13 @@ def test_settings_remember_jxlphoto_after_checking_it(tmp_path, monkeypatch, men
     monkeypatch.delenv("FAKE_JXLPHOTO_VERSION", raising=False)
     # answers: jxl-photo? its path; the work folder? (rc5) no; the conversion off? no;
     # try the failed conversions again? (rc6) no; forget the choices? no
-    script(monkeypatch, ["y", str(tmp_path / "missing.py"), "n", "n", "n", "n"])
+    script(monkeypatch, ["y", str(tmp_path / "missing.py"), "n", "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert "jxlphoto" not in menu.load_config()                 # not found: not saved
-    script(monkeypatch, ["y", f'"{tool}"', "n", "n", "n", "n"])
+    script(monkeypatch, ["y", f'"{tool}"', "n", "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["jxlphoto"] == str(tool)
-    script(monkeypatch, ["y", "-", "n", "n", "n", "n"])
+    script(monkeypatch, ["y", "-", "n", "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["jxlphoto"] == ""
 
@@ -362,13 +362,13 @@ def test_settings_remember_the_work_folder_when_it_exists(tmp_path, monkeypatch,
     work.mkdir()
     # answers: jxl-photo? no; the work folder? yes, its path; the conversion off? no;
     # try the failed conversions again? no; forget the choices? no
-    script(monkeypatch, ["n", "y", str(tmp_path / "missing"), "n", "n", "n"])
+    script(monkeypatch, ["n", "y", str(tmp_path / "missing"), "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert "work_dir" not in menu.load_config()                 # not a folder: not saved
-    script(monkeypatch, ["n", "y", f'"{work}"', "n", "n", "n"])
+    script(monkeypatch, ["n", "y", f'"{work}"', "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["work_dir"] == str(work)
-    script(monkeypatch, ["n", "y", "-", "n", "n", "n"])
+    script(monkeypatch, ["n", "y", "-", "n", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["work_dir"] == ""
 
@@ -405,7 +405,7 @@ def test_the_conversion_off_on_this_computer(monkeypatch, menu_config):
     menu says so on top; the same question turns it back on."""
     # answers: jxl-photo? no; the work folder? no; the conversion off? yes; try the failed
     # conversions again? no; forget? no
-    script(monkeypatch, ["n", "n", "y", "n", "n"])
+    script(monkeypatch, ["n", "n", "y", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["no_convert"] == "yes"
     commands = []
@@ -424,7 +424,7 @@ def test_the_conversion_off_on_this_computer(monkeypatch, menu_config):
     tails = [command[2:] for command in commands]
     assert [tail[-1] == "--no-convert" for tail in tails] == [True, True, True, False, False,
                                                               False]
-    script(monkeypatch, ["n", "n", "y", "n", "n"])
+    script(monkeypatch, ["n", "n", "y", "n", "n", "n"])
     menu.settings_menu(menu.load_config())
     assert menu.load_config()["no_convert"] == ""
 
