@@ -106,10 +106,24 @@ def row_count(text, label):
     return None
 
 
-def latest_log(log_dir):
+def latest_log_raw(log_dir):
+    """The newest run log as it is on the disk: every line starts with its
+    time (rc9, N8)."""
     files = sorted(Path(log_dir).glob("*.log"), key=lambda path: path.stat().st_mtime_ns)
     assert files, f"no log file in {log_dir}"
     return files[-1].read_text(encoding="utf-8")
+
+
+def log_messages(text):
+    """A log's text without the time before each line (rc9, N8): the one
+    helper every test that reads a run log goes through."""
+    strip = getattr(selective_backup, "_strip_log_times", None)    # (a log without times: as it is)
+    return strip(text) if strip else text
+
+
+def latest_log(log_dir):
+    """The newest run log's messages (the times taken away: `log_messages`)."""
+    return log_messages(latest_log_raw(log_dir))
 
 
 def latest_csv(log_dir, suffix):

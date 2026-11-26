@@ -51,7 +51,12 @@ days, separately for the normal backup and the mirror:
   or `--analyze` never deletes) on or after the day *taken out + N* deletes that
   run folder, right after the question and before the first copy. Each run
   deletes only in the folders it owns: the normal backup in `versions\` and
-  `originals\`, the mirror in its three trash folders.
+  `originals\`, the mirror in its three trash folders. The day *taken out* is
+  the run folder's name, written with the computer's clock: a run made while
+  the clock was behind (a dead CMOS battery, no time sync) names its folder in
+  the past, and once the clock is right that folder goes that many days early.
+  It cannot be told apart (the folder's own dates come from the same clock):
+  keep the clock right, or use `never`.
 - **`never`** (`None` in the script): never deleted by age; only offered when
   space is short. The default of the normal backup: it keeps everything, as
   before. The mirror keeps its 30 days.
@@ -78,7 +83,14 @@ days, separately for the normal backup and the mirror:
   other bytes) it is kept as an old version.
 - The catalog's table `originals` lists each TIFF copy kept in `originals\` (or
   the mirror's `trash_originals\`): where it is, the name it had, its size, date
-  and SHA-256. Its row goes when the file is deleted.
+  and SHA-256. Its row goes when the file is deleted. *(v0.14.0-rc9)* A TIFF
+  original is used again with proof (the row, the file's size and date, the
+  SHA-256 the JXL was made from): the restore gives it back as it is instead of
+  decoding the JXL (`RESTORED_ORIGINAL`), and when the manifest goes back to
+  `Tiff` = copy the normal backup renames it back to its place instead of
+  copying the TIFF again (`PUT BACK` in the log; a rename that fails, or no
+  proof: copied from the source). The mirror still copies
+  ([details](tiff_to_jxl.md#going-back-from-jxl-to-tiff-the-kept-original-is-renamed-back-v0140-rc9)).
 - Only folders named like a stamp are deleted, by their real path, never through
   a link or junction; a store that is a link stops a real run (exit 2), and so
   does `orphans\` with `--move-orphans` or `tools\` (the programs kept in the

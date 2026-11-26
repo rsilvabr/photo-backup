@@ -17,6 +17,7 @@ import argparse
 import collections
 import contextlib
 import csv
+import errno
 import hashlib
 import json
 import math
@@ -26,6 +27,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import stat as stat_module
 import struct
 import subprocess
 import sys
@@ -38,7 +40,7 @@ from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor, TimeoutErro
 from dataclasses import dataclass, field, replace as _replace_fields
 from datetime import datetime, timedelta
 
-__version__ = "0.14.0-rc8"
+__version__ = "0.14.0-rc9"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -818,6 +820,9 @@ class FileStatus:
                                 # read-only, its bytes the source's (review 261126, S5)
     undo_older: bool = False    # `undoes` is the JXL group of ANOTHER version of the file (known while
                                 # planning): it leaves as an old version, with --update-changed (SF1)
+    from_original: str = None   # a plain TIFF copy that comes back from originals\ by a rename, not a
+                                # copy: the stored_rel of its kept original, proven to be the source
+                                # as it is now (rc9, round 2 of keep-days; _put_back_planned)
 
 
 @dataclass
@@ -1871,6 +1876,31 @@ def _not_converted_again(statuses, dest, rows, tool, retry=False):
     return result
 
 
+def _forget_gone_not_converted(not_converted, statuses, rows_by_key, catalog, log):
+    """rc9 (N7 of the rc6 review): a `not_converted` row of a file this run
+    does not plan (neither as itself nor as its JXL) whose source is proven gone
+    -- its copy's files row names the source, and _source_state says missing
+    (never on unreadable, never without that row) -- is deleted. Only a real
+    run without errors in its plan calls this. Returns how many."""
+    planned = {status.planned.rel.casefold() for status in statuses}
+    forgotten = 0
+    for key, row in not_converted.items():
+        if key in planned or key + ".jxl" in planned:
+            continue
+        copy_row = rows_by_key.get(key)
+        if copy_row is None or not copy_row.source_path:
+            continue                    # no source known: no proof that it is gone
+        if _source_state(copy_row.source_path) != SOURCE_MISSING:
+            continue
+        catalog.forget_not_converted(key)
+        forgotten += 1
+        log.log(f"NOT CONVERTED FORGOTTEN {row.rel}: its source is gone "
+                f"({copy_row.source_path})")
+    if forgotten:
+        catalog.commit()
+    return forgotten
+
+
 def _undo_groups(statuses, groups, rows, log=None):
     """The manifest is the state the backup goes to (v0.14.0, 261126): a plain
     file planned for a TIFF or JPEG whose JXL group is in the catalog (`Jpeg` /
@@ -1937,6 +1967,236 @@ def _undo_proof(status, copied, catalog):
         return _sha256_file(status.dst), None
     except OSError as exc:
         return None, f"the copy in the backup cannot be read ({exc})"
+
+
+def _originals_prefix():
+    """The start of a stored_rel kept in the normal backup's originals\\ (never
+    a mirror's trash folder), casefolded."""
+    return (os.path.join(CATALOG_FOLDER, ORIGINALS_FOLDER) + os.sep).casefold()
+
+
+def _kept_original_proof(path, size, mtime_ns, sha256, wanted, planned, read=True, dest=None,
+                         stored_rel=None):
+    """(the SHA-256 the kept original holds, why not) -- proof that the TIFF copy
+    kept at `path` (its `originals` row: size, mtime_ns, sha256) IS the source
+    as it is now (rc9, round 2 of keep-days): a plain file of the source's
+    size, with the source's date (within MTIME_TOLERANCE_S: a rename keeps
+    it), and the SHA-256 the JXL group was made from (`wanted`) -- the row's,
+    else the file read here (`read`; False = not read: no proof). With `dest`
+    and `stored_rel` (`path` = dest + stored_rel; the review of rc9, M1): no
+    folder from the backup's root to it is a link, a junction or another
+    reparse point (_dest_link), and its real path is the backup's real path +
+    stored_rel -- a junction planted in originals\\ that leads into a source
+    would make the SOURCE file "the kept file", and its rename would move it."""
+    tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
+    if size != planned.size:
+        return None, f"its size is {size}, the source's {planned.size}"
+    if sha256 is not None and sha256 != wanted:
+        return None, "its SHA-256 is not the one its JXL was made from"
+    if dest is not None and stored_rel is not None:
+        link = _dest_link(dest, os.path.dirname(stored_rel), {})
+        if link is not None:
+            return None, (f"it is not a plain file in the backup (a link or junction on the way "
+                           f"to it: {link})")
+        expected = os.path.join(_real(dest), stored_rel)
+        real = _real(path)
+        if os.path.normcase(real) != os.path.normcase(expected):
+            return None, f"it is not a plain file in the backup (it leads to {real})"
+    try:
+        info = os.stat(_io(path), follow_symlinks=False)
+    except OSError as exc:
+        return None, f"it cannot be read ({exc.strerror or exc})"
+    if not stat_module.S_ISREG(info.st_mode) or _is_reparse(path):
+        return None, "it is not a plain file"
+    if info.st_size != size:
+        return None, f"it holds {info.st_size} bytes, its row {size}"
+    if abs(info.st_mtime_ns - planned.mtime_ns) > tolerance:
+        return None, "its date is not the source's"
+    if abs(_db_ns(mtime_ns) - _db_ns(planned.mtime_ns)) > tolerance:
+        return None, "its row's date is not the source's"
+    if sha256 is None:
+        if not read:
+            return None, "its row has no SHA-256"
+        try:
+            sha256 = _sha256_file(path)
+        except OSError as exc:
+            return None, f"it cannot be read ({exc.strerror or exc})"
+        if sha256 != wanted:
+            return None, "its bytes are not the ones its JXL was made from"
+    return sha256, None
+
+
+def _put_back_planned(statuses, groups, originals, dest, log=None):
+    """rc9 (round 2 of keep-days): a plain TIFF copy planned NEW because the
+    manifest no longer keeps the TIFF as JXL (`undoes`, change A) comes back
+    from the normal backup's originals\\ by a rename instead of a copy, when an
+    `originals` row proves that its kept file IS the source as it is now: the
+    source has the JXL group's size and date, and the kept file has them too
+    and the group's SHA-256 (_kept_original_proof). Several: the newest. The
+    status gets `from_original` (not copied; _put_back_originals renames it
+    in the write phase, and copies it from the source after all when that
+    fails). The mirror never comes here (it copies)."""
+    if not originals:
+        return statuses
+    prefix = _originals_prefix()
+    by_source = collections.defaultdict(list)
+    for row in originals:
+        stored_rel = str(row[0])
+        if stored_rel.casefold().startswith(prefix):
+            by_source[str(row[1]).casefold()].append(row)
+    if not by_source:
+        return statuses
+    tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
+    result = []
+    for status in statuses:
+        planned = status.planned
+        key = planned.rel.casefold()
+        candidates = by_source.get(key)
+        group = (groups or {}).get(key)
+        if (candidates and group and status.undoes and not status.undo_older
+                and status.status == ST_NEW and not planned.convert
+                and (group[0].kind or _convert_kind(group[0].source_rel)) == "tiff"
+                and group[0].source_sha256
+                and group[0].source_size == planned.size
+                and abs(_db_ns(group[0].source_mtime_ns) - _db_ns(planned.mtime_ns)) <= tolerance):
+            why_not = []
+            for stored_rel, _source_rel, size, mtime_ns, sha256, _stored_at in sorted(
+                    candidates, key=lambda row: str(row[5] or ""), reverse=True):
+                have, why = _kept_original_proof(os.path.join(dest, stored_rel), size, mtime_ns,
+                                                 sha256, group[0].source_sha256, planned,
+                                                 dest=dest, stored_rel=stored_rel)
+                if why is None:
+                    status = _replace_fields(status, from_original=stored_rel)
+                    if log is not None:
+                        log.log(f"PUT BACK PLANNED {planned.rel}: from {stored_rel} (its bytes "
+                                f"and date are the source's)")
+                    break
+                why_not.append(f"{stored_rel}: {why}")
+            else:
+                if log is not None:
+                    log.log(f"PUT BACK NOT POSSIBLE {planned.rel}: " + "; ".join(why_not)
+                            + "; it is copied from the source")
+        result.append(status)
+    return result
+
+
+def _clear_put_backs(statuses, dest, runs, log, why):
+    """(statuses, the ones cleared): a planned put-back whose kept file lies in
+    one of `runs` (_StoreRun: run folders this run deletes -- past their days,
+    or chosen to make room) cannot be put back: the purge deletes it before
+    the copy. It loses `from_original` and is copied from the source, counted
+    as a copy in the space (review of rc9, S2)."""
+    folders = [os.path.normcase(os.path.abspath(run.path)).rstrip("\\/") + os.sep
+               for run in runs]
+    if not folders:
+        return statuses, []
+    result, cleared = [], []
+    for status in statuses:
+        stored_rel = getattr(status, "from_original", None)
+        if stored_rel:
+            path = os.path.normcase(os.path.abspath(os.path.join(dest, stored_rel)))
+            if any(path.startswith(folder) for folder in folders):
+                status = _replace_fields(status, from_original=None)
+                cleared.append(status)
+                if log is not None:
+                    log.log(f"PUT BACK NOT POSSIBLE {status.planned.rel}: its kept file "
+                            f"{stored_rel} is in a run folder deleted in this run ({why}); it is "
+                            f"copied from the source")
+        result.append(status)
+    return result, cleared
+
+
+def _put_back_originals(statuses, dest, catalog, log, copied_keys, info):
+    """rc9: the write phase of _put_back_planned, before the copy loop. Each
+    status with `from_original`: its kept file is asked again (its row, size,
+    date, and its SHA-256 always read) and the source too (the
+    size and date planned), then RENAMED to its place in the backup's tree --
+    the same volume, never a copy -- its files row written with that SHA-256,
+    its `originals` row deleted, all in one commit that Ctrl+C waits for. The
+    JXL group it undoes then leaves through _retire_undone (`copied_keys`
+    gets the SHA-256: the proof). Any failure leaves the kept file where it is
+    and the status is copied from the source in this run (`from_original`
+    cleared in `statuses`, in place); log `PUT BACK FAILED`. Except a file
+    that appeared at its place (seen here, or refused by the rename): it is
+    never replaced -- the status is `held` for this run (not copied, its JXL
+    stays), an error (`info["errors"]`, exit 1); the next run decides
+    (review of rc9, S1)."""
+    tolerance = int(MTIME_TOLERANCE_S * 1_000_000_000)
+    appeared = "a file appeared at its place"
+    for index, status in enumerate(statuses):
+        stored_rel = getattr(status, "from_original", None)
+        if not stored_rel:
+            continue
+        planned = status.planned
+        key = planned.rel.casefold()
+        why = None
+        renamed = False
+        try:
+            row = catalog.original_row(stored_rel)
+            wanted = catalog.converted_sha256(next(iter(
+                rel.casefold() for rel in status.undoes), ""))
+            if row is None:
+                why = "its row in the catalog's originals table is gone"
+            elif not wanted:
+                why = "the catalog has no SHA-256 of the file its JXL was made from"
+            else:
+                _stored, _source_rel, size, mtime_ns, row_sha, _at = row
+                if row_sha is not None and row_sha != wanted:
+                    sha256, why = None, "its SHA-256 is not the one its JXL was made from"
+                else:
+                    # the kept file is always READ before the rename (as _apply_moves
+                    # does): its digest, never its row's, goes to copied_keys and the
+                    # files row (final review of rc9, SF-1)
+                    sha256, why = _kept_original_proof(os.path.join(dest, stored_rel), size,
+                                                       mtime_ns, None, wanted, planned,
+                                                       dest=dest, stored_rel=stored_rel)
+            if why is None:
+                now = os.stat(_io(planned.src))
+                if (now.st_size != planned.size
+                        or abs(now.st_mtime_ns - planned.mtime_ns) > tolerance):
+                    why = "the source changed since it was planned"
+            if os.path.lexists(_io(status.dst)):
+                why = appeared          # first, whatever else failed (final review, F7)
+            if why is None:
+                os.makedirs(_io(os.path.dirname(status.dst)), exist_ok=True)
+                with _ctrl_c_after():       # the name and the rows go together
+                    try:
+                        _rename_no_clobber(os.path.join(dest, stored_rel), status.dst)
+                    except FileExistsError:
+                        why = appeared      # between the look and the rename
+                    else:
+                        renamed = True
+                        catalog.upsert(planned, sha256, planned.size, planned.mtime_ns)
+                        catalog.forget_original(stored_rel)
+                        catalog.commit()
+                if renamed:
+                    copied_keys[key] = sha256
+                    info["put_back"] = info.get("put_back", 0) + 1
+                    info["put_back_bytes"] = info.get("put_back_bytes", 0) + planned.size
+                    log.log(f"PUT BACK {planned.rel} (renamed from {stored_rel}, not copied)")
+                    continue
+        except OSError as exc:
+            why = str(exc.strerror or exc)
+        except sqlite3.Error as exc:
+            if renamed:
+                # the file is at its place, its rows not written: never copied over;
+                # the next run adopts it by its size and date. The run stops here
+                log.log(f"PUT BACK {planned.rel} (renamed from {stored_rel}), but the catalog "
+                        f"could not be written ({exc})")
+                raise
+            why = f"the catalog could not be read ({exc})"
+        if why == appeared:
+            # never replaced (os.replace) by a copy from the source: left as it
+            # is in this run, its kept original and its JXL with it
+            log.log(f"PUT BACK FAILED {planned.rel}: {why}; it is left as it is, the next run "
+                    f"decides (the kept original {stored_rel} and the JXL stay)")
+            info["put_back_left"] = info.get("put_back_left", 0) + 1
+            info["errors"] = info.get("errors", 0) + 1
+            statuses[index] = _replace_fields(status, from_original=None, held=why)
+            continue
+        log.log(f"PUT BACK FAILED {planned.rel}: {why}; it is copied from the source")
+        info["put_back_failed"] = info.get("put_back_failed", 0) + 1
+        statuses[index] = _replace_fields(status, from_original=None)
 
 
 def _retire_undone(statuses, copied_keys, dest, stamp, catalog, log, keep_old_file, info,
@@ -2797,6 +3057,16 @@ class _Catalog:
         if self._has_originals():
             self.conn.execute("DELETE FROM originals WHERE key=?", (stored_rel.casefold(),))
 
+    def original_row(self, stored_rel):
+        """(stored_rel, source_rel, size, mtime_ns, sha256, stored_at) of one
+        kept TIFF original, or None."""
+        if not self._has_originals():
+            return None
+        row = self.conn.execute(
+            "SELECT stored_rel, source_rel, size, mtime_ns, sha256, stored_at FROM originals "
+            "WHERE key=?", (stored_rel.casefold(),)).fetchone()
+        return tuple(row) if row else None
+
     def originals_rows(self):
         """[(stored_rel, source_rel, size, mtime_ns, sha256, stored_at)], or []."""
         if not self._has_originals():
@@ -2937,6 +3207,24 @@ def _converted_groups(converted):
     return groups
 
 
+def _log_clock():
+    """The time written at the start of each log line (tests patch it)."""
+    return datetime.now()
+
+
+# what `_Logger.log` puts before a line, and the line it writes when the day
+# changes: `_strip_log_times` takes both away (tests read the messages)
+_LOG_TIME = re.compile(r"^(?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2}:\d{2} ")
+_LOG_DAY = re.compile(r"^--- \d{4}-\d{2}-\d{2} ---$")
+
+
+def _strip_log_times(text):
+    """A log's text as the messages were written: without the time at the
+    start of each line and without the `--- date ---` lines."""
+    return "\n".join(_LOG_TIME.sub("", line, count=1)
+                     for line in text.split("\n") if not _LOG_DAY.match(line))
+
+
 class _Logger:
     def __init__(self, prefix):
         os.makedirs(_io(LOG_DIR), exist_ok=True)
@@ -2948,9 +3236,27 @@ class _Logger:
         self.prefix = candidate
         self.path = candidate + ".log"
         self.handle = open(_io(self.path), "a", encoding="utf-8")
+        self.day = None
 
     def log(self, message):
-        self.handle.write(message + "\n")
+        """Every line in the file starts with the time (rc9, N8 of the rc6
+        review: a 22 h run's log must say where the time went); the first line
+        with the date too, and a line `--- YYYY-MM-DD ---` when the day changes.
+        The console never shows it (`out` prints the message as it is)."""
+        now = _log_clock()
+        day = now.date()
+        lines = []
+        if self.day is None:
+            first = f"{now:%Y-%m-%d %H:%M:%S} "
+        else:
+            first = f"{now:%H:%M:%S} "
+            if day != self.day:
+                lines.append(f"--- {day:%Y-%m-%d} ---")
+        self.day = day
+        time_text = f"{now:%H:%M:%S} "
+        for index, line in enumerate(str(message).split("\n")):
+            lines.append((first if index == 0 else time_text) + line)
+        self.handle.write("\n".join(lines) + "\n")
         self.handle.flush()
 
     def out(self, message):
@@ -3384,20 +3690,23 @@ def _purge_store_run(run, dest, folder, log, catalog=None):
                         pass
                 else:
                     size = entry.stat(follow_symlinks=False).st_size
-                    _delete_backup_file(path)
-                    counts[0] += 1
-                    counts[1] += size
-                    if catalog is not None:
-                        try:
-                            catalog.forget_original(os.path.relpath(path, dest))
-                        except sqlite3.Error as exc:
-                            catalog.write_failed = str(exc)
-                            log.log(f"ERROR {folder}: the catalog could not be written ({exc}) "
-                                    f"after deleting {path}; the deletion stops there, the rest "
-                                    f"stays")
-                            counts[2] += 1
-                            stopped.append(True)
-                            return
+                    # the file and its `originals` row go together: Ctrl+C waits
+                    # for both (rc9, 3b: a row of a deleted file was left)
+                    with _ctrl_c_after():
+                        _delete_backup_file(path)
+                        counts[0] += 1
+                        counts[1] += size
+                        if catalog is not None:
+                            try:
+                                catalog.forget_original(os.path.relpath(path, dest))
+                            except sqlite3.Error as exc:
+                                catalog.write_failed = str(exc)
+                                log.log(f"ERROR {folder}: the catalog could not be written "
+                                        f"({exc}) after deleting {path}; the deletion stops "
+                                        f"there, the rest stays")
+                                counts[2] += 1
+                                stopped.append(True)
+                                return
             except OSError as exc:
                 log.log(f"ERROR {folder} {path}: {exc}")
                 counts[2] += 1
@@ -3443,7 +3752,7 @@ def _set_aside_counts(statuses, args):
             counts["versions"] += 1
         if status.planned.convert and copying:
             counts["versions"] += len(status.old_outputs)
-        if status.undoes and (status.status == ST_UP_TO_DATE or copying):
+        if status.undoes and _plain_copy_coming(status, args):
             if not status.undo_older or update_changed:
                 counts["versions"] += len(status.undoes)
         if status.planned.convert and status.replaces and (
@@ -3901,9 +4210,18 @@ def _auto_updated(status, args):
             and os.path.splitext(status.planned.rel)[1].casefold() in AUTO_UPDATE_EXTENSIONS)
 
 
+def _plain_copy_coming(status, args):
+    """Whether the plain copy of a file will be in the backup after this run:
+    there already, copied, or put back from originals\\ (rc9)."""
+    return (status.status == ST_UP_TO_DATE or _will_copy(status, args)
+            or bool(getattr(status, "from_original", None)))
+
+
 def _will_copy(status, args):
     if getattr(status, "held", None):
         return False                    # left as it is in this run (S5 of the review 261126)
+    if getattr(status, "from_original", None):
+        return False                    # renamed back from originals\, not copied (rc9)
     if status.status == ST_NEW:
         return True
     if status.status == ST_CHANGED and getattr(status, "reconvert", False):
@@ -3937,6 +4255,8 @@ def _find_move_candidates(statuses, rows, dest, sources=None):
     candidates = {}
     for status in statuses:
         if status.status != ST_NEW or status.planned.convert:    # a JXL is made, not moved
+            continue
+        if getattr(status, "from_original", None):      # put back from originals\ (rc9)
             continue
         matches = index.get((os.path.basename(status.planned.rel).casefold(),
                              status.planned.size))
@@ -4254,6 +4574,18 @@ def _tiff_lossless(profile, tokens):
         return 1
     if all(value > 0 for value in distances):
         return 0
+    return None
+
+
+def _group_lossless(values):
+    """The `lossless` of a TIFF's JXL group from its pages' (rc9, N4 of the rc6
+    review): 1 only when EVERY page is lossless, 0 when any page is lossy,
+    None (not known) else -- never a lossy page under a lossless flag."""
+    values = list(values)
+    if any(value == 0 for value in values):
+        return 0
+    if values and all(value == 1 for value in values):
+        return 1
     return None
 
 
@@ -5405,12 +5737,11 @@ def _encode_one(status, work, jxlphoto, flush=True, servers=None):
     want = _jxlphoto_srcsum(source_sha)
     stem = os.path.splitext(os.path.basename(tiff))[0].casefold()
     files = []
-    lossless = None
+    page_lossless = []
     for name in names:
         path = os.path.join(work, name)
         tokens = _jxl_tokens(path)
-        if lossless is None or tokens.get("jxlphoto-page", ["0"])[0] == "0":
-            lossless = _tiff_lossless(profile, tokens)
+        page_lossless.append(_tiff_lossless(profile, tokens))
         if want not in [value.casefold() for value in tokens.get("jxlphoto-srcsum", [])]:
             raise _ConvertFailed(f"{name} does not say it was made from these bytes "
                                  f"(jxlphoto-srcsum, JP-4/JP-5)")
@@ -5443,6 +5774,7 @@ def _encode_one(status, work, jxlphoto, flush=True, servers=None):
         item[2], item[3] = stat.st_size, stat.st_mtime_ns
         item[4] = _sha256_file(item[1])
     files.sort(key=lambda item: (item[5], item[0].casefold()))
+    lossless = _group_lossless(page_lossless)
     return _Conversion(stat0.st_size, stat0.st_mtime_ns, source_sha, work,
                        [tuple(item) for item in files], kind="tiff", lossless=lossless,
                        seconds={"read": read - started, "convert": converted - read,
@@ -5464,7 +5796,7 @@ class _SetAside:
         self.left = collections.Counter(dict(at_once or {}))
         self.deleted = collections.Counter()
 
-    def __call__(self, dest, stamp, rel, log, kind="versions"):
+    def __call__(self, dest, stamp, rel, log, kind="versions", why=None):
         path = os.path.join(dest, rel)
         if kind == "jpeg_proven":
             _delete_backup_file(path)
@@ -5492,17 +5824,19 @@ class _SetAside:
         return _handle_old_copy(dest, stamp, status, log, keep_old=keep)
 
 
-def _keep_old_file(dest, stamp, rel, log, kind="versions"):
+def _keep_old_file(dest, stamp, rel, log, kind="versions", why=None):
     """The default home of a backup file a JXL (or a plain copy) replaces:
     versions\\, or originals\\ for a TIFF copy its JXL replaced (the mirror
     passes its own: its trash for what is ours)."""
-    return _SetAside()(dest, stamp, rel, log, kind)
+    return _SetAside()(dest, stamp, rel, log, kind, why)
 
 
-def _retire_file(dest, stamp, rel, catalog, log, keep_old_file, kind="versions"):
+def _retire_file(dest, stamp, rel, catalog, log, keep_old_file, kind="versions", why=None):
     """Move the backup file at `rel` aside (keep_old_file, by its `kind`) and
     drop its row. A TIFF copy kept in an originals store gets its row in the
-    catalog's `originals` table, in the same transaction (261126)."""
+    catalog's `originals` table, in the same transaction (261126). `why`: what
+    takes its place when it is not what the kind says (rc9: the file copied as
+    it is, its conversion failed or off), handed to keep_old_file for its log."""
     path = os.path.join(dest, rel)
     if os.path.lexists(_io(path)):
         known = None
@@ -5514,7 +5848,8 @@ def _retire_file(dest, stamp, rel, catalog, log, keep_old_file, kind="versions")
                     known = (info.st_size, info.st_mtime_ns, None)
                 except OSError:
                     known = None
-        result = keep_old_file(dest, stamp, rel, log, kind=kind)
+        result = (keep_old_file(dest, stamp, rel, log, kind=kind) if why is None
+                  else keep_old_file(dest, stamp, rel, log, kind=kind, why=why))
         used, stored = result if isinstance(result, tuple) else (result, None)
         if stored == "originals" and used and known is not None:
             catalog.record_original(os.path.relpath(used, dest), rel, *known)
@@ -5699,7 +6034,8 @@ def _copy_as_is(status, dest, stamp, catalog, log, keep_old_file, args,
             # disk and checked: the last step before the final name (v0.12.0's
             # rule; v0.14.0-rc6 review, M3: it left first, and a copy that then
             # failed left no file and no row under that name)
-            _retire_file(dest, stamp, tiff_rel, catalog, log, keep_old_file, old_kind)
+            _retire_file(dest, stamp, tiff_rel, catalog, log, keep_old_file, old_kind,
+                         why=f"its new copy, copied as it is ({why}; no JXL made)")
 
         digest, size, mtime_ns = _copy_file(copy, dst, args.verify_copy,
                                             before_final=retire_old if in_the_way else None)
@@ -5708,7 +6044,8 @@ def _copy_as_is(status, dest, stamp, catalog, log, keep_old_file, args,
     # the JXL of an older version of this TIFF: the old copy of a changed file,
     # retired only now that the new bytes are in the backup
     for old_rel in status.old_outputs:
-        _retire_file(dest, stamp, old_rel, catalog, log, keep_old_file)
+        _retire_file(dest, stamp, old_rel, catalog, log, keep_old_file,
+                     why=f"the file copied as it is ({why}; no JXL made)")
     return size
 
 
@@ -5894,6 +6231,13 @@ def _work_root(work_dir=None):
     return root
 
 
+def _cross_device(exc):
+    """Whether an OSError of a rename says the two names are on different
+    volumes (EXDEV; Windows' ERROR_NOT_SAME_DEVICE, 17)."""
+    return (getattr(exc, "winerror", None) == 17
+            or getattr(exc, "errno", None) == errno.EXDEV)
+
+
 def _jxl_copy_needed(work_root, dest):
     """Whether a finished JXL goes from the work folder to the backup by a copy
     (another volume: the system's temp folder) or by a rename. The volume, not
@@ -6039,6 +6383,25 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
                 pending[future] = (index, status, queue)
                 queue[3] += 1
 
+    def place(status, conversion):
+        """_place_group by this run's route. A rename the system refuses as
+        "another device" (two volumes with one serial number: a cloned disk,
+        which `st_dev` takes for one) sends this group, and every one after it,
+        the copy route (rc9, N3 of the rc6 review): said once."""
+        nonlocal copy
+        try:
+            _place_group(status, conversion, dest, stamp, catalog, log, keep_old_file,
+                         tool, copy, args.verify_copy, planned_keys, timing)
+        except OSError as exc:
+            if copy or not _cross_device(exc):
+                raise
+            copy = True
+            log.out(f"The work folder and the backup are on different volumes after all (the "
+                    f"system said: {exc.strerror or exc}); every JXL from now on is copied into "
+                    f"the backup and checked")
+            _place_group(status, conversion, dest, stamp, catalog, log, keep_old_file,
+                         tool, copy, args.verify_copy, planned_keys, timing)
+
     def finish(index, status, future):
         conversion, why = None, problem
         if servers is not None and servers.unavailable and not serve_said:
@@ -6059,8 +6422,7 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
                 timing[name] += seconds
             placing = time.monotonic()
             try:
-                _place_group(status, conversion, dest, stamp, catalog, log, keep_old_file,
-                             tool, copy, args.verify_copy, planned_keys, timing)
+                place(status, conversion)
                 info["converted"] += 1
                 info[conversion.kind] = info.get(conversion.kind, 0) + 1
                 info["bytes_in"] += conversion.source_size
@@ -6193,7 +6555,21 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_cop
     `old_copy(dest, stamp, status, log)` decides what happens to the old copy
     of a CHANGED file (default: _handle_old_copy; the mirror passes its own).
     The TIFFs kept as JXL go through _convert_all after the copies
-    (`keep_old_file`, `convert_info`)."""
+    (`keep_old_file`, `convert_info`). A plain TIFF copy put back from
+    originals\\ (rc9) is renamed first (_put_back_originals); one that cannot be
+    is copied from the source with the rest."""
+    copied_keys = {}                    # the plain copies this run recorded: their SHA-256
+                                        # (_retire_undone's proof, review 261126 S2)
+    if convert_info is None:
+        convert_info = {}
+    if any(getattr(status, "from_original", None) for status in statuses):
+        try:
+            _put_back_originals(statuses, dest, catalog, log, copied_keys, convert_info)
+        except KeyboardInterrupt:
+            _say_stopping(log)
+            _tell("Interrupted while putting TIFF back from originals\\")
+            log.log("INTERRUPTED while putting TIFF back from originals")
+            return 0, 0, 0, True
     to_copy = [status for status in statuses
                if _will_copy(status, args) and not status.planned.convert]
     total_bytes = sum(status.planned.size for status in to_copy)
@@ -6209,8 +6585,6 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_cop
     last_said = (0, 0)
     speed = _Speed()
     log.log(f"Copying {_num(len(to_copy))} files / {_gb(total_bytes)}")
-    copied_keys = {}                    # the plain copies this run recorded: their SHA-256
-                                        # (_retire_undone's proof, review 261126 S2)
     pending = []
     read_ahead = None
     if READ_AHEAD_MB > 0 and to_copy:
@@ -6395,7 +6769,8 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
     orphans' block; `lists`: (file name, what it holds) of the CSVs;
     `space_block`: what is set aside in the backup (261126), after the Space
     line; `replace_label`: the label of the changed files' row."""
-    new = [status for status in statuses if status.status == ST_NEW]
+    new = [status for status in statuses if status.status == ST_NEW
+           and not getattr(status, "from_original", None)]     # put back: a row of its own
     changed = [status for status in statuses if status.status == ST_CHANGED
                and not getattr(status, "held", None)]      # a held one has its own row
     auto = [status for status in changed if _auto_updated(status, args)]
@@ -6550,6 +6925,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     rows = []
     converted = {}
     not_converted = {}
+    originals = []
     candidates = {}
     try:
         read_only_catalog = _Catalog(dest, create=False, readonly=True)
@@ -6570,6 +6946,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             rows = read_only_catalog.all_rows()
             converted = read_only_catalog.converted_rows()
             not_converted = read_only_catalog.not_converted_rows()
+            originals = read_only_catalog.originals_rows()
         except sqlite3.Error as exc:
             message = f"cannot read catalog {read_only_catalog.path}: {exc}"
             print(message, file=sys.stderr)
@@ -6586,6 +6963,10 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     # the manifest is the state: a plain copy planned for a file whose JXL group
     # is in the catalog takes that group away once it is in place (261126)
     statuses = _undo_groups(statuses, groups, rows_by_key, log)
+    if mirror is None:
+        # rc9: such a plain TIFF copy comes back from originals\ by a rename when
+        # the TIFF kept there is the source as it is now (the mirror copies)
+        statuses = _put_back_planned(statuses, groups, originals, dest, log)
     if getattr(args, "no_convert", False):
         statuses = _without_conversion(statuses, dest)
     if not getattr(args, "no_convert", False) and any(s.planned.convert for s in statuses):
@@ -6665,6 +7046,13 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     at_once = {}
     zero_runs = []              # (scan, run) already kept in a store of 0 days: typed (SF1)
     if mirror is None:
+        # a put-back whose kept file expires in this run is deleted before the
+        # copy: it is a copy from the source, and its bytes are needed (S2)
+        statuses, cleared = _clear_put_backs(statuses, dest, [run for _scan, run in expired], log,
+                                             "past its days")
+        if cleared:
+            to_copy = [status for status in statuses if _will_copy(status, args)]
+            needed = sum(status.planned.size for status in to_copy)
         counts = _set_aside_counts(statuses, args)
         at_once = {scan.store.kind: counts[scan.store.kind] for scan in owned_scans
                    if scan.store.days == 0 and counts.get(scan.store.kind)}
@@ -6753,9 +7141,15 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
         extra_lines.append(_summary_row(
             "JPEG copies their JXL replaces", len(retire_jpeg), None,
             f"deleted when their JXL gives the same bytes back (else to {versions_where})"))
+    # rc9: their plain TIFF copy comes back from originals\ by a rename
+    put_back = [status for status in statuses if getattr(status, "from_original", None)]
+    if put_back:
+        extra_lines.append(_summary_row(
+            f"TIFF put back from {ORIGINALS_FOLDER}\\ (renamed, not copied)", len(put_back),
+            sum(status.planned.size for status in put_back), "the source's very bytes"))
     # the JXL groups the manifest no longer wants, whose plain copy will be there
     undoing = [status for status in statuses if status.undoes and not status.undo_older
-               and (status.status == ST_UP_TO_DATE or _will_copy(status, args))]
+               and _plain_copy_coming(status, args)]
     if undoing:
         extra_lines.append(_summary_row(
             f"JXL replaced by their plain copy (to {versions_where})",
@@ -6764,7 +7158,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                 (rel.casefold() for rel in status.undoes) if key in rows_by_key)))
     # ... and those of an older version of the file: old copies (SF1)
     older = [status for status in statuses if status.undoes and status.undo_older
-             and (status.status == ST_UP_TO_DATE or _will_copy(status, args))]
+             and _plain_copy_coming(status, args)]
     if older:
         label = (f"JXL of an older version (to {versions_where})" if args.update_changed
                  else "JXL of an older version: waits for --update-changed")
@@ -6952,6 +7346,25 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             picked, why = _choose_room(options, missing, log)
             if picked:
                 room_runs = [(option.scan, run) for option in picked for run in option.runs]
+                if mirror is None:
+                    # a planned put-back in what was chosen is deleted with it:
+                    # copied from the source, its bytes are needed again (S2);
+                    # still not enough = nothing is deleted
+                    statuses, cleared = _clear_put_backs(
+                        statuses, dest, [run for _scan, run in room_runs], log,
+                        "chosen to make room")
+                    if cleared:
+                        to_copy = [status for status in statuses if _will_copy(status, args)]
+                        needed = sum(status.planned.size for status in to_copy)
+                        chosen = sum(run.nbytes for _scan, run in room_runs)
+                        if needed > free + freed + chosen - margin:
+                            room_runs = []
+                            why = (f"what was chosen holds {_num(len(cleared))} TIFF this run "
+                                   f"would have put back from {ORIGINALS_FOLDER}\\ (renamed, not "
+                                   f"copied); deleted with it, they are copied from the source, "
+                                   f"so this run needs {_gb(needed)} and what was chosen no "
+                                   f"longer makes room; nothing was deleted")
+                            todo = "choose more as well, or make room another way, then run again"
             else:
                 todo = "make room another way, then run again"
         if why is not None:
@@ -7182,6 +7595,10 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
         done, done_bytes, error_count, interrupted = _copy_all(
             args, statuses, dest, stamp, catalog, log, stop_info, old_copy, keep_old_file,
             convert_info)
+        if not interrupted and not planned.errors and not stop_info and not_converted:
+            # rc9 (N7 of the rc6 review): the conversion failures of a file that is
+            # not planned and whose source is proven gone are forgotten
+            _forget_gone_not_converted(not_converted, statuses, rows_by_key, catalog, log)
         log.log(f"moved {moved} files / {_gb(moved_bytes)}")
         log.out(f"copied {done} files / {_gb(done_bytes)}; {error_count} errors")
         if any(convert_info.get(name) for name in ("converted", "failed", "retired")):
@@ -7213,6 +7630,17 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             log.out(f"  {_num(convert_info['undone'])} JXL in the backup replaced by their plain "
                     f"copy (to {'the trash' if mirror is not None else 'versions'})"
                     + (f"; {_num(older)} of them of an older version of the file" if older else ""))
+        if (convert_info.get("put_back") or convert_info.get("put_back_failed")
+                or convert_info.get("put_back_left")):
+            log.out(f"  {_num(convert_info.get('put_back', 0))} TIFF put back from "
+                    f"{ORIGINALS_FOLDER}\\ ({_gb(convert_info.get('put_back_bytes', 0))}; renamed, "
+                    f"not copied)"
+                    + (f"; {_num(convert_info['put_back_failed'])} copied from the source "
+                       f"instead (PUT BACK FAILED in the log)"
+                       if convert_info.get("put_back_failed") else "")
+                    + (f"; ERROR: {_num(convert_info['put_back_left'])} left as they are: a file "
+                       f"appeared at their place, never replaced (PUT BACK FAILED in the log)"
+                       if convert_info.get("put_back_left") else ""))
         if convert_info.get("undo_waits"):
             log.out(f"  {_num(convert_info['undo_waits'])} JXL of an older version of their file "
                     f"stay: --update-changed sets them aside (UNDO WAITS in the log)")

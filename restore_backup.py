@@ -32,6 +32,7 @@ import queue
 import re
 import shutil
 import sqlite3
+import stat as stat_module
 import subprocess
 import sys
 import tempfile
@@ -41,13 +42,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc8"
+__version__ = "0.14.0-rc9"
 
 # ---- Settings -------------------------------------------------------------------
 SPACE_MARGIN_GB = 5.0     # free space kept on each restore target drive (default --space-margin-gb)
 
 GOOD = ("RESTORED", "RESTORED_UNVERIFIED", "RESTORED_FROM_JXL", "RESTORED_AS_JXL",
-        "ALREADY_THERE")
+        "RESTORED_ORIGINAL", "ALREADY_THERE")
 CONVERT_BACK = ("all", "lossless", "none")
 
 
@@ -63,6 +64,14 @@ class _JxlGroup:
         self.members = []                   # [(sb._Row, sb._Converted)], by page
         self.sha256 = converted.source_sha256
         self.kind = converted.kind or sb._convert_kind(converted.source_rel)
+        # rc9 (round 2 of keep-days): the TIFF copy its JXL replaced, kept in the
+        # backup's originals\ with proof that it holds these very bytes:
+        # (stored_rel, size, mtime_ns) of the one restored instead of decoding
+        self.original = None
+        self.fallback = None        # the status it has when that copy cannot be used
+
+    def names(self):
+        return [self.rel] + [row.rel for row, _conv in self.members]
 
     def whole(self):
         pages = sorted(conv.page for _row, conv in self.members)
@@ -74,8 +83,12 @@ class _JxlGroup:
 
     def lossless(self):
         """1 when the original comes back exactly (a JPEG's bytes, a lossless
-        TIFF's pixels), 0 when lossy, None when the catalog does not know."""
-        return 1 if self.kind == "jpeg" else self.conv.lossless
+        TIFF's pixels), 0 when lossy, None when the catalog does not know.
+        A multipage TIFF: lossless only when every page's row says so (rc9, N4)."""
+        if self.kind == "jpeg":
+            return 1
+        values = [conv.lossless for _row, conv in self.members] or [self.conv.lossless]
+        return sb._group_lossless(values)
 
 
 def _drive_root(path):
@@ -142,6 +155,63 @@ def _find_jxlphoto(given, backup):
             return candidate, "kept in the backup"
         why = f"{why}; the one kept in the backup: {problem}"
     return None, why
+
+
+def _kept_original(group, candidates, backup):
+    """(stored_rel, size, mtime_ns) of the TIFF copy kept in the backup (the
+    catalog's `originals` table, read only) that PROVES to be the TIFF this
+    JXL group was made from, or None (rc9, round 2 of keep-days). A row is
+    proof when its file is there, a plain file with the row's size, and its
+    SHA-256 is the group's `source_sha256`: the row's hash when it has one (the
+    copy checks it again), else the file is read here. Several with proof: the
+    newest. Anything that cannot be read is no proof (the JXL is decoded)."""
+    if group.kind != "tiff" or not group.sha256:
+        return None
+    for stored_rel, _source_rel, size, mtime_ns, sha256, _stored_at in sorted(
+            candidates, key=lambda row: str(row[5] or ""), reverse=True):
+        if size != group.size or (sha256 is not None and sha256 != group.sha256):
+            continue
+        path = os.path.join(backup, stored_rel)
+        try:
+            info = os.stat(sb._io(path), follow_symlinks=False)
+            if not stat_module.S_ISREG(info.st_mode) or info.st_size != size:
+                continue
+            if sha256 is None and sb._sha256_file(path) != group.sha256:
+                continue
+        except OSError:
+            continue
+        return stored_rel, size, mtime_ns
+    return None
+
+
+def _restore_original(group, backup, target):
+    """Copy the TIFF original kept in the backup to the target (the restore's
+    own copy: a temp file beside the target, its SHA-256 checked against the
+    group's `source_sha256`, never replacing a file). (status, detail); a
+    status None = that copy is no proof after all (the JXL is decoded)."""
+    stored_rel, size, mtime_ns = group.original
+    src = os.path.join(backup, stored_rel)
+    try:
+        info = os.stat(sb._io(src), follow_symlinks=False)
+    except OSError as exc:
+        return None, f"{stored_rel}: {exc}"
+    if info.st_size != size:
+        return None, f"{stored_rel}: size {info.st_size} != {size}"
+    tolerance = int(sb.MTIME_TOLERANCE_S * 1_000_000_000)
+    source_mtime = group.conv.source_mtime_ns
+    exact = source_mtime if abs(info.st_mtime_ns - source_mtime) <= tolerance else None
+    planned = sb.PlannedFile(src, group.rel, size, mtime_ns, "restore")
+    try:
+        sb._copy_file(planned, target, "hash", expected_sha256=group.sha256, no_clobber=True,
+                      mtime_ns=exact)
+    except FileExistsError:
+        return "CONFLICT", "the target appeared during the restore; left as it was"
+    except RuntimeError as exc:
+        if "content differs from the catalog" in str(exc):
+            return None, f"{stored_rel}: not the bytes the JXL was made from"
+        raise
+    return ("RESTORED_ORIGINAL", f"the original TIFF kept in the backup: {stored_rel} "
+                                 f"(SHA-256 checked; no JXL decoded)")
 
 
 def _resolve_group_exists(group, target):
@@ -406,6 +476,7 @@ def _main(argv):
     try:
         rows = catalog.all_rows()
         converted = catalog.converted_rows()
+        originals = catalog.originals_rows()     # rc9: the TIFF copies kept in originals\
     except sqlite3.Error as exc:
         print(f"cannot read catalog {catalog.path}: {exc}", file=sys.stderr)
         return 2
@@ -460,8 +531,30 @@ def _main(argv):
     for group in groups.values():
         group.members.sort(key=lambda member: member[1].page)
         group.conv = group.members[0][1]
-    if convert_back == "lossless":      # a lossy (or unknown) TIFF stays JXL
-        kept_as_jxl = {key for key, group in groups.items() if group.lossless() != 1}
+    patterns = args.only
+    # rc9 (round 2 of keep-days): a TIFF whose copy its JXL replaced is kept in
+    # originals\ comes back as that copy -- its own bytes, no jxl-photo -- when
+    # the copy proves to be the TIFF the JXL was made from (_kept_original)
+    originals_by_source = collections.defaultdict(list)
+    for item in originals:
+        originals_by_source[str(item[1]).casefold()].append(item)
+    proven = {}
+
+    def original_of(group):
+        key = group.conv.source_key
+        if key not in proven:
+            proven[key] = _kept_original(
+                group, originals_by_source.get(group.rel.casefold(), []), backup)
+        return proven[key]
+
+    def selected(names):
+        return patterns is None or any(_under_any(name, [pattern])
+                                       for pattern in patterns for name in names)
+
+    if convert_back == "lossless":      # a lossy (or unknown) TIFF stays JXL, unless its
+        # original TIFF is kept in the backup with proof: that one is exact
+        kept_as_jxl = {key for key, group in groups.items() if group.lossless() != 1
+                       and not (selected(group.names()) and original_of(group))}
         entries = [item for entry in entries for item in
                    ([member for member, _conv in entry.members]
                     if isinstance(entry, _JxlGroup) and entry.conv.source_key in kept_as_jxl
@@ -471,7 +564,6 @@ def _main(argv):
     if groups:
         jxlphoto, jxlphoto_where = _find_jxlphoto(args.jxlphoto, backup)
         djxl = sb._djxl_path()          # a JPEG needs only djxl (JP-18), a TIFF jxl-photo
-    patterns = args.only
     matched = set()
     items = []
     for row in entries:
@@ -487,8 +579,13 @@ def _main(argv):
             matched.update(hits)
         src = None if is_group else os.path.join(backup, row.rel)
         target = _target_for(row, args, kept_jxl=not is_group and row.key in converted)
+        if is_group and not inside_backup(target):
+            row.original = original_of(row)
         if inside_backup(target):
             status = "REFUSED"
+        elif is_group and row.original is not None:
+            # the TIFF original, kept with proof: no JXL is decoded, no jxl-photo needed
+            status = "EXISTS" if sb._exists(target) else "RESTORE"
         elif is_group and (not row.whole() or not all(
                 sb._exists(os.path.join(backup, member.rel)) for member, _conv in row.members)):
             status = "MISSING_IN_BACKUP"
@@ -500,13 +597,23 @@ def _main(argv):
             status = "NEEDS_JXLPHOTO"
         else:
             status = "RESTORE"
+        if is_group and row.original is not None:
+            # what it is when that copy cannot be used after all: decoded as before
+            if not row.whole() or not all(sb._exists(os.path.join(backup, member.rel))
+                                          for member, _conv in row.members):
+                row.fallback = "MISSING_IN_BACKUP"
+            elif jxlphoto is None:
+                row.fallback = "NEEDS_JXLPHOTO"
+            else:
+                row.fallback = "RESTORE"
         items.append((status, row, src, target))
     restores = [item for item in items if item[0] == "RESTORE"]
     by_drive = {}
     for _status, row, _src, target in restores:
         root = _drive_root(target)
         # a TIFF made from its JXL needs its own size plus the JXL copied beside it
-        need = row.size + (row.jxl_size() if isinstance(row, _JxlGroup) else 0)
+        need = row.size + (row.jxl_size() if isinstance(row, _JxlGroup)
+                           and row.original is None else 0)
         by_drive[root] = by_drive.get(root, 0) + need
     margin = int(float(args.space_margin_gb) * 1e9)
     space_ok = True
@@ -538,7 +645,14 @@ def _main(argv):
         f"Catalog:   {sb._num(len(rows))} files; selected {sb._num(len(items))}",
         f"Plan:      {plan_text if plan_text else '(nothing to restore)'}",
     ] + space_lines
-    from_jxl = [item[1] for item in items if isinstance(item[1], _JxlGroup)]
+    from_original = [item[1] for item in items
+                     if isinstance(item[1], _JxlGroup) and item[1].original is not None]
+    if from_original:
+        lines.append(f"Kept as JXL, their original TIFF kept in the backup with proof: "
+                     f"{sb._num(len(from_original))} TIFF (restored as that copy, "
+                     f"RESTORED_ORIGINAL; no JXL decoded)")
+    from_jxl = [item[1] for item in items
+                if isinstance(item[1], _JxlGroup) and item[1].original is None]
     if from_jxl:
         kinds = collections.Counter(group.kind.upper() for group in from_jxl)
         how = [f"JPEG by djxl ({djxl})"] if djxl and kinds.get("JPEG") else []
@@ -605,6 +719,7 @@ def _main(argv):
         # fewer TIFFs at a time: JXL_TIFF_WORKERS) while the plain copies go on in
         # order; each result keeps its place in the list.
         results = [None] * len(items)
+        extra_results = []      # the 2nd, 3rd ... JXL file of a group restored as JXL (S3)
         result_rows = []
         bad = False
         total_bytes = sum(row.size for _status, row, _src, _target in restores)
@@ -619,6 +734,7 @@ def _main(argv):
         needs_jxlphoto = any(
             isinstance(row, _JxlGroup) and status not in ("MISSING_IN_BACKUP", "REFUSED",
                                                           "NEEDS_JXLPHOTO")
+            and row.original is None
             and (row.kind == "tiff" or sb._djxl_path() is None)
             for status, row, _src, _target in items)
         if needs_jxlphoto and jxlphoto and sb._serve_wanted(sb._jxlphoto_version(jxlphoto)):
@@ -676,6 +792,71 @@ def _main(argv):
                 if future in pending:
                     collect(future)
 
+        def copy_plain(row, src, target):
+            """A catalog row copied as it is in the backup: (status, detail, ok)."""
+            try:
+                backup_stat = os.stat(sb._io(src))
+                backup_size = backup_stat.st_size
+                if backup_size != row.size:
+                    raise RuntimeError(
+                        f"content differs from the catalog: backup file size "
+                        f"{backup_size} != {row.size} (backup copy corrupt?)")
+                planned = sb.PlannedFile(src, row.rel, row.size, row.mtime_ns, "restore")
+                # A backup on FAT/exFAT keeps a date in 2 s steps: a copy
+                # whose date is the catalog's within that step is restored
+                # with the exact date the original had. Any other copy
+                # keeps the date it has.
+                exact = (row.mtime_ns
+                         if abs(backup_stat.st_mtime_ns - row.mtime_ns) <= tolerance
+                         else None)
+                sb._copy_file(planned, target, "hash", expected_sha256=row.sha256,
+                              no_clobber=True, mtime_ns=exact)
+                status = "RESTORED" if row.sha256 else "RESTORED_UNVERIFIED"
+                detail = ""
+                if row.key in converted:        # a JXL kept as it is (--convert-back)
+                    status = "RESTORED_AS_JXL"
+                    detail = (f"the JXL of {converted[row.key].source_rel}, as it is in the "
+                              f"backup ({convert_back})")
+                return status, detail, True
+            except FileExistsError:
+                return ("CONFLICT", "the target appeared during the restore; left as it was",
+                        False)
+            except RuntimeError as exc:
+                return (("CORRUPT_IN_BACKUP" if "content differs from the catalog" in str(exc)
+                         else "ERROR"), str(exc), False)
+            except Exception as exc:
+                return "ERROR", str(exc), False
+
+        def restore_members_as_jxl(group):
+            """The review of rc9, S3: a LOSSY group under --convert-back lossless
+            whose kept original proved wrong at its copy is never decoded: each
+            of its JXL files is restored as it is (RESTORED_AS_JXL), as any
+            lossy group in that mode. [(status, rel, target, detail)]."""
+            nonlocal bad, done_bytes
+            out = []
+            for member, _conv in group.members:
+                member_src = os.path.join(backup, member.rel)
+                member_target = _target_for(member, args, kept_jxl=True)
+                if inside_backup(member_target):
+                    status, detail, ok = "REFUSED", "the target is inside the backup", False
+                elif not sb._exists(member_src):
+                    status, detail, ok = "MISSING_IN_BACKUP", "backup file missing", False
+                elif sb._exists(member_target):
+                    try:
+                        status, detail = _resolve_exists(member, member_src, member_target)
+                        ok = status != "CONFLICT"
+                    except OSError as exc:
+                        status, detail, ok = "ERROR", str(exc), False
+                else:
+                    status, detail, ok = copy_plain(member, member_src, member_target)
+                    if ok:
+                        done_bytes += member.size
+                if not ok:
+                    bad = True
+                out.append((status, member.rel, member_target, detail))
+                log.log(f"{status} {member.rel}" + (f": {detail}" if detail else ""))
+            return out
+
         try:
             for index, (status, row, src, target) in enumerate(items):
                 collect_finished()
@@ -711,6 +892,39 @@ def _main(argv):
                         bad = True
                     log.log(f"{outcome} {row.rel}")
                     continue
+                if is_group and row.original is not None:
+                    # rc9: the TIFF original kept in the backup, copied as it is
+                    try:
+                        outcome, detail = _restore_original(row, backup, target)
+                    except Exception as exc:
+                        outcome, detail = None, str(exc)
+                    if outcome is not None:
+                        if outcome == "RESTORED_ORIGINAL":
+                            done_bytes += row.size
+                        else:
+                            bad = True
+                        results[index] = (outcome, row.rel, target, detail)
+                        log.log(f"{outcome} {row.rel}" + (f": {detail}" if detail else ""))
+                        continue
+                    row.original = None
+                    if convert_back == "lossless" and row.lossless() != 1:
+                        # lossy: --convert-back lossless never decodes it (S3)
+                        log.log(f"ORIGINAL NOT USED {row.rel}: {detail}; it is lossy: restored "
+                                f"as its JXL (--convert-back lossless)")
+                        as_jxl_rows = restore_members_as_jxl(row)
+                        if as_jxl_rows:
+                            results[index] = as_jxl_rows[0]
+                            extra_results.extend(as_jxl_rows[1:])
+                        continue
+                    # no proof after all: the JXL is decoded, as without that copy
+                    log.log(f"ORIGINAL NOT USED {row.rel}: {detail}; its JXL is decoded")
+                    if row.fallback != "RESTORE":
+                        why = ("backup file missing" if row.fallback == "MISSING_IN_BACKUP"
+                               else f"kept as JXL; jxl-photo not found ({jxlphoto_where})")
+                        results[index] = (row.fallback, row.rel, target, why)
+                        bad = True
+                        log.log(f"{row.fallback} {row.rel}")
+                        continue
                 if is_group:
                     work = os.path.join(os.path.dirname(os.path.abspath(target)),
                                         f"{os.path.basename(target)}.restoring_{stamp}_{index}"
@@ -720,42 +934,10 @@ def _main(argv):
                     pending[future] = (index, row, target)
                     future.add_done_callback(finished_queue.put)
                     continue
-                try:
-                    backup_stat = os.stat(sb._io(src))
-                    backup_size = backup_stat.st_size
-                    if backup_size != row.size:
-                        raise RuntimeError(
-                            f"content differs from the catalog: backup file size "
-                            f"{backup_size} != {row.size} (backup copy corrupt?)")
-                    planned = sb.PlannedFile(src, row.rel, row.size, row.mtime_ns, "restore")
-                    # A backup on FAT/exFAT keeps a date in 2 s steps: a copy
-                    # whose date is the catalog's within that step is restored
-                    # with the exact date the original had. Any other copy
-                    # keeps the date it has.
-                    exact = (row.mtime_ns
-                             if abs(backup_stat.st_mtime_ns - row.mtime_ns) <= tolerance
-                             else None)
-                    sb._copy_file(planned, target, "hash", expected_sha256=row.sha256,
-                                  no_clobber=True, mtime_ns=exact)
+                status, detail, ok = copy_plain(row, src, target)
+                if ok:
                     done_bytes += row.size
-                    status = "RESTORED" if row.sha256 else "RESTORED_UNVERIFIED"
-                    detail = ""
-                    if row.key in converted:        # a JXL kept as it is (--convert-back)
-                        status = "RESTORED_AS_JXL"
-                        detail = (f"the JXL of {converted[row.key].source_rel}, as it is in the "
-                                  f"backup ({convert_back})")
-                except FileExistsError:
-                    status = "CONFLICT"
-                    detail = "the target appeared during the restore; left as it was"
-                    bad = True
-                except RuntimeError as exc:
-                    status = ("CORRUPT_IN_BACKUP"
-                              if "content differs from the catalog" in str(exc) else "ERROR")
-                    detail = str(exc)
-                    bad = True
-                except Exception as exc:
-                    status = "ERROR"
-                    detail = str(exc)
+                else:
                     bad = True
                 results[index] = (status, row.rel, target, detail)
                 log.log(f"{status} {row.rel}" + (f": {detail}" if detail else ""))
@@ -782,9 +964,9 @@ def _main(argv):
             print("Interrupted.", file=sys.stderr)
             log.log("Interrupted.")
             log.csv(".csv", ["status", "rel", "target", "detail"],
-                    [item for item in results if item is not None])
+                    [item for item in results if item is not None] + extra_results)
             sb._tell(RESTORE_STOPPED_SAYING.format(
-                count=sb._num(sum(1 for item in results if item is not None
+                count=sb._num(sum(1 for item in results + extra_results if item is not None
                                   and item[0].startswith("RESTORED"))),
                 csv=log.prefix + ".csv"))
             return 130
@@ -799,7 +981,7 @@ def _main(argv):
                             f"file")
             elif serve_root:
                 sb._remove_own_folder(serve_root)
-        result_rows = [item for item in results if item is not None]
+        result_rows = [item for item in results if item is not None] + extra_results
         log.csv(".csv", ["status", "rel", "target", "detail"], result_rows)
         result_counts = {}
         for status, _rel, _target, _detail in result_rows:

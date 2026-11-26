@@ -51,7 +51,16 @@ added the newer parts. The restore has its own guarantees
   copy of a changed file: with `--update-changed` (the mirror: always) it goes
   to the versions folder as an old version, without it it waits (`UNDO WAITS`);
   a backup file of another program with other bytes proves nothing and keeps
-  it (`UNDO SKIPPED`) *(final review 261126, SF1)*. With `--reconvert-older`, a TIFF whose new JXL fails keeps
+  it (`UNDO SKIPPED`) *(final review 261126, SF1)*. When that plain copy is a
+  TIFF whose own copy is kept in `originals\`, it is renamed back instead of
+  copied only with proof that it is the source as it is now (its row, the
+  source's size and date, the SHA-256 the JXL was made from, no link or
+  junction on the way to it and its real path its place in the backup: a
+  junction there could make a source file "the kept file") and with nothing
+  at its place; its rows change in the same step, and any failure leaves it
+  where it was and copies the TIFF from the source -- except a file that
+  appeared at its place, which is never replaced (left as it is, exit 1)
+  *(v0.14.0-rc9)*. With `--reconvert-older`, a TIFF whose new JXL fails keeps
   its old JXL while that is still whole in the backup; once part of it has
   left, the TIFF is copied as it is; if that copy fails too, the TIFF has no
   copy in the backup's tree until the next run (the old JXL is in `versions\`

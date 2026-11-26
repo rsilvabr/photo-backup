@@ -121,11 +121,12 @@ def encode(tiff, folder):
     written = pages - 1 if fail == "short" and pages > 1 else pages
     for page in range(written):
         name = stem if page == 0 else f"{stem}_page{page}"
+        # the class marks (JP-17): a TIFF whose bytes say SCAN is a film scan, 8BIT
+        # an 8-bit TIFF; PAGE<n>_EIGHT: only its page n is 8-bit (pages classed apart)
+        eight = b"8BIT" in data or (b"PAGE%d_EIGHT" % page) in data
         tokens = [f"jxlphoto-src:{os.path.basename(tiff).replace(' ', '_')}",
                   f"jxlphoto-srcsum:{srcsum}", "jxlphoto-depth:16",
-                  # the class marks (JP-17): a TIFF whose bytes say SCAN is a film
-                  # scan, 8BIT an 8-bit TIFF
-                  f"jxlphoto-origin:{'tiff8' if b'8BIT' in data else 'tiff16'}"]
+                  f"jxlphoto-origin:{'tiff8' if eight else 'tiff16'}"]
         if b"SCAN" in data:
             tokens.append("jxlphoto-scan:raw")
         if pages > 1:

@@ -54,7 +54,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 import manifest_backup as mb
 
-__version__ = "0.14.0-rc8"
+__version__ = "0.14.0-rc9"
 
 # ---- Settings -------------------------------------------------------------------
 MIRROR_KEEP_DAYS = 30               # days a file the mirror removed (gone from the source, no longer
@@ -1489,7 +1489,7 @@ class MirrorJob:
                 self._to_versions(dest, stamp, status, log)
         return before_final
 
-    def keep_old_file(self, dest, stamp, rel, log, kind="versions"):
+    def keep_old_file(self, dest, stamp, rel, log, kind="versions", why=None):
         """Where a backup file goes when a JXL or a plain copy takes over (an
         old JXL group, a TIFF or JPEG copy the JXL replaces, a JXL undone):
         ours to the trash folder of its kind (261126: `originals` ->
@@ -1498,8 +1498,10 @@ class MirrorJob:
         backup. A JPEG copy whose JXL gives its very bytes back
         (`jpeg_proven`) is deleted when ours. A TIFF copy without a row that
         still has the source TIFF's size and date (made by another program) is
-        what a run adopts: ours too. Returns (where it went or None, the kind
-        of store)."""
+        what a run adopts: ours too. `why` (rc9): what really takes its place
+        when no JXL does (the file copied as it is: its conversion failed, or
+        conversion off), for the log and the table. Returns (where it went or
+        None, the kind of store)."""
         store_kind = "originals" if kind == "originals" else "versions"
         path = os.path.join(dest, rel)
         row = self.rows_by_key.get(rel.casefold())
@@ -1511,6 +1513,8 @@ class MirrorJob:
         # (a JXL group the manifest no longer wants)
         by, label = (("its plain copy", "undone") if item is not None
                      and item.reason == "replaced_by_plain" else ("its JXL", "jxl"))
+        if why:
+            by = why                # no JXL took its place: say what did (rc9)
         state, size, mtime_ns = _dest_stat(path)
         if state == "unreadable":
             raise OSError(f"cannot be read in the backup; it stays: {rel}")

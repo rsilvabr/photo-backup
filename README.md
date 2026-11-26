@@ -4,7 +4,7 @@ Backs up the photos you kept, found through the exports you already make: each e
 
 Also keeps **Capture One itself**: the ICC profiles, film curves and styles your edits name, with your presets and workspaces, and a double-click restore for a new computer. [Details](docs/captureone.md).
 
-**Current version: v0.13.2** (2026-11-12) · [What's new](#whats-new-in-v0132) · [All releases](docs/version_history.md) · Test version: [v0.14.0-rc8](https://github.com/rsilvabr/photo-backup/releases/tag/v0.14.0-rc8), the mirror, TIFF and JPEG kept as JXL ([what's new](docs/whats_new.md#v0140-rc8-test-version-not-released-yet))
+**Current version: v0.13.2** (2026-11-12) · [What's new](#whats-new-in-v0132) · [All releases](docs/version_history.md) · Test version: [v0.14.0-rc9](https://github.com/rsilvabr/photo-backup/releases/tag/v0.14.0-rc9), the mirror, TIFF and JPEG kept as JXL ([what's new](docs/whats_new.md#v0140-rc9-test-version-not-released-yet))
 
 **Windows program, no Python needed:** [photo-backup-exe](https://github.com/rsilvabr/photo-backup-exe/releases/latest) — unzip and double-click.
 

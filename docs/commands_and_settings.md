@@ -201,6 +201,13 @@ Every run writes `<LOG_DIR>\<YYMMDD_HHMMSS>_backup` (or `_verify`) plus:
   files that are not `OK` *(v0.13.1; `VERIFY_CSV_OK = True` lists every file
   checked)*. A verify's `_plan.csv` follows the same rule.
 
+Every line of a `.log` starts with the time it was written (`HH:MM:SS`; the
+first line with the date too, and a line `--- YYYY-MM-DD ---` when the day
+changes during a run), so a long run's log says where the time went
+*(v0.14.0-rc9)*. The same for the logs of `manifest_backup.py`,
+`mirror_backup.py`, `restore_backup.py` and `captureone_backup.py`; the console
+shows the lines without it.
+
 Nothing in `Logs\` is ever removed by the tool: delete old runs yourself when
 the folder grows.
 

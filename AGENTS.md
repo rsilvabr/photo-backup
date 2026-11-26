@@ -71,7 +71,41 @@ from the command line. A future job (e.g. a full mirror) is a new
   `_apply_hash_adoptions`, `FileStatus.adopt_sha256`) adopts a backup file
   without a row only with proof of its bytes; a read-only one whose date would
   have to change gets `FileStatus.held` (`_will_copy` False: not adopted, not
-  replaced, no error; S5). `_keep_tools` keeps photo-backup, jxl-photo
+  replaced, no error; S5). **v0.14.0-rc9 (plan `AI_tools/261127_Claude_plan_rc9.md`):**
+  such a plain TIFF copy (`undoes`, NEW, not `undo_older`) whose kept original in
+  the normal backup's `originals\` proves to be the source as it is now
+  (`_put_back_planned` / `_kept_original_proof`: the `originals` row, a plain file
+  with the source's size and date, SHA-256 = the group's `source_sha256`; the
+  source with the group's size and date; the newest) gets
+  `FileStatus.from_original` (`_will_copy` False; `_plain_copy_coming` True) and
+  is RENAMED back in `_copy_all` before the copy loop (`_put_back_originals`:
+  asked again, rename + files row + `originals` row deleted + commit under
+  `_ctrl_c_after`, its SHA-256 into `copied_keys` so `_retire_undone` retires
+  the JXL); any failure leaves the kept file and copies from the source
+  (`PUT BACK FAILED`). Never in the mirror. The write phase always READS the
+  kept file (its digest, never the row's, goes to `copied_keys` and the files
+  row) and a file at the TIFF's place is looked for first, whatever else failed
+  (final review of rc9, SF-1/F7, `tests/test_rc9_final.py`). From the review of rc9
+  (`AI_tools/261127_Opus_review_rc9.md`, `test_m1_*`/`test_s1_*`/`test_s2_*`/`test_s3_*`
+  in `tests/test_rc9.py`): `_kept_original_proof(..., dest=, stored_rel=)` is no
+  proof when a folder from the backup root to the kept file is a reparse point
+  (`_dest_link`) or its `_real` path is not `_real(dest)` + stored_rel (M1: a
+  junction into a source would make the rename MOVE a source file); a file that
+  appeared at the TIFF's place (seen, or `FileExistsError` from the rename) is
+  never replaced: the status gets `held`, `info["errors"]` (exit 1),
+  `put_back_left` (S1); `_clear_put_backs` drops `from_original` of a put-back
+  whose run folder this run deletes (expired, before the fit; chosen in the room
+  chooser, then `needed` again: still not enough = exit 2 before deleting) (S2).
+  `_Logger.log` writes `HH:MM:SS `
+  before every line (the first with the date, `--- date ---` when the day
+  changes; `_log_clock`, `_strip_log_times`; tests read logs through
+  `conftest.latest_log`, which strips it). A multipage TIFF's `lossless` is
+  `_group_lossless` of its pages. A rename refused as another device
+  (`_cross_device`) switches `_convert_all` to the copy route for the rest of
+  the run. `_forget_gone_not_converted` deletes `not_converted` rows of an
+  unplanned file whose copy's source is proven gone (real run, no plan
+  errors). `keep_old_file(..., why=)` (last, optional): what took the place
+  when no JXL did (`_copy_as_is`). `_keep_tools` keeps photo-backup, jxl-photo
   and `KEEP_TOOLS_EXTRA` in `_photo_backup\tools` on every real run. jxl-photo
   always runs through `_run_jxlphoto` (`_jxlphoto_env`: `JXLPHOTO_LOG_DIR` =
   the conversion's own folder, its log copied to our `Logs\jxl-photo` by
@@ -248,7 +282,18 @@ from the command line. A future job (e.g. a full mirror) is a new
   (v0.14.0-rc3; `--keep-jxl` = none): `lossless` brings back a group only when
   its `lossless` flag is 1 (every JPEG; a TIFF per JP-17), the others are
   restored as their JXL (`RESTORED_AS_JXL`). `_find_jxlphoto` falls back to
-  the newest jxl-photo kept in the backup.
+  the newest jxl-photo kept in the backup. **v0.14.0-rc9:** a TIFF group whose
+  copy is kept in `originals\` with proof (`_kept_original`: the catalog's
+  `originals` row read only, a plain file with its size, SHA-256 = the group's
+  `source_sha256`: the row's, else read; the newest) is restored as that file
+  (`_restore_original`, `_copy_file` with `expected_sha256`, `no_clobber`):
+  `RESTORED_ORIGINAL`, no jxl-photo (`NEEDS_JXLPHOTO` never for it), also with
+  `--convert-back lossless`; a copy that turns out other bytes falls back to
+  decoding (`ORIGINAL NOT USED`, `_JxlGroup.fallback`) -- but a lossy group
+  under `--convert-back lossless` never: its JXL files are restored as they are
+  (`restore_members_as_jxl` -> `copy_plain`, `RESTORED_AS_JXL`; the 2nd+ rows in
+  `extra_results`; review of rc9, S3). `_JxlGroup.lossless`
+  is `sb._group_lossless` of every page's row.
   **v0.14.0-rc7:** the restore starts `sb._JxlServers` (root `pbrestore_serve_`
   in the system's temp folder, `log_dir` = `Logs\jxl-photo`) when a TIFF (or a
   JPEG without djxl) needs jxl-photo and `sb._serve_wanted` says the jxl-photo
@@ -501,7 +546,12 @@ from the command line. A future job (e.g. a full mirror) is a new
   too, the TIFF has no copy in the backup's tree until the next run (the old
   JXL is in `versions\` or the mirror's trash; a mirror with no trash, or a
   normal backup with `VERSIONS_KEEP_DAYS = 0` typed, deleted it), exit 1
-  (final review 261126, SF2).
+  (final review 261126, SF2). A kept TIFF original goes back into the tree
+  only by a rename on the same disk, with proof that it is the source as it is
+  now, no link or junction on the way to it (its real path is its place in the
+  backup), and nothing at its place -- a file there is never replaced
+  (`_put_back_originals`, rc9 and its review); the restore uses
+  one only with proof too, and only reads it.
 - **The restore never writes to the backup.** `restore_backup.py` opens the
   catalog read-only, never writes, moves or deletes anything under `--backup`,
   and never overwrites a target file that already exists. An empty `--to` or

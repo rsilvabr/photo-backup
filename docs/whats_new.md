@@ -3,6 +3,16 @@
 The short notes of each recent release, newest first; the README keeps the
 current one. Every release in detail: [version_history.md](version_history.md).
 
+## v0.14.0-rc9 (test version, not released yet)
+
+2026-11-27. The backup goes to the state the manifest asks for, keeps what it sets aside for as long as you say, and uses the TIFF originals it keeps. Needs jxl-photo 2.31.0 (unchanged). Everything of rc8 and below holds.
+
+- **The manifest is the state** (converge): a TIFF or JPEG whose line goes back to `copy` gets its plain copy, and only then, with proof that it holds the same bytes, its JXL leaves (`UNDONE`; no proof: it stays). `--reconvert-older` makes again, once, the TIFF JXL of an older jxl-photo (menu: `[4] Settings`). `--adopt-by-hash` (`ADOPT_BY_HASH`) takes over a backup another program made, file by file, only when both files' bytes are the same. [How](tiff_to_jxl.md#a-new-jxl-photo)
+- **What the backup sets aside, and for how long** (keep-days): old versions, TIFF originals a JXL replaced (`originals\`, listed in the catalog) and the mirror's removed files, each with its own days for the backup and the mirror (`VERSIONS_KEEP_DAYS`, `ORIGINALS_KEEP_DAYS`, `MIRROR_*_KEEP_DAYS`: a number, `0` = at once after you type the number of files, `never`). A space block in every run, `--space-report` (menu: `[9] Backup space`), and when space is short you choose what to delete and type the number of files. [How](reruns_and_moves.md#what-the-backup-sets-aside-and-for-how-long)
+- **A TIFF original kept in the backup is used**: the restore gives it back as it is instead of decoding its JXL (`RESTORED_ORIGINAL`, no jxl-photo needed), and when the manifest goes back to `Tiff` = copy the backup renames it back to its place instead of copying the TIFF again (`PUT BACK`) — each only with proof that it is the very file the JXL was made from. The mirror still copies. [How](tiff_to_jxl.md#going-back-from-jxl-to-tiff-the-kept-original-is-renamed-back-v0140-rc9)
+- **Every log line has its time** (the first one its date too): a long run's log says where the time went. The console is unchanged.
+- **Smaller fixes**: a multipage TIFF is lossless only when every page is (before, its first page decided, and `--convert-back lossless` could decode a lossy page as lossless); a rename refused as "another device" (a cloned disk with the same serial number) sends the JXL the copy way instead of copying every TIFF as it is; the failures recorded for a file whose source is gone are forgotten; the mirror's log says "copied as it is" when no JXL took an old copy's place; Ctrl+C while a kept file is deleted no longer leaves its row behind.
+
 ## v0.14.0-rc8 (test version, not released yet)
 
 2026-11-23. jxl-photo 2.31.0, the release. Everything of rc7 and below holds.

@@ -55,6 +55,18 @@ the console, in the log and in `<log>_restore.csv`:
   again by jxl-photo under its own name, with its pages and its date (each JXL
   checked against its catalog SHA-256 first). Lossless gives back the same
   pixels, not the same bytes ([tiff_to_jxl.md](tiff_to_jxl.md#restoring));
+- `RESTORED_ORIGINAL` *(v0.14.0-rc9)* — a TIFF the backup keeps as JXL whose
+  own copy is still kept in `_photo_backup\originals\` (the TIFF copy its JXL
+  replaced): that copy is restored as it is, its bytes checked against the
+  SHA-256 of the TIFF the JXL was made from, and no JXL is decoded (no
+  jxl-photo needed). Only with proof: the catalog's `originals` row (read
+  only), the file there with its size, and its SHA-256 the JXL's source (the
+  row's; a row without one: the file is read first). Several: the newest. No
+  proof, or a copy that turns out other bytes (`ORIGINAL NOT USED` in the log):
+  the JXL is decoded as before. With `--convert-back lossless` a lossy JXL whose
+  original is kept comes back as that original (it is exact), and when that copy
+  turns out other bytes it is never decoded: its JXL comes back as it is
+  (`RESTORED_AS_JXL`); `none` gives the JXL as it is;
 - `RESTORED_AS_JXL` *(v0.14.0-rc3)* — a file kept as JXL restored as the JXL
   it is (`photo.tif.jxl`), as `--convert-back` chose;
 - `NEEDS_JXLPHOTO` *(v0.14.0-rc2)* — such a TIFF or JPEG, and no jxl-photo:

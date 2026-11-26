@@ -302,6 +302,46 @@ which one is current) keeps the JXL (`UNDO SKIPPED` in the log; its JXL is never
 orphan). A JXL that stays competes with the plain copy in a restore: `--only` on the
 plain file, or `--convert-back none`, gets the current one.
 
+### Going back from JXL to TIFF: the kept original is renamed back (v0.14.0-rc9)
+
+When that plain copy is a TIFF whose own copy is still kept in `originals\` (the TIFF
+copy its JXL replaced), the backup does not copy it from the source again: it
+**renames** the kept file back to its place in the backup's tree (the same disk:
+no bytes written) — only with proof that it IS the source as it is now: the
+catalog's `originals` row, the file there with the source's size and date, and its
+SHA-256 (the row's; a row without one: the file is read) the one the JXL was made
+from, while the source still has the size and date of the file the JXL was made
+from. The summary has a row *TIFF put back from originals\ (renamed, not copied)*
+and the log one `PUT BACK` line per file; the file gets its row (with that SHA-256),
+its `originals` row goes, and then the JXL leaves as above (`UNDONE`). Several kept
+copies with proof: the newest. Anything else — no proof (`PUT BACK NOT POSSIBLE`), or
+a rename that fails (`PUT BACK FAILED`: the kept file stays where it is, with its
+row) — copies the TIFF from the source in the same run, as before. A dry-run says it
+and changes nothing. **The mirror does not do this yet**: it copies the TIFF from
+the source, and its `trash_originals\` keeps its days.
+
+Three more cases are no proof or no put-back:
+
+- **A link or junction on the way** to the kept file (any folder from the backup's
+  root down to it), or a kept file whose real path is not its place in the backup:
+  `PUT BACK NOT POSSIBLE ... it is not a plain file in the backup`, copied from the
+  source. A junction there could lead into a source, and the rename would then move
+  the source's own file into the backup.
+- **Its run folder is deleted in this run** (past `ORIGINALS_KEEP_DAYS`, or chosen
+  to make room when space is short): `PUT BACK NOT POSSIBLE ... deleted in this
+  run`, copied from the source and counted as a copy in the space. When what was
+  chosen to make room no longer fits because of that, the run stops before
+  deleting anything (exit 2).
+- **A file appeared at the TIFF's place** after the plan: it is never replaced.
+  `PUT BACK FAILED ... a file appeared at its place; it is left as it is`, an error
+  (exit 1); the kept original and the JXL stay, and the next run decides (that file
+  is then a changed copy, as any other).
+
+The kept file is always read before the rename, and the JXL leaves (to `versions\`)
+only on the SHA-256 of what was read: a kept file damaged in the backup is not put
+back, the TIFF is copied from the source instead. A file at the TIFF's place is
+never replaced, whatever else failed.
+
 ## The conversion off: a trip with a slow computer
 
 `--no-convert` (*v0.14.0-rc5*; in the menu, `[4] Settings` → "Turn the
@@ -377,15 +417,29 @@ From then on, do not point FreeFileSync at that backup again.
 `restore_backup.py` (or the menu's `[5] Restore`, which asks) gives each file
 back in the format you choose ([restoring.md](restoring.md)):
 
-| `--convert-back` | A JPEG | A lossless TIFF | A lossy TIFF |
-|---|---|---|---|
-| `all` (default) | the JPEG, byte for byte | the TIFF, the same pixels | the TIFF, close to the original |
-| `lossless` | the JPEG, byte for byte | the TIFF, the same pixels | **stays JXL** (`photo.tif.jxl`) |
-| `none` (or `--keep-jxl`) | stays JXL | stays JXL | stays JXL |
+| `--convert-back` | A JPEG | A lossless TIFF | A lossy TIFF | A TIFF whose original is kept (rc9) |
+|---|---|---|---|---|
+| `all` (default) | the JPEG, byte for byte | the TIFF, the same pixels | the TIFF, close to the original | **the original TIFF, byte for byte** (`RESTORED_ORIGINAL`) |
+| `lossless` | the JPEG, byte for byte | the TIFF, the same pixels | **stays JXL** (`photo.tif.jxl`) | **the original TIFF, byte for byte** (`RESTORED_ORIGINAL`) |
+| `none` (or `--keep-jxl`) | stays JXL | stays JXL | stays JXL | stays JXL |
 
 `lossless` brings back only what comes back exactly; a lossy TIFF stays the
 JXL it is in the backup (a TIFF made from it would be bigger, never better).
 A file the catalog cannot tell (a backup made by rc2) counts as lossy there.
+A multipage TIFF is lossless only when every page is *(v0.14.0-rc9; before, its
+first page decided)*.
+
+**A TIFF whose original is kept** *(v0.14.0-rc9)*: when the TIFF copy its JXL
+replaced is still in `originals\` and proves to be the TIFF the JXL was made
+from (the catalog's `originals` row, the file there with its size, its SHA-256 the
+JXL's source: the row's, else read first; several: the newest), the restore
+copies that file (its SHA-256 checked again) instead of decoding: the exact
+bytes, no jxl-photo needed, `RESTORED_ORIGINAL`. No proof, or a copy that turns
+out other bytes (`ORIGINAL NOT USED` in the log): the JXL is decoded as before —
+except a lossy TIFF with `--convert-back lossless`, which is never decoded: its JXL
+is restored as it is (`RESTORED_AS_JXL`), as for any lossy TIFF in that mode.
+The restore only reads the backup, as always. Groups made before rc9 keep their
+first page's `lossless` flag on every page.
 
 How each one comes back: a JPEG is rebuilt by libjxl's djxl straight from
 the backup's JXL (read once and checked against its catalog SHA-256, never
@@ -486,7 +540,7 @@ At the top of `selective_backup.py`:
 | `JXL_TIMEOUT_MIN` | `30` | a conversion longer than this is given up: the file is copied as it is |
 | `JXLPHOTO_SERVE` | `True` | one jxl-photo process per worker converts file after file (its `--serve` mode, 2.31.0-rc3 and newer; [above](#how-the-conversions-run-serve-mode)); `False` = one per file, as up to rc6 *(rc7)* |
 | `CONVERT_GIVE_UP_AFTER` | `2` | a TIFF or JPEG jxl-photo could not convert in this many runs in a row (same file, jxl-photo and settings) stays the copy as it is, not tried again and not a failure; `0` = always try again ([above](#a-file-jxl-photo-cannot-convert)) |
-| `JXL_WORK_DIR` | `""` | where the conversions run, each in a folder of its own, jxl-photo's temp files too; `""` = the system's temp folder (an SSD on most computers). `--work-dir` sets it for one run, and the menu remembers one per computer (`[4] Settings`). The work folder is never inside or above a source or the backup (refused, exit 2: a source that holds the temp folder needs another `JXL_WORK_DIR`). On another volume than the backup, each JXL is copied into it and checked; on the same one, renamed. A path with a `%` in it is refused (exit 2, before anything is read): ExifTool reads a `%` in a file name as a format code, and jxl-photo keeps its temp files there ([JP-22](jxlphoto_contract.md#jp-22--the-temp-folder-never-has-a-)). So is a work folder so deep that jxl-photo's temp folders in it would be 240 characters or more (about 220 for the folder itself): Windows hangs a program whose temp folder has 260 when it starts another one *(rc6)* |
+| `JXL_WORK_DIR` | `""` | where the conversions run, each in a folder of its own, jxl-photo's temp files too; `""` = the system's temp folder (an SSD on most computers). `--work-dir` sets it for one run, and the menu remembers one per computer (`[4] Settings`). The work folder is never inside or above a source or the backup (refused, exit 2: a source that holds the temp folder needs another `JXL_WORK_DIR`). On another volume than the backup, each JXL is copied into it and checked; on the same one, renamed (a rename the system refuses as "another device" — two disks with one serial number, a cloned disk — sends that JXL and the rest of the run the copy way, said once, *rc9*). A path with a `%` in it is refused (exit 2, before anything is read): ExifTool reads a `%` in a file name as a format code, and jxl-photo keeps its temp files there ([JP-22](jxlphoto_contract.md#jp-22--the-temp-folder-never-has-a-)). So is a work folder so deep that jxl-photo's temp folders in it would be 240 characters or more (about 220 for the folder itself): Windows hangs a program whose temp folder has 260 when it starts another one *(rc6)* |
 | `JXL_WORK_FOLDER` | `"pbconv"` | photo-backup's folder inside `JXL_WORK_DIR` (one plain name): one folder per running backup, named by its process number and holding a mark file, removed at the end; a later run removes the marked ones of a backup that no longer runs |
 | `KEEP_TOOLS_IN_BACKUP` | `True` | keep photo-backup, jxl-photo and `KEEP_TOOLS_EXTRA` in the backup |
 | `KEEP_TOOLS_EXTRA` | `()` | more files or folders kept there |
