@@ -22,3 +22,9 @@ The restore chooses what comes back in its own format: everything, only what is 
 What photo-backup needs from jxl-photo — the commands, the marks in the files, the page check, the version (2.31.0 or newer for a backup, 2.30.0 for a restore) — is written down item by item in [the contract](jxlphoto_contract.md), with a test that checks any jxl-photo against it: edit jxl-photo freely, run the test, and a failure names what broke.
 
 One `.cmd` can run both every night ([Run it after jxl-photo](menu.md#run-it-after-jxl-photo)).
+
+## c1-cache-link
+
+[c1-cache-link](https://github.com/rsilvabr/c1-cache-link) moves the `Cache` folder of each `CaptureOne` folder (thumbnails and previews, which Capture One can always rebuild) to a fast SSD and leaves an NTFS junction in its place, so browsing a big folder on a hard disk is fast. Rules decide which folders get the SSD: for example, every `OUTTAKES` folder can keep its cache beside the photos. The edits (`Settings*`) never move.
+
+The two work together without any setting: photo-backup leaves Capture One's `Cache` out by default and follows no junction, so a backup holds every edit and none of the cache, wherever the cache lives. The summary names a cache that is a junction on its own line, apart from the links that are really not in the backup.

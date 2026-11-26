@@ -287,6 +287,7 @@ All mine ([more on each](docs/related_projects.md)):
 
 - [photo-backup-exe](https://github.com/rsilvabr/photo-backup-exe) — this backup as a Windows program, no Python needed. The scripts inside are byte for byte those of a release; the Python version here is the one I run on my own archive and remains the more tested.
 - [jxl-photo](https://github.com/rsilvabr/jxl-photo) — TIFF and JPEG to JPEG XL and back, for photographers: JXL masters with the ICC profile and metadata, sRGB and resized copies, thumbnails in Explorer with jxl-thumb. It makes the JXL this backup keeps and gives them back on restore; how much smaller: [above](#smaller-with-jxl-photo).
+- [c1-cache-link](https://github.com/rsilvabr/c1-cache-link) — keeps Capture One's `Cache` folders on a fast SSD through NTFS junctions, with rules per folder, while the edits stay next to the photos. This backup leaves those caches out and still takes every edit.
 
 ---
 

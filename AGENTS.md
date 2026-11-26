@@ -701,7 +701,7 @@ Same as the sibling repo `jxl-photo`. Documents live in `AI_tools/`
   `Tiff` column, the proof, a second run, TIFF copies already there, moving
   from FreeFileSync, the restore, verify, space, the tools kept in the backup,
   its options and settings (v0.14.0-rc2).
-- `docs/related_projects.md` — the Windows program and jxl-photo.
+- `docs/related_projects.md` — the Windows program, jxl-photo and c1-cache-link.
 - `docs/whats_new.md` — the short notes of each release, newest first, and
   the at-a-glance table. `docs/version_history.md` — every release in detail.
 - `README_mobile_backup.md` — `mobile_backup.py`: usage, how it numbers,
