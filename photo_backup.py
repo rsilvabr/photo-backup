@@ -17,6 +17,16 @@ themselves, never repeated here.
     python photo_backup.py --run-preset NAME  # unattended (Task Scheduler)
 """
 
+import sys
+
+_MIN_PYTHON = (3, 12)
+if sys.version_info[:2] < _MIN_PYTHON:
+    sys.stderr.write(
+        f"photo-backup needs Python {_MIN_PYTHON[0]}.{_MIN_PYTHON[1]} or newer; this is "
+        f"Python {'.'.join(str(part) for part in sys.version_info[:3])} "
+        f"({sys.executable}).\n")
+    raise SystemExit(2)
+
 import argparse
 import datetime
 import importlib.util
@@ -26,7 +36,6 @@ import shutil
 import sqlite3
 import string
 import subprocess
-import sys
 
 __version__ = "0.14.0-rc9"
 

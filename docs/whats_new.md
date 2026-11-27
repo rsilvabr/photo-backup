@@ -12,6 +12,7 @@ current one. Every release in detail: [version_history.md](version_history.md).
 - **A TIFF original kept in the backup is used**: the restore gives it back as it is instead of decoding its JXL (`RESTORED_ORIGINAL`, no jxl-photo needed), and when the manifest goes back to `Tiff` = copy the backup renames it back to its place instead of copying the TIFF again (`PUT BACK`) — each only with proof that it is the very file the JXL was made from. The mirror still copies. [How](tiff_to_jxl.md#going-back-from-jxl-to-tiff-the-kept-original-is-renamed-back-v0140-rc9)
 - **Every log line has its time** (the first one its date too): a long run's log says where the time went. The console is unchanged.
 - **Smaller fixes**: a multipage TIFF is lossless only when every page is (before, its first page decided, and `--convert-back lossless` could decode a lossy page as lossless); a rename refused as "another device" (a cloned disk with the same serial number) sends the JXL the copy way instead of copying every TIFF as it is; the failures recorded for a file whose source is gone are forgotten; the mirror's log says "copied as it is" when no JXL took an old copy's place; Ctrl+C while a kept file is deleted no longer leaves its row behind.
+- **Python older than 3.12 stops at once with a message (exit 2)**; tested on 3.12, 3.13, 3.14 and 3.15.
 
 ## v0.14.0-rc8 (test version, not released yet)
 

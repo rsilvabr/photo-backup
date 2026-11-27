@@ -9,7 +9,7 @@ import msvcrt
 import os
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -200,9 +200,22 @@ def test_n3_an_odd_date_does_not_stop_the_backup(tmp_path, capsys, photobackup_l
     assert sb.main(argv_for(source, dest, tmp_path, "--verify", "quick")) == 0
 
 
+def _expected_csv_date(ns):
+    """What this Python can do with a date: local time when it converts it
+    (Python 3.15 does a date before 1970 on Windows), else the UTC form."""
+    try:
+        return datetime.fromtimestamp(ns / 1e9).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError):
+        moment = datetime(1970, 1, 1) + timedelta(microseconds=ns // 1000)
+        return moment.strftime("%Y-%m-%d %H:%M:%S") + " UTC"
+
+
 def test_n3_csv_date():
     assert sb._csv_date(0) == datetime.fromtimestamp(0).strftime("%Y-%m-%d %H:%M:%S")
-    assert sb._csv_date(-157766400 * 10 ** 9) == "1965-01-01 00:00:00 UTC"
+    assert sb._csv_date(-157766400 * 10 ** 9) == _expected_csv_date(-157766400 * 10 ** 9)
+    assert sb._csv_date(48282134400 * 10 ** 9) == _expected_csv_date(48282134400 * 10 ** 9)
+    # Windows converts no date after the year 3000 to local time, in any Python:
+    # the fallback's own text is pinned here
     assert sb._csv_date(48282134400 * 10 ** 9) == "3500-01-01 00:00:00 UTC"
     assert sb._csv_date(10 ** 30).startswith("mtime_ns ")
     assert sb._db_ns(48282134400 * 10 ** 9) == 2 ** 63 - 1

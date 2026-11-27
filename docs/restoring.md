@@ -96,7 +96,8 @@ Exit codes: 0 (everything restored or already there), 1 (any of the above),
 2 (aborted before restoring: no catalog or a damaged one, wrong backup ID, `--to` inside the
 backup or the backup inside `--to` — also through a junction or a `subst`
 letter, *v0.13.2* —, an empty `--to` or `--only`, a `--space-margin-gb` that
-is not a number or is negative, not enough space, no confirmation),
+is not a number or is negative, not enough space, no confirmation, a Python older
+than 3.12),
 130 (Ctrl+C: it says so at once; what came back stays, the files being made
 are ended and leave nothing at their targets, the CSV lists what came back,
 and the last line says nothing is being written any more, *v0.14.0-rc5*).

@@ -776,9 +776,16 @@ files):
 ## Verification
 - After editing: `python -m py_compile photo_backup.py selective_backup.py
   restore_backup.py`.
-- Tests: `python -m pytest tests/` (pytest lives in the `python` 3.12
-  interpreter; `py` is 3.13 without pytest). Tests build synthetic trees in
-  `tmp_path` and set `PHOTOBACKUP_LOG_DIR`, so no test writes to `Logs\`.
+- Tests: `python -m pytest tests/` (the `python` 3.12 interpreter; `py -3.XX`
+  reaches 3.9-3.15, each with pytest, rich, numpy and tifffile). Tests build
+  synthetic trees in `tmp_path` and set `PHOTOBACKUP_LOG_DIR`, so no test
+  writes to `Logs\`. The tests need Python 3.12+ (an older Python stops at the
+  import of `selective_backup`, exit 2: `_MIN_PYTHON`); measured 27/11: the
+  full suite passes on 3.12-3.15. The scripts must still COMPILE on 3.9 (no
+  3.12-only syntax such as `f"{row["rel"]}"`): Python compiles a whole file
+  before the check runs, and an old Python would show a SyntaxError instead
+  of the message (`tests/test_py_versions.py` runs each script with
+  `py -3.9` when it is installed).
 - **Real-archive checks**: the owner's `G:` is READ-ONLY for every agent.
   A `--dry-run` over a `G:` folder is always allowed; a real copy goes only
   to `E:\temp_jxl\photo_backup_test` (scratch). The plan lists the exact

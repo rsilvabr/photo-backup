@@ -13,6 +13,16 @@ the versions folder first, never overwritten in place. Edit settings and
 sidecars (AUTO_UPDATE_EXTENSIONS) are updated that way on every run.
 """
 
+import sys
+
+_MIN_PYTHON = (3, 12)
+if sys.version_info[:2] < _MIN_PYTHON:
+    sys.stderr.write(
+        f"photo-backup needs Python {_MIN_PYTHON[0]}.{_MIN_PYTHON[1]} or newer; this is "
+        f"Python {'.'.join(str(part) for part in sys.version_info[:3])} "
+        f"({sys.executable}).\n")
+    raise SystemExit(2)
+
 import argparse
 import collections
 import contextlib
@@ -30,7 +40,6 @@ import sqlite3
 import stat as stat_module
 import struct
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -716,9 +725,10 @@ def _db_ns(mtime_ns):
 
 
 def _csv_date(mtime_ns):
-    """A file date for a CSV. Windows cannot convert a date before 1970 or
-    after the year 3000 to local time: it is written in UTC then, and a date
-    no calendar holds as its number -- one odd file must not stop the run."""
+    """A file date for a CSV. Windows cannot convert a date before 1970
+    (before Python 3.15) or after the year 3000 to local time: it is written
+    in UTC then, and a date no calendar holds as its number -- one odd file
+    must not stop the run."""
     try:
         return datetime.fromtimestamp(mtime_ns / 1e9).strftime("%Y-%m-%d %H:%M:%S")
     except (OSError, OverflowError, ValueError):

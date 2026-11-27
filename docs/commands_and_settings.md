@@ -268,7 +268,7 @@ manifest still writes its 83 MB every time.
 |---|---|
 | 0 | everything fine (also a dry-run without read errors) |
 | 1 | finished with file errors or unreadable folders (a dry-run too), the destination stopped taking writes, or verify found a problem |
-| 2 | aborted before copying: usage error (a `--space-margin-gb` or `--max-gb` that is not a number, *v0.13.2*), not enough space, destination not available, a destination that is really inside a source (a junction or a `subst` letter, *v0.13.2*), no confirmation, bad or damaged catalog (a row leading outside the backup too, *v0.13.2*), a plan that would write into `_photo_backup` |
+| 2 | aborted before copying: usage error (a `--space-margin-gb` or `--max-gb` that is not a number, *v0.13.2*), not enough space, destination not available, a destination that is really inside a source (a junction or a `subst` letter, *v0.13.2*), no confirmation, bad or damaged catalog (a row leading outside the backup too, *v0.13.2*), a plan that would write into `_photo_backup`; 2 also when the Python is older than 3.12 (the message names the Python that ran) |
 | 130 | interrupted with Ctrl+C (partial summary; the temp file is removed; a verify keeps what it had checked). Since *v0.14.0-rc5* it says so at once, ends the conversions running instead of waiting for them, writes the catalog and ends with `Stopped (Ctrl+C) ... the disk can be removed` ([safety.md](safety.md)) |
 
 The restore has its own ([restoring.md](restoring.md)); `manifest_backup.py`

@@ -365,5 +365,5 @@ In `Logs\`, next to the backup's usual CSVs (`<stamp>_mirror_plan.csv`, ...):
 |---|---|
 | `0` | done |
 | `1` | done, with problems: a copy or a removal failed, a line could not be read (it removed nothing), the trash could not be fully deleted |
-| `2` | stopped before changing anything: a usage error, the lock, the limit, a total mirror not confirmed, not enough space, a cancelled question, a damaged catalog, the wrong backup |
+| `2` | stopped before changing anything: a usage error, the lock, the limit, a total mirror not confirmed, not enough space, a cancelled question, a damaged catalog, the wrong backup, a Python older than 3.12 |
 | `130` | interrupted (Ctrl+C) |
