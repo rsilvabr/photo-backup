@@ -29,7 +29,9 @@ room, or --empty-trash) needs a person who types the number of files.
 
 The copy, the catalog and the space check are selective_backup.py's own
 (_run_backup with mirror=MirrorJob); this script only decides what leaves.
-The source is READ-ONLY.
+The source is READ-ONLY. There is no --resume: a mirror decides what leaves
+from a fresh listing; it leaves the backup's saved plan as it is (a resume
+after it proves every file again and finds little to do).
 
     python mirror_backup.py --manifest backup_manifest.csv --dest H:\\BACKUP --dry-run
     python mirror_backup.py --manifest backup_manifest.csv --dest H:\\BACKUP
@@ -54,7 +56,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 import manifest_backup as mb
 
-__version__ = "0.14.0-rc9"
+__version__ = "0.14.0-rc10"
 
 # ---- Settings -------------------------------------------------------------------
 MIRROR_KEEP_DAYS = 30               # days a file the mirror removed (gone from the source, no longer

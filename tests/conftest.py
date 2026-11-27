@@ -18,6 +18,8 @@ def photobackup_log_dir(tmp_path, monkeypatch):
     # the tools kept in a backup (v0.14.0-rc2) would add files to every
     # destination a test compares; the tests of that feature turn it on
     monkeypatch.setattr(selective_backup, "KEEP_TOOLS_IN_BACKUP", False)
+    # SAVE_RESUME_PLAN (v0.14.0-rc10) stays as shipped (True): every real run of
+    # the suite saves its plan for --resume, as the owner's runs do
     # the fake jxl-photo's files are no JXL a real djxl can read: the JPEG
     # rebuild goes through the fake jxl-photo unless a test names a fake djxl
     monkeypatch.setattr(selective_backup, "DJXL", "none")

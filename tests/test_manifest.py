@@ -510,6 +510,35 @@ def test_menu_manifest_analyze_and_copy(tmp_path, monkeypatch):
     assert len(calls) == 1 and "--analyze" in calls[0]
 
 
+def test_m1_the_menu_continues_the_last_manifest_backup(tmp_path, monkeypatch):
+    """[7] Manifest -> [4] (v0.14.0-rc10): the manifest runs ONCE with --resume,
+    without --yes and without a dry-run (the backup asks itself)."""
+    import photo_backup as menu
+
+    monkeypatch.setattr(menu, "CONFIG_PATH", str(tmp_path / "menu_config.json"))
+    monkeypatch.setattr(menu, "list_drives", lambda: [])
+    data = tmp_path / "data"
+    data.mkdir()
+    manifest = write_manifest(tmp_path / "manifest.csv", [(data, "1", "raw")])
+    calls = []
+
+    def fake_run(argv):
+        calls.append(list(argv))
+        return 0
+
+    monkeypatch.setattr(menu, "run_manifest", fake_run)
+    for replace, wanted in (("y", True), ("n", False)):
+        calls.clear()
+        #               menu manifest dest choice replace exit
+        answers = iter(["7", str(manifest), str(tmp_path / "out"), "4", replace, "0"])
+        monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+        assert menu.main([]) == 0
+        assert len(calls) == 1
+        assert "--resume" in calls[0]
+        assert ("--update-changed" in calls[0]) is wanted
+        assert "--yes" not in calls[0] and "--dry-run" not in calls[0]
+
+
 def test_t16_verify_full_after_copy(tmp_path):
     root = tmp_path / "G"
     make_tree(root, {

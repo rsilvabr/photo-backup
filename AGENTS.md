@@ -198,6 +198,33 @@ from the command line. A future job (e.g. a full mirror) is a new
   knobs (`FAKE_JXLPHOTO_SERVE`, `FAKE_JXLPHOTO_SERVE_PIDS`); a test of one
   call's own shape pins `JXLPHOTO_SERVE = False`, its serve counterpart is in
   `tests/test_rc7_serve.py`.
+  **v0.14.0-rc10 (plan `AI_tools/261127_Opus_plan_resume.md`): pause and resume.** A normal real
+  run that leaves work saves its plan right before `_copy_all` (`_save_plan`, `SAVE_RESUME_PLAN`):
+  `CATALOG_FOLDER\RESUME_FILE`, gzip JSON lines — a header (kind, version, backup ID,
+  `_plan_options`, `_plan_settings`: every UPPER_CASE global but `_RESUME_FREE_SETTINGS`,
+  `plan_extra`: the manifest's and modes' SHA-256), one line per planned file (`o` + the
+  PlannedFile when `_resume_open`, else `c` + its rel), a trailer — bound to the catalog by the
+  `meta` rows `resume_plan` / `resume_plan_sha256`; a run that finishes its copy sets
+  `resume_done` only for the plan it saved or resumed (`_mark_plan_done(..., plan_id)`; never the
+  mirror, never another scope's plan: review of rc10, S1). `--resume`
+  (`selective_backup.py`, `manifest_backup.py`; never the mirror) loads it instead of `plan_fn`
+  (`_resume_load`: `_read_saved_plan` — any exception while parsing, a value of the wrong type,
+  a NUL = `_PlanRefused`, never a traceback (S2) —, `_resume_mismatch` — the age from the
+  header's `started_utc` (N4) —, `_resume_source_check` — one listing per source folder,
+  `os.lstat` on a miss, a folder below a source that is a reparse point now is not read through
+  (`_source_folder_link`, N5); changed, gone or unreadable = `RESUME LEFT`, not an error). The
+  saved plan's read errors (header `plan_errors` + the first `_RESUME_ERROR_LINES` as `errors`)
+  become the resumed plan's `errors` (+ `Plan.errors_not_listed`): the summary's `Errors:`,
+  exit 1, as the run that planned (M1). The resume hint goes BEFORE `STOPPED_SAYING` (S3). A
+  link, junction or folder at the plan's temp name is never deleted: the plan is not saved (N1).
+  A resume computes every open file's status again (`_file_statuses` on that subset), passes
+  `planned_keys` (every saved rel) to `_undo_groups` and `_convert_all`, re-asks the binding on
+  the write connection (`_resume_bound`) and leaves out what needs a fresh listing or deletes:
+  put-back, moves, orphans (`--move-orphans` refused), expired / room / 0-day deletions
+  (`_SetAside({})`), `--adopt-by-hash` (refused), `_forget_gone_not_converted`. `_convert_all`
+  commits after a placed group once `CONVERT_COMMIT_S` passed (the hard kill of 26–27/11 lost the
+  rows of 45 groups with the every-50 cadence). `_run_backup` logs one `TIMING before the copy:`
+  line.
 - `manifest_backup.py` — per-folder modes, read from `backup_manifest.csv`
   (gitignored; `backup_manifest.example.csv` is versioned) and
   `backup_modes.csv` (versioned, UTF-8; `--modes` reads another). The code
@@ -552,6 +579,25 @@ from the command line. A future job (e.g. a full mirror) is a new
   backup), and nothing at its place -- a file there is never replaced
   (`_put_back_originals`, rc9 and its review); the restore uses
   one only with proof too, and only reads it.
+- **A resume finishes the saved plan's work, with proof, and nothing else (v0.14.0-rc10).** It
+  never lists a source: each open file's source must still have the plan's size and date (else it
+  is left for the next full run, counted, exit 0); its status is computed again from the
+  destination (a listing never proves NEW) and the catalog; every action keeps its own proof when it
+  acts (`_convert_status`'s `replaces`, `_retire_undone`, `_retire_replaced`, `_place_group`). It
+  never deletes what is set aside, never moves, never looks for orphans, never puts back from
+  `originals\`, never adopts by hash, never saves a plan, never reads a source through a folder
+  that became a link or junction. It never hides a loss: the saved plan's read errors are its
+  errors again (`Errors:`, exit 1). It refuses (exit 2, nothing changed; any malformed file is a
+  refusal, never a traceback) a plan
+  that is missing, used, not the one the catalog recorded (id + SHA-256), damaged (a rel
+  `_unsafe_rel` rejects, a src outside the plan's sources, a value of the wrong type, a NUL, a
+  wrong count), of another kind, version,
+  backup ID, options, settings, manifest or modes, or older than `RESUME_MAX_DAYS`. Only the run
+  that saved a plan, or a resume of it, marks it used. The plan file is
+  ours: written as temp + fsync + `os.replace` only over a file whose header says it is our plan,
+  never through a link (a link there stops a real run that would save one: `store_stop`), never
+  deleted; a link, a junction or a folder at its temp name is never deleted either (the plan is
+  then not saved). The mirror never resumes.
 - **The restore never writes to the backup.** `restore_backup.py` opens the
   catalog read-only, never writes, moves or deletes anything under `--backup`,
   and never overwrites a target file that already exists. An empty `--to` or
@@ -855,8 +901,8 @@ Same as the sibling repo `jxl-photo`. Documents live in `AI_tools/`
   `selective_backup.py`, the logs and CSVs, exit codes.
 - `docs/safety.md` — every safety guarantee in full (the README keeps one
   line each).
-- `docs/reruns_and_moves.md` — re-runs, the versions folder, what the backup
-  sets aside and for how long (the three kinds, their days, the space block,
+- `docs/reruns_and_moves.md` — re-runs, the versions folder, pause and resume
+  (`--resume`), what the backup sets aside and for how long (the three kinds, their days, the space block,
   `--space-report`, room on demand), moves, orphans.
 - `docs/verifying.md` — verify, statuses, the check after each copy, a
   damaged catalog (the backend's message points to "A damaged catalog", which

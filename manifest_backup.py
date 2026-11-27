@@ -19,6 +19,7 @@ mirror_backup.py only; this script ignores it.
 
 --analyze copies nothing: it prints how many bytes each mode would take in each
 folder of the manifest, and writes <stamp>_analysis.csv next to the log.
+--resume goes on with the plan the last real run saved, without reading the folders again.
 
     python manifest_backup.py --manifest backup_manifest.csv --dest H:\\BACKUP --dry-run
     python manifest_backup.py --manifest backup_manifest.csv --dest H:\\BACKUP
@@ -36,7 +37,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import selective_backup as sb
 
-__version__ = "0.14.0-rc9"
+__version__ = "0.14.0-rc10"
 
 # ---- Settings -------------------------------------------------------------------
 MODES_FILE = "backup_modes.csv"     # next to this script; --modes reads another
@@ -419,6 +420,8 @@ def _backend_args(parsed, rows, dest):
         argv.append("--dry-run")
     if parsed.yes:
         argv.append("--yes")
+    if getattr(parsed, "resume", False):    # the mirror's args have none
+        argv.append("--resume")
     if parsed.verify:
         argv += ["--verify", parsed.verify, "--max-gb", str(parsed.max_gb)]
     return sb._build_parser().parse_args(argv)
@@ -451,6 +454,16 @@ def _new_log(stamp, kind):
         return None
 
 
+def _plan_extra(parsed):
+    """What makes a saved plan this manifest's (selective_backup's resume section): the
+    kind, the SHA-256 of the manifest's and the modes table's bytes, this script's settings."""
+    return {"kind": "manifest_backup",
+            "manifest": os.path.abspath(parsed.manifest),
+            "manifest_sha256": sb._sha256_file(os.path.abspath(parsed.manifest)),
+            "modes_sha256": sb._sha256_file(os.path.abspath(parsed.modes)),
+            "manifest_settings": sb._plan_settings(sys.modules[__name__])}
+
+
 def _run(parsed, rows, modes, stamp, argv):
     backend_args = _backend_args(parsed, rows, os.path.abspath(parsed.dest))
     log = _new_log(stamp, "manifest_verify" if parsed.verify else "manifest")
@@ -480,7 +493,14 @@ def _run(parsed, rows, modes, stamp, argv):
         try:
             if parsed.verify:
                 return sb._run_verify(backend_args, log, plan_fn=plan_fn)
-            return sb._run_backup(backend_args, log, stamp, plan_fn=plan_fn)
+            try:
+                plan_extra = _plan_extra(parsed)
+            except OSError as exc:
+                print(f"cannot read {exc.filename}: {exc}", file=sys.stderr)
+                log.log(f"ERROR cannot read {exc.filename}: {exc}")
+                return 2
+            return sb._run_backup(backend_args, log, stamp, plan_fn=plan_fn,
+                                  plan_extra=plan_extra)
         except KeyboardInterrupt:       # while planning (the copy handles its own)
             print("Interrupted.", file=sys.stderr)
             log.log("Interrupted.")
@@ -611,6 +631,12 @@ def build_parser():
                         help="plan and log, copy nothing")
     parser.add_argument("--yes", action="store_true",
                         help="do not ask for confirmation")
+    parser.add_argument("--resume", action="store_true",
+                        help="go on with the plan the last real manifest run saved in the "
+                             "backup, without reading the folders again: only the copies and "
+                             "conversions it left; the manifest, the modes and the other "
+                             "options must be the plan's; no orphans, moves or deletions; "
+                             "refused, exit 2, when the plan does not match")
     parser.add_argument("--update-changed", action="store_true",
                         help="move a changed destination file to the versions folder first")
     parser.add_argument("--no-auto-update", dest="auto_update", action="store_false",
@@ -685,6 +711,9 @@ def main(argv=None):
         return 2
     if args.analyze and args.verify:
         print("--verify cannot be combined with --analyze", file=sys.stderr)
+        return 2
+    if args.analyze and args.resume:
+        print("--resume cannot be combined with --analyze", file=sys.stderr)
         return 2
     setting_errors = sb._store_settings_errors()
     if setting_errors:

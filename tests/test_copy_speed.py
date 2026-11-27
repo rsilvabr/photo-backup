@@ -68,8 +68,16 @@ def test_small_files_flush_as_a_batch_before_their_final_name(tmp_path, monkeypa
         events.append("fsync")
         return real_fsync(fd)
 
+    plans = []
+
     def replace(src, dst, **kwargs):
-        if selective_backup.BACKUP_ID_FILE not in str(src):
+        if str(dst).endswith(selective_backup.RESUME_FILE):
+            # the plan for --resume (rc10), saved once before the copy: on the
+            # disk (its fsync, the event right before) before it takes its name
+            assert events and events[-1] == "fsync", events
+            events.pop()
+            plans.append(dst)
+        elif selective_backup.BACKUP_ID_FILE not in str(src):
             events.append("replace")
         return real_replace(src, dst, **kwargs)
 
@@ -81,6 +89,7 @@ def test_small_files_flush_as_a_batch_before_their_final_name(tmp_path, monkeypa
     monkeypatch.setattr(selective_backup.os, "replace", replace)
     monkeypatch.setattr(selective_backup._Catalog, "upsert", upsert)
     assert selective_backup.main(argv_for(source, dest, tmp_path, "--yes")) == 0
+    assert len(plans) == (1 if selective_backup.SAVE_RESUME_PLAN else 0)
     assert events[:5] == ["fsync"] * 5, events[:12]
     counts = {"fsync": 0, "replace": 0, "upsert": 0}
     for event_name in events:

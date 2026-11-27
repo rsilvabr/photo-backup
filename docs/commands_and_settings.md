@@ -61,6 +61,7 @@ selective_backup.py --source PATH [--source PATH ...] --dest PATH [options]
 | `--space-margin-gb N` | free space kept on the destination, in GB (default `20.0`) |
 | `--versions-keep-days N\|never` | days a run folder of `versions\` is kept, then deleted by the first real run on or after that day; `0` = not kept (deleted at once, the number of files is typed; `--yes` stops); `never` = only when space is short (default `VERSIONS_KEEP_DAYS`; [what the backup sets aside](reruns_and_moves.md#what-the-backup-sets-aside-and-for-how-long)) |
 | `--originals-keep-days N\|never` | the same for `originals\`, the TIFF copies a JXL replaced (default `ORIGINALS_KEEP_DAYS`) |
+| `--resume` | go on with the plan the last real run saved, without listing the sources again: only the copies and conversions it left, each file checked first; the other options must be the plan's; no orphans, moves or deletions; refused, exit 2, when the plan does not match *(v0.14.0-rc10; [pause and resume](reruns_and_moves.md#pause-and-resume-a-long-run))* |
 | `--space-report` | with `--dest` only: what the backup holds set aside (old versions, TIFF originals, the mirror's trash), run folder by run folder, when each is deleted and what deleting it would free; reads only the destination (exit 0; 1 when a folder cannot be read) |
 | `--dry-run` | plan, print the summary and write the logs/CSVs; copy nothing |
 | `--verify {quick,full}` | verify an existing backup; no copy ([verifying.md](verifying.md)) |
@@ -71,6 +72,8 @@ selective_backup.py --source PATH [--source PATH ...] --dest PATH [options]
 
 `--verify` cannot be combined with `--dry-run`, `--update-changed` or
 `--move-orphans` (exit 2); a negative `--max-gb` is a usage error too.
+`--resume` cannot be combined with `--verify`, `--move-orphans`,
+`--adopt-by-hash` or `--space-report` (exit 2).
 
 ## Settings
 
@@ -124,6 +127,9 @@ default everywhere — the menu reads them from there too.
 | `DETECT_MOVES` | `True` | detect moved/renamed catalogued files and move their backup copy (`--no-detect-moves`) |
 | `ORPHANS_FOLDER` | `orphans` | under `CATALOG_FOLDER`: where `--move-orphans` puts files whose source is gone |
 | `BACKUP_ID_FILE` | `volume.json` | under `CATALOG_FOLDER`: the backup identity ([backup ID](verifying.md#which-disk-is-this-backup-id)) |
+| `RESUME_FILE` | `resume_plan.jsonl.gz` | under `CATALOG_FOLDER`: the plan of the last real run that left work, for `--resume` *(v0.14.0-rc10; [pause and resume](reruns_and_moves.md#pause-and-resume-a-long-run))* |
+| `SAVE_RESUME_PLAN` | `True` | a real run with something to copy or convert saves its plan there first (about 5-10 MB for 426,000 files, estimated); `False` = never (`--resume` finds none) *(v0.14.0-rc10)* |
+| `RESUME_MAX_DAYS` | `7` | `--resume` refuses a saved plan older than this many days (from the start of the run that made it); `0` = no resume at all *(v0.14.0-rc10)* |
 | `VERIFY_MAX_GB` | `0.0` | default `--max-gb` for `--verify full` (0 = everything) |
 | `VERIFY_PARALLEL` | `True` | `--verify full` reads the backup copy and the source at the same time when they are on two drives; `False` = one after the other *(v0.13.1)* |
 | `VERIFY_COMMIT_S` | `30.0` | `--verify full` writes what it has verified to the catalog at least this often *(v0.13.1)* |
@@ -154,6 +160,7 @@ TIFF and JPEG kept as JXL in the backup, and the programs kept in it
 | `JXL_TIMEOUT_MIN` | `30` | a conversion longer than this is given up: the file is copied as it is |
 | `JXLPHOTO_SERVE` | `True` | jxl-photo runs as one process per worker that converts file after file (its `--serve` mode, 2.31.0-rc3 and newer, [JP-23](jxlphoto_contract.md#jp-23--serve-mode-one-process-file-after-file)): Python, its imports and ExifTool start once per worker, not once per file. `False` = one jxl-photo per file, as up to v0.14.0-rc6. A jxl-photo without it runs one per file *(v0.14.0-rc7; [how](tiff_to_jxl.md#how-the-conversions-run-serve-mode))* |
 | `CONVERT_GIVE_UP_AFTER` | `2` | a TIFF or JPEG jxl-photo could not convert in this many runs in a row (the same file, jxl-photo and settings) stays the copy as it is and is not tried again, no longer a failure of the run; `0` = always try again *(v0.14.0-rc6; [a file jxl-photo cannot convert](tiff_to_jxl.md#a-file-jxl-photo-cannot-convert))* |
+| `CONVERT_COMMIT_S` | `2.0` | during the conversions the catalog is written after a JXL is put in place once this many seconds passed since the last write (and every `FLUSH_BATCH_FILES` files): a hard stop loses the rows of at most that much, which the next run makes again; `0` = after every file *(v0.14.0-rc10; [after a hard stop](reruns_and_moves.md#pause-and-resume-a-long-run))* |
 | `JXL_WORK_DIR` | `""` | where the conversions run, jxl-photo's temp files too; `""` = the system's temp folder (`--work-dir` for one run; the menu remembers one per computer). One writer then copies each finished JXL into the backup |
 | `JXL_WORK_FOLDER` | `pbconv` | photo-backup's folder inside `JXL_WORK_DIR`: one per running backup (its process number), removed at the end |
 | `KEEP_TOOLS_IN_BACKUP` | `True` | every real run keeps photo-backup and jxl-photo in the backup, one folder per version |
@@ -177,7 +184,12 @@ Every run writes `<LOG_DIR>\<YYMMDD_HHMMSS>_backup` (or `_verify`) plus:
   (`LINK not followed <path>`; a Capture One cache folder that is a link:
   `CACHE LINK not followed <path>`, *v0.13.2*), every folder skipped by its
   name (`SKIPPED FOLDER <path>`, *v0.12.1*), the destination tests
-  (`DEST CHECK ...`), final summary;
+  (`DEST CHECK ...`), the `TIMING before the copy:` line (how long the plan, the
+  catalog, the backup's state and the link check took), the saved plan
+  (`RESUME PLAN ...`) and a resume's `RESUME ...` / `RESUME LEFT ...` lines
+  *(v0.14.0-rc10)*, final summary;
+- `_resume_left.csv` — `why,size,mtime,src,rel`: a `--resume` that left files
+  for the next full run (changed or gone since the plan) *(v0.14.0-rc10)*;
 - `_plan.csv` — `action,category,size,mtime,src,rel` (written on every run).
   A `--dry-run` lists every planned file. A run that copies lists what it
   changes (`NEW`, `CHANGED`), and the log says how many `UP_TO_DATE` files
@@ -267,8 +279,8 @@ manifest still writes its 83 MB every time.
 | Code | Meaning |
 |---|---|
 | 0 | everything fine (also a dry-run without read errors) |
-| 1 | finished with file errors or unreadable folders (a dry-run too), the destination stopped taking writes, or verify found a problem |
-| 2 | aborted before copying: usage error (a `--space-margin-gb` or `--max-gb` that is not a number, *v0.13.2*), not enough space, destination not available, a destination that is really inside a source (a junction or a `subst` letter, *v0.13.2*), no confirmation, bad or damaged catalog (a row leading outside the backup too, *v0.13.2*), a plan that would write into `_photo_backup`; 2 also when the Python is older than 3.12 (the message names the Python that ran) |
+| 1 | finished with file errors or unreadable folders (a dry-run too; a `--resume` of a plan whose run had unreadable folders too, *v0.14.0-rc10*), the destination stopped taking writes, or verify found a problem |
+| 2 | aborted before copying: usage error (a `--space-margin-gb` or `--max-gb` that is not a number, *v0.13.2*), not enough space, destination not available, a destination that is really inside a source (a junction or a `subst` letter, *v0.13.2*), no confirmation, bad or damaged catalog (a row leading outside the backup too, *v0.13.2*), a plan that would write into `_photo_backup`; 2 also when the Python is older than 3.12 (the message names the Python that ran); a `--resume` that is refused (no saved plan, nothing to resume, a plan that does not match), *v0.14.0-rc10* |
 | 130 | interrupted with Ctrl+C (partial summary; the temp file is removed; a verify keeps what it had checked). Since *v0.14.0-rc5* it says so at once, ends the conversions running instead of waiting for them, writes the catalog and ends with `Stopped (Ctrl+C) ... the disk can be removed` ([safety.md](safety.md)) |
 
 The restore has its own ([restoring.md](restoring.md)); `manifest_backup.py`

@@ -173,7 +173,32 @@ added the newer parts. The restore has its own guarantees
   `Stopped (Ctrl+C) ... the disk can be removed`, comes only once the catalog
   is closed. A second Ctrl+C stops waiting (the next run removes what is left
   in the work folder). A window closed or a power cut loses nothing either: the
-  next run finishes or redoes what was half done.
+  next run finishes or redoes what was half done. During the conversions the
+  catalog is written after a JXL is put in place once `CONVERT_COMMIT_S` seconds
+  passed since the last write, so a hard stop redoes at most that much *(rc10)*.
+- **A resume finishes the saved plan's work, with proof, and nothing else**
+  *(v0.14.0-rc10; [pause and resume](reruns_and_moves.md#pause-and-resume-a-long-run))*:
+  `--resume` never lists a source. Each file the plan left must still have, on
+  the source, the size and date the plan saw (else it is left for the next full
+  run, counted, exit 0), and a source folder that became a link or a junction
+  since is not read through; its state is read again from the backup and its
+  catalog (a listing never proves a file NEW), and every step keeps its own proof
+  when it acts (a JXL put in place, a copy it replaces, a JXL undone). What the
+  run that saved the plan could not read is said again (`Errors:`, exit 1): a
+  resume never hides a loss. A resume never deletes what is set aside, never
+  moves, never looks for orphans, never puts a TIFF back from `originals\`,
+  never adopts by hash and never saves a plan. It refuses (exit 2, nothing
+  changed) a plan that is missing, used, not the one the catalog recorded (its
+  id and SHA-256), damaged (a path that would lead out of the backup, a source
+  file outside the plan's sources, a value of the wrong type, a wrong count:
+  any file that is not a whole plan of ours), of another script, version,
+  backup, options, settings, manifest or modes table, or older than
+  `RESUME_MAX_DAYS` (counted in UTC). Only the run that saved a plan, or a
+  resume of it, marks it used. The plan file is photo-backup's own: written as a
+  temp file, flushed to the disk and put in place only over a file whose first
+  line says it is a plan of ours, never through a link, never deleted (a link or
+  a folder at its temp name is left as it is, and the plan is not saved). The
+  mirror never resumes.
 - **A JPEG kept as JXL comes back byte for byte** *(v0.14.0-rc3)*: jxl-photo's
   lossless transcode only (`--force-transcode`), and the JXL is kept only after
   the JPEG rebuilt from it (by libjxl's djxl, *rc4*; without it by jxl-photo)

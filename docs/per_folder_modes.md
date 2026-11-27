@@ -139,6 +139,7 @@ python manifest_backup.py --manifest backup_manifest.csv --analyze
 python manifest_backup.py --manifest backup_manifest.csv --dest "H:\BACKUP" --dry-run
 python manifest_backup.py --manifest backup_manifest.csv --dest "H:\BACKUP"
 python manifest_backup.py --manifest backup_manifest.csv --dest "H:\BACKUP" --verify full
+python manifest_backup.py --manifest backup_manifest.csv --dest "H:\BACKUP" --resume
 ```
 
 From the menu: `[7] Manifest` ([menu.md](menu.md)).
@@ -151,6 +152,7 @@ From the menu: `[7] Manifest` ([menu.md](menu.md)).
 | `--analyze` | print how many bytes each mode would take in each folder and write `<stamp>_analysis.csv`; copies nothing and needs no destination |
 | `--dry-run` | plan, print the summary and write the logs/CSVs; copy nothing |
 | `--yes` | do not ask for confirmation |
+| `--resume` | go on with the plan the last real manifest run saved in the backup, without reading the folders again: only the copies and conversions it left, each file checked first. The manifest and the modes table must be the plan's, byte for byte, and so must the other options that change the plan; no orphans, moves or deletions; refused, exit 2, when the plan does not match. Not with `--analyze` *(v0.14.0-rc10; [pause and resume](reruns_and_moves.md#pause-and-resume-a-long-run))* |
 | `--update-changed` | move a changed destination file to the versions folder before copying the new one |
 | `--no-auto-update` | do not update changed edit settings/sidecars (`AUTO_UPDATE_EXTENSIONS`) unless `--update-changed` is given |
 | `--verify-copy {none,size,hash}` | verification of each copy (default: `hash`, from `selective_backup.py`) |

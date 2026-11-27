@@ -3,6 +3,13 @@
 The short notes of each recent release, newest first; the README keeps the
 current one. Every release in detail: [version_history.md](version_history.md).
 
+## v0.14.0-rc10 (test version, not released yet)
+
+2026-11-27. A long backup can be paused and continued without reading the sources again. Needs jxl-photo 2.31.0 (unchanged). Everything of rc9 and below holds.
+
+- **Pause and resume** (`--resume`): Ctrl+C stops a long run as before; the same command with `--resume` goes on with the plan that run saved in the backup, without listing the sources again (7 min 40 s saved on a 426,000-file manifest). It finishes only the copies and conversions the plan left, each file checked against its source and the backup first; no orphans, moves or deletions, and a plan that does not match is refused (exit 2, nothing changed). Menu: `[7] Manifest` → `[4] Continue the last backup`. [How](reruns_and_moves.md#pause-and-resume-a-long-run)
+- **A hard stop redoes almost nothing**: during the conversions the catalog is written every `CONVERT_COMMIT_S` seconds (2) instead of every 50 files; a run killed with `taskkill /F` had to make 45 TIFF again.
+
 ## v0.14.0-rc9 (test version, not released yet)
 
 2026-11-27. The backup goes to the state the manifest asks for, keeps what it sets aside for as long as you say, and uses the TIFF originals it keeps. Needs jxl-photo 2.31.0 (unchanged). Everything of rc8 and below holds.

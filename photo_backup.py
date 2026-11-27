@@ -37,7 +37,7 @@ import sqlite3
 import string
 import subprocess
 
-__version__ = "0.14.0-rc9"
+__version__ = "0.14.0-rc10"
 
 # ---- Settings ------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("PHOTOBACKUP_CONFIG") or os.path.join(
@@ -937,6 +937,7 @@ def manifest_flow(config):
     say("  [1] Analyze only (how many bytes each mode would take in each folder)")
     say("  [2] Back up (dry-run first, then copy)")
     say("  [3] Verify the backup against this manifest")
+    say("  [4] Continue the last backup (its saved plan: the folders are not read again)")
     choice = ask("Choose", "2")
     if choice == "1":
         rc = run_manifest(["--manifest", manifest, "--analyze"])
@@ -970,6 +971,19 @@ def manifest_flow(config):
             say("Verify: problems found - see the statuses above and the _verify.csv.", "yellow")
         else:
             say(f"Verify: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.", "red")
+        return rc
+    if choice == "4":
+        update_changed = yes_no("Replace originals/exports that changed since the last backup "
+                                "(old copy kept in versions)? (as in the run you continue)",
+                                bool(config.get("last_manifest_update_changed", False)))
+        config["last_manifest_update_changed"] = update_changed
+        save_config(config)
+        title("Continuing the last backup (its saved plan)")
+        # once, without --yes: the backup shows what is left and asks itself
+        rc = run_manifest(["--manifest", manifest, "--dest", dest, "--resume"]
+                          + (["--update-changed"] if update_changed else []))
+        say(f"Continue: {_EXIT_TEXT.get(rc, f'exit code {rc}')}.",
+            "green" if rc == 0 else "yellow")
         return rc
     if choice != "2":
         return 0

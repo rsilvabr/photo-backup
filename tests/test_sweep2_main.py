@@ -427,7 +427,8 @@ def test_n27_names_that_differ_only_by_sharp_s_are_an_error_not_a_silent_loss(
     assert "Errors: 1" in capsys.readouterr().out
     assert "ERROR duplicate destination" in latest_log(photobackup_log_dir)
     assert len(dest_files(tmp_path / "D") - {"_photo_backup/catalog.sqlite",
-                                             "_photo_backup/volume.json"}) == 1
+                                             "_photo_backup/volume.json",
+                                             f"_photo_backup/{sb.RESUME_FILE}"}) == 1
 
 
 # ---- N28: the restore gives the date the catalog recorded ------------------------------------

@@ -288,6 +288,11 @@ mirror of its manifest with `--unattended` ([menu.md](menu.md#unattended-runs-ta
 
 ## Options
 
+There is no `--resume`: the mirror decides what leaves from a fresh listing
+([pause and resume](reruns_and_moves.md#pause-and-resume-a-long-run) is for the
+backup); a mirror run leaves the backup's saved plan as it is (a resume after it
+proves every file again and finds little to do).
+
 | Option | Description |
 |---|---|
 | `--manifest PATH` | the manifest (`Folder,Mode,Originals,Mirror,Tiff,Jpeg`; `Tiff` and `Jpeg` keep that line's TIFFs and JPEGs as JXL, [tiff_to_jxl.md](tiff_to_jxl.md)) |

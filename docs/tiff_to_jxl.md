@@ -237,6 +237,13 @@ says `serve mode`, and its end `jxl-photo serve: N processes for M files`.
 
 - **Nothing changed**: the JXL is up to date (`N up to date` in the summary),
   nothing is converted again.
+- **After a hard stop** *(v0.14.0-rc10)*: during the conversions the catalog is
+  written after a JXL is put in place once `CONVERT_COMMIT_S` seconds (2) passed
+  since the last write: a JXL put in place in
+  those last seconds of a run killed (`taskkill /F`, a power cut) may have no
+  row; the next run (full or `--resume`) sets it aside in `versions\` and makes
+  it again. It was every 50 files: 45 TIFF were made again on 27/11
+  ([pause and resume](reruns_and_moves.md#pause-and-resume-a-long-run)).
 - **The file was edited**: CHANGED. With `--update-changed` (always in the
   mirror) it is converted again; the old JXL goes to `versions\` (the
   mirror: to its trash).
@@ -540,6 +547,7 @@ At the top of `selective_backup.py`:
 | `JXL_TIMEOUT_MIN` | `30` | a conversion longer than this is given up: the file is copied as it is |
 | `JXLPHOTO_SERVE` | `True` | one jxl-photo process per worker converts file after file (its `--serve` mode, 2.31.0-rc3 and newer; [above](#how-the-conversions-run-serve-mode)); `False` = one per file, as up to rc6 *(rc7)* |
 | `CONVERT_GIVE_UP_AFTER` | `2` | a TIFF or JPEG jxl-photo could not convert in this many runs in a row (same file, jxl-photo and settings) stays the copy as it is, not tried again and not a failure; `0` = always try again ([above](#a-file-jxl-photo-cannot-convert)) |
+| `CONVERT_COMMIT_S` | `2.0` | the catalog is written after a JXL is put in place once this many seconds passed since the last write (and every `FLUSH_BATCH_FILES` files); `0` = after every file *(v0.14.0-rc10; [after a hard stop](#a-second-run))* |
 | `JXL_WORK_DIR` | `""` | where the conversions run, each in a folder of its own, jxl-photo's temp files too; `""` = the system's temp folder (an SSD on most computers). `--work-dir` sets it for one run, and the menu remembers one per computer (`[4] Settings`). The work folder is never inside or above a source or the backup (refused, exit 2: a source that holds the temp folder needs another `JXL_WORK_DIR`). On another volume than the backup, each JXL is copied into it and checked; on the same one, renamed (a rename the system refuses as "another device" — two disks with one serial number, a cloned disk — sends that JXL and the rest of the run the copy way, said once, *rc9*). A path with a `%` in it is refused (exit 2, before anything is read): ExifTool reads a `%` in a file name as a format code, and jxl-photo keeps its temp files there ([JP-22](jxlphoto_contract.md#jp-22--the-temp-folder-never-has-a-)). So is a work folder so deep that jxl-photo's temp folders in it would be 240 characters or more (about 220 for the folder itself): Windows hangs a program whose temp folder has 260 when it starts another one *(rc6)* |
 | `JXL_WORK_FOLDER` | `"pbconv"` | photo-backup's folder inside `JXL_WORK_DIR` (one plain name): one folder per running backup, named by its process number and holding a mark file, removed at the end; a later run removes the marked ones of a backup that no longer runs |
 | `KEEP_TOOLS_IN_BACKUP` | `True` | keep photo-backup, jxl-photo and `KEEP_TOOLS_EXTRA` in the backup |

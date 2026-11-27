@@ -28,7 +28,9 @@ import collections
 import contextlib
 import csv
 import errno
+import gzip
 import hashlib
+import io
 import json
 import math
 import os
@@ -44,12 +46,13 @@ import tempfile
 import threading
 import time
 import uuid
+import zlib
 from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as _FutureTimeout,
                                 wait as _wait_futures)
 from dataclasses import dataclass, field, replace as _replace_fields
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-__version__ = "0.14.0-rc9"
+__version__ = "0.14.0-rc10"
 
 # ---- Export folders -------------------------------------------------------
 EXPORT_NAME_CONTAINS = "export"     # a folder whose name contains this (any case) is an export folder
@@ -138,6 +141,13 @@ AUTO_UPDATE_EXTENSIONS = (".xmp", ".dop", ".pp3", ".cos", ".comask", ".nksc")  #
 DETECT_MOVES = True                 # default: a NEW file that is a moved/renamed catalogued file is moved inside the backup (--no-detect-moves)
 ORPHANS_FOLDER = "orphans"          # under CATALOG_FOLDER: where --move-orphans puts backup files whose source is gone
 BACKUP_ID_FILE = "volume.json"      # under CATALOG_FOLDER: the identity of this backup (F2)
+RESUME_FILE = "resume_plan.jsonl.gz"  # under CATALOG_FOLDER: the plan of the last real backup that left work,
+                                    # for --resume (one file of ours, rewritten by each such run, bound to the
+                                    # catalog; never under a source: the backup never is)
+SAVE_RESUME_PLAN = True             # a real backup with something to copy or convert saves its plan there
+                                    # first (5-10 MB for 426 000 files); False = never (--resume finds none)
+RESUME_MAX_DAYS = 7                 # --resume refuses a saved plan older than this many days (counted from
+                                    # the start of the run that made it); 0 = no resume at all
 VERIFY_MAX_GB = 0.0                 # default --max-gb for --verify full: 0 = verify everything
 VERIFY_PARALLEL = True              # --verify full: read the backup copy and the source at the same time when they
                                     # are on two drives (the time of the slower disk, not the sum); False = one
@@ -195,6 +205,11 @@ CONVERT_GIVE_UP_AFTER = 2           # a TIFF or JPEG jxl-photo could not convert
                                     # not tried again: no longer a failure of the run ("not converted
                                     # again" in the summary). A changed file, another jxl-photo, other
                                     # settings or --retry-conversions try again; 0 = always try again
+CONVERT_COMMIT_S = 2.0              # conversions: the catalog is written after a JXL is put in place once
+                                    # this many seconds passed since the last write (and every
+                                    # FLUSH_BATCH_FILES files): a hard stop (taskkill /F, a power cut) loses
+                                    # the rows of at most that much, which the next run makes again (it was
+                                    # every 50 files: 45 TIFF made again on 27/11); 0 = after every file
 JXL_WORK_DIR = ""                   # where the conversions run, each in a folder of its own, jxl-photo's
                                     # own temp files too: "" = the system's temp folder (an SSD on most
                                     # PCs). The backup's disk then gets each finished JXL from one writer,
@@ -806,6 +821,7 @@ class Plan:
     inside: list = field(default_factory=list)   # (session, subfolder, files, bytes) left out
     skipped_folders: list = field(default_factory=list)  # skipped by name, not listed (paths)
     cache_links: list = field(default_factory=list)  # Capture One cache folders that are links (paths)
+    errors_not_listed: int = 0  # read errors counted but not in `errors` (a resume: past the lines its plan kept)
 
 
 @dataclass
@@ -1641,6 +1657,10 @@ def _tiff_profile_errors():
         value = globals()[name]
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 10:
             errors.append(f"{name} must be a whole number from 1 to 10 (it is {value!r})")
+    value = CONVERT_COMMIT_S
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value < 0):
+        errors.append(f"CONVERT_COMMIT_S must be a number of seconds, 0 or more (it is {value!r})")
     return errors
 
 
@@ -1656,6 +1676,17 @@ def _validate_usage(args):
         errors.append("--verify cannot be combined with --update-changed")
     if args.verify and args.move_orphans:
         errors.append("--move-orphans cannot be combined with --verify")
+    if getattr(args, "resume", False):
+        if args.verify:
+            errors.append("--resume cannot be combined with --verify")
+        if args.move_orphans:
+            errors.append("--resume cannot be combined with --move-orphans: a resume does not look "
+                          "for orphans (a full run does)")
+        if getattr(args, "adopt_by_hash", False):
+            errors.append("--resume cannot be combined with --adopt-by-hash (ADOPT_BY_HASH): a run "
+                          "that adopts by hash is not resumed; give --no-adopt-by-hash, or run in full")
+        if RESUME_MAX_DAYS == 0:
+            errors.append("--resume: RESUME_MAX_DAYS = 0 turns resuming off")
     if args.max_gb < 0:
         errors.append("--max-gb cannot be negative")
     elif not math.isfinite(args.max_gb):
@@ -1911,7 +1942,7 @@ def _forget_gone_not_converted(not_converted, statuses, rows_by_key, catalog, lo
     return forgotten
 
 
-def _undo_groups(statuses, groups, rows, log=None):
+def _undo_groups(statuses, groups, rows, log=None, planned_keys=None):
     """The manifest is the state the backup goes to (v0.14.0, 261126): a plain
     file planned for a TIFF or JPEG whose JXL group is in the catalog (`Jpeg` /
     `Tiff` say copy now) carries the rels of that group in `undoes`; the group
@@ -1929,9 +1960,11 @@ def _undo_groups(statuses, groups, rows, log=None):
     SKIPPED`, the group stays); the group's source has another size than the
     file, or an UP_TO_DATE copy's row (our copy of the source) has another
     SHA-256 (`undo_older`). The rest is proven after the copy. A group that
-    stays keeps its keys planned."""
+    stays keeps its keys planned. `planned_keys` (a resume): the rels of every
+    planned file, casefolded, not only of `statuses`."""
     groups = groups or {}
-    planned_keys = {status.planned.rel.casefold() for status in statuses}
+    planned_keys = (planned_keys if planned_keys is not None
+                    else {status.planned.rel.casefold() for status in statuses})
     result = []
     for status in statuses:
         planned = status.planned
@@ -3141,6 +3174,15 @@ class _Catalog:
             self._record_writer(created_now=False)
         self.conn.commit()
 
+    def meta(self, key):
+        """The value of one row of the meta table, or None."""
+        row = self.conn.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key, value):
+        """One row of the meta table (the caller commits)."""
+        self.conn.execute("INSERT OR REPLACE INTO meta(k, v) VALUES(?, ?)", (key, value))
+
     def close(self):
         try:
             if self.conn is not None:
@@ -3419,24 +3461,37 @@ def _plain_name_problem(name, value, reserved):
     return None
 
 
-def _reserved_names():
+def _reserved_names(resume=True):
     """The names under CATALOG_FOLDER that are taken: what a store folder can
-    never be called."""
-    return {_VERSIONS_FOLDER, ORPHANS_FOLDER.casefold(), TOOLS_FOLDER.casefold(),
-            BACKUP_ID_FILE.casefold(), _OLD_WORK_FOLDER.casefold(), "catalog.sqlite",
-            "catalog.sqlite-journal"}
+    never be called. `resume=False`: without RESUME_FILE's own two (what
+    RESUME_FILE itself can never be called)."""
+    names = {_VERSIONS_FOLDER, ORPHANS_FOLDER.casefold(), TOOLS_FOLDER.casefold(),
+             BACKUP_ID_FILE.casefold(), _OLD_WORK_FOLDER.casefold(), "catalog.sqlite",
+             "catalog.sqlite-journal"}
+    if resume and isinstance(RESUME_FILE, str):     # a wrong setting gives its own message
+        names |= {RESUME_FILE.casefold(), (RESUME_FILE + TEMP_SUFFIX).casefold()}
+    return names
 
 
 def _store_settings_errors():
-    """The keep-days settings and ORIGINALS_FOLDER of this script: refused
-    before anything is read (exit 2)."""
+    """The keep-days settings, ORIGINALS_FOLDER and the resume settings of
+    this script: refused before anything is read (exit 2)."""
     mirror_folders = {str(store.folder).casefold() for store in _mirror_stores()}
     errors = [problem for problem in (
         _keep_days_problem("VERSIONS_KEEP_DAYS", VERSIONS_KEEP_DAYS),
         _keep_days_problem("ORIGINALS_KEEP_DAYS", ORIGINALS_KEEP_DAYS),
         _plain_name_problem("ORIGINALS_FOLDER", ORIGINALS_FOLDER,
-                            _reserved_names() | mirror_folders))
+                            _reserved_names() | mirror_folders),
+        _plain_name_problem("RESUME_FILE", RESUME_FILE,
+                            _reserved_names(resume=False) | mirror_folders
+                            | {str(ORIGINALS_FOLDER).casefold()}))
         if problem]
+    if not isinstance(SAVE_RESUME_PLAN, bool):
+        errors.append(f"SAVE_RESUME_PLAN must be True or False (it is {SAVE_RESUME_PLAN!r})")
+    if (isinstance(RESUME_MAX_DAYS, bool) or not isinstance(RESUME_MAX_DAYS, int)
+            or RESUME_MAX_DAYS < 0):
+        errors.append(f"RESUME_MAX_DAYS must be a whole number of days, 0 or more "
+                      f"(it is {RESUME_MAX_DAYS!r})")
     return errors
 
 
@@ -6292,12 +6347,14 @@ def _timing_line(timing, files, wall):
             f"a conversion {timing['wait']:.0f} s, putting the JXL in place "
             f"{timing['place']:.0f} s (writing the copies {timing['write']:.0f} s), old copies "
             f"aside {timing['retire']:.0f} s, copies as they are {timing['as_is']:.0f} s, work "
-            f"folders removed {timing['clean']:.0f} s; the workers (sum): reading the sources "
+            f"folders removed {timing['clean']:.0f} s, the catalog written "
+            f"{timing['commit']:.0f} s ({_num(int(timing['commits']))} times); the workers (sum): reading the sources "
             f"{timing['read']:.0f} s, jxl-photo {timing['convert']:.0f} s, proof "
             f"{timing['proof']:.0f} s")
 
 
-def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, info=None):
+def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, info=None,
+                 planned_keys=None):
     """The TIFFs and JPEGs kept as JXL: jxl-photo converts each in a folder of
     its own in this run's work folder (_work_root: --work-dir, else
     JXL_WORK_DIR, by default the system's temp folder), JPEGs _jxl_workers() at a time and
@@ -6307,6 +6364,9 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
     worst load for an SMR drive). Each pool runs at most twice its size ahead of
     that writer, so the work folder holds a few GB at most, however slow the
     backup's disk is. A file that cannot be converted is copied as it is.
+    The catalog is written after a placed group once CONVERT_COMMIT_S passed
+    since the last write, and every FLUSH_BATCH_FILES files. `planned_keys` (a
+    resume): the rels of every planned file, casefolded, not only of `statuses`.
     Returns True when interrupted (Ctrl+C)."""
     info = {} if info is None else info
     for name in ("converted", "failed", "retired", "retired_deleted", "bytes_in", "bytes_out",
@@ -6350,7 +6410,7 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
             f"({tool}{', serve mode' if serving else ''}; {' and '.join(pace)} at a time; "
             f"{_gb(sum(status.planned.size for status in todo))})")
     started = time.monotonic()
-    progress = {"finished": 0, "bytes": 0, "last_report": started}
+    progress = {"finished": 0, "bytes": 0, "last_report": started, "committed": started}
     total_bytes = sum(status.planned.size for status in todo)
     speed = _Speed()
     interrupted = False
@@ -6379,7 +6439,8 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
     for index, status in enumerate(todo):
         queues[0 if status.planned.convert == JPEG_CONVERT else 1][1].append((index, status))
     pending = {}
-    planned_keys = {status.planned.rel.casefold() for status in statuses}   # S1
+    planned_keys = (planned_keys if planned_keys is not None
+                    else {status.planned.rel.casefold() for status in statuses})   # S1
     failures = []       # (status, why): what may count towards CONVERT_GIVE_UP_AFTER (M2)
     timing = collections.Counter()      # seconds, for the TIMING line (P0)
     serve_said = []                     # JXL-PHOTO SERVE NOT USED is said once
@@ -6493,8 +6554,15 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
             timing["clean"] += time.monotonic() - cleaning
         progress["finished"] += 1
         finished = progress["finished"]
-        if finished % max(FLUSH_BATCH_FILES, 1) == 0:
+        # every placed group is on the disk with its row within CONVERT_COMMIT_S: a hard
+        # stop loses at most that much (rc10; every 50 files lost 45 groups on 27/11)
+        asked = time.monotonic()
+        if (finished % max(FLUSH_BATCH_FILES, 1) == 0
+                or asked - progress["committed"] >= CONVERT_COMMIT_S):
             catalog.commit()
+            progress["committed"] = time.monotonic()
+            timing["commit"] += progress["committed"] - asked
+            timing["commits"] += 1
         progress["bytes"] += status.planned.size     # converted or kept as it is
         now = time.monotonic()
         if now - progress["last_report"] >= PROGRESS_EVERY_S or finished == total:
@@ -6554,7 +6622,7 @@ def _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file=None, 
 
 
 def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_copy=None,
-              keep_old_file=None, convert_info=None):
+              keep_old_file=None, convert_info=None, planned_keys=None):
     """Copy what the plan says. `stop_info` (a dict) receives why the copy
     stopped early and what was left, when the destination stopped taking
     writes: after DEST_CHECK_AFTER_ERRORS failed copies in a row the
@@ -6726,7 +6794,7 @@ def _copy_all(args, statuses, dest, stamp, catalog, log, stop_info=None, old_cop
                            keep_old_file or _keep_old_file, convert_info,
                            bool(getattr(args, "update_changed", False)))
             if _convert_all(args, statuses, dest, stamp, catalog, log, keep_old_file,
-                            convert_info):
+                            convert_info, planned_keys):
                 raise KeyboardInterrupt
         if stopped is None and catalog_error is not None:
             # the last commit failed: every file was tried, none is left
@@ -6771,14 +6839,16 @@ _CATEGORY_LABELS = {
 
 def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_paths,
                    dest_error=None, extra_lines=(), freed=0, catalog_note="", orphan_lines=(),
-                   lists=(), space_block=(), replace_label=None):
+                   lists=(), space_block=(), replace_label=None, resume_text=None):
     """The summary a person reads before the question (v0.14.0-rc4, PENDENCIAS
     of 16/11: tables of label | files | size, one fact per line, counts with
     separators, TB from 1,000 GB on, the lists named once at the end, the space
     last). `extra_lines`: more rows of "This run"; `orphan_lines`: rows of the
     orphans' block; `lists`: (file name, what it holds) of the CSVs;
     `space_block`: what is set aside in the backup (261126), after the Space
-    line; `replace_label`: the label of the changed files' row."""
+    line; `replace_label`: the label of the changed files' row; `resume_text`:
+    (head, block) of a --resume (_resume_summary), instead of the sessions'
+    line and the "Not copied" block (rc10)."""
     new = [status for status in statuses if status.status == ST_NEW
            and not getattr(status, "from_original", None)]     # put back: a row of its own
     changed = [status for status in statuses if status.status == ST_CHANGED
@@ -6806,9 +6876,12 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
     if catalog_note:
         lines.append(f"              catalog {catalog_note}")
     lines.append(f"Sources:      {source_text}")
-    lines.append(f"Sessions: {_num(planned.stats.shoots)}   "
-                 f"export folders: {_num(planned.stats.export_folders)}   "
-                 f"export formats: {args.export_formats}")
+    if resume_text is not None:
+        lines.append(resume_text[0])
+    else:
+        lines.append(f"Sessions: {_num(planned.stats.shoots)}   "
+                     f"export folders: {_num(planned.stats.export_folders)}   "
+                     f"export formats: {args.export_formats}")
     lines.append("")
     lines.append(_summary_header("This run"))
     lines.append(_summary_row("copy (new)", len(new), sum(s.planned.size for s in new)))
@@ -6829,6 +6902,33 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
         lines.append("")
         lines.append(_summary_header("In the backup, not on the source (orphans)"))
         lines.extend(orphan_lines)
+    if resume_text is not None:
+        lines.extend(resume_text[1])
+    else:
+        lines.extend(_not_copied_lines(planned))
+    if lists:
+        folder = os.path.normpath(os.path.dirname(log_paths["log"]))
+        lines.append("")
+        lines.append(f"The lists, in {folder}:")
+        width = max(len(name) for name, _what in lists)
+        lines.extend(f"  {name:<{width}}   {what}" for name, what in lists)
+    lines.append("")
+    if planned.errors:
+        lines.append(f"Errors: {_num(len(planned.errors) + planned.errors_not_listed)} "
+                     f"folders/files could not be read (NOT backed up) -> {log_paths['log']}")
+    if dest_error:
+        lines.append(f"Space: need {_gb(needed)}, destination not available ({dest_error})")
+    else:
+        freed_note = f" + {_gb(freed)} freed by this run" if freed else ""
+        lines.append(f"Space: need {_gb(needed)}, free {_gb(free)}{freed_note}, "
+                     f"margin {_gb(margin)} -> " + ("fits" if fits else "DOES NOT FIT"))
+    lines.extend(space_block)
+    return lines
+
+
+def _not_copied_lines(planned):
+    """The "Not copied" block of the summary (what the plan left out)."""
+    lines = []
     lines.append("")
     lines.append(_summary_header("Not copied"))
     lines.append(_summary_row("export files filtered (formats / excluded subfolders)",
@@ -6880,34 +6980,700 @@ def _summary_lines(args, planned, statuses, needed, free, margin, fits, log_path
         lines.append(_summary_row("folders skipped by name (system / --exclude-folders)",
                                   f"{_num(len(planned.skipped_folders))} folders", None,
                                   "listed in the log"))
-    if lists:
-        folder = os.path.normpath(os.path.dirname(log_paths["log"]))
-        lines.append("")
-        lines.append(f"The lists, in {folder}:")
-        width = max(len(name) for name, _what in lists)
-        lines.extend(f"  {name:<{width}}   {what}" for name, what in lists)
-    lines.append("")
-    if planned.errors:
-        lines.append(f"Errors: {_num(len(planned.errors))} folders/files could not be read "
-                     f"(NOT backed up) -> {log_paths['log']}")
-    if dest_error:
-        lines.append(f"Space: need {_gb(needed)}, destination not available ({dest_error})")
-    else:
-        freed_note = f" + {_gb(freed)} freed by this run" if freed else ""
-        lines.append(f"Space: need {_gb(needed)}, free {_gb(free)}{freed_note}, "
-                     f"margin {_gb(margin)} -> " + ("fits" if fits else "DOES NOT FIT"))
-    lines.extend(space_block)
     return lines
 
 
-def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
+# ---- Pause and resume (v0.14.0-rc10) ------------------------------------------------------
+# A normal real run that leaves work saves its plan in the backup right before the
+# copy (_save_plan); --resume goes on with it without listing the sources again
+# (_resume_load). The catalog and the destination say what is done: the plan only
+# says what the run that made it meant to do, and every file is checked again.
+_RESUME_TOOL = "photo-backup resume plan"      # the header's "tool": the proof a file is a plan of ours
+_RESUME_FORMAT = 1
+_RESUME_KEY_OPTIONS = ("source", "base", "export_formats", "exclude_export_subfolders",
+                       "export_name_contains", "exclude_export_names", "unselected", "unexported",
+                       "c1_cache", "derivatives", "exclude_folders", "tiff", "jpeg",
+                       "update_changed", "auto_update", "no_convert", "retry_conversions",
+                       "reconvert_older", "adopt_by_hash")
+_RESUME_FREE_SETTINGS = frozenset({
+    "SPACE_MARGIN_GB", "COPY_CHUNK_MB", "READ_AHEAD_MB", "SMALL_FILE_KB", "FLUSH_BATCH_FILES",
+    "FLUSH_THREADS", "DEST_CHECK_AFTER_ERRORS", "VERSIONS_KEEP_DAYS", "ORIGINALS_KEEP_DAYS",
+    "PROGRESS_EVERY_S", "PROGRESS_RECENT_S", "VERIFY_COPY", "VERIFY_MAX_GB", "VERIFY_PARALLEL",
+    "VERIFY_COMMIT_S", "VERIFY_QUICK_USES_PLAN", "SUMMARY_FOLDER_LINES", "SUMMARY_INSIDE_NAMES",
+    "JXLPHOTO", "JXLPHOTO_RESTORE_MIN_VERSION", "JXL_WORKERS", "JXL_TIFF_WORKERS", "DJXL",
+    "JXL_TIMEOUT_MIN", "JXLPHOTO_SERVE", "JXL_WORK_DIR", "JXL_WORK_FOLDER",
+    "KEEP_TOOLS_IN_BACKUP", "KEEP_TOOLS_EXTRA", "LOG_DIR", "PLAN_CSV_UP_TO_DATE",
+    "VERIFY_CSV_OK", "CONVERT_COMMIT_S", "RESUME_MAX_DAYS", "SAVE_RESUME_PLAN"})
+_SETTING_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
+_SETTING_TYPES = (str, int, float, bool, type(None), tuple, list, dict, set, frozenset)
+_RESUME_NOTHING = "NOTHING"     # _resume_mismatch: the plan was finished (not a mismatch)
+_RESUME_ERROR_LINES = 100       # the plan's read errors kept as text in its header (all are counted)
+_RESUME_ERROR_CHARS = 1000      # ... each cut at this length (the header stays far below 1 MB)
+
+
+class _PlanRefused(Exception):
+    """A --resume that cannot go on: the message says why (exit 2, nothing changed)."""
+
+
+def _canonical_text(value):
+    """One text for a value, the same in every process: JSON with sorted keys
+    (a set sorted), else its repr."""
+    def sets(item):
+        if isinstance(item, (set, frozenset)):
+            return sorted(item, key=repr)
+        raise TypeError(f"not JSON: {type(item).__name__}")
+    try:
+        return json.dumps(value, sort_keys=True, default=sets)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def _plan_settings(module):
+    """{name: canonical text} of every UPPER_CASE setting of `module` that can
+    change what a run plans: everything but _RESUME_FREE_SETTINGS (deny by
+    default -- a setting added later is compared until someone frees it)."""
+    return {name: _canonical_text(value) for name, value in sorted(vars(module).items())
+            if _SETTING_NAME.fullmatch(name) and name not in _RESUME_FREE_SETTINGS
+            and isinstance(value, _SETTING_TYPES)}
+
+
+def _plan_options(args):
+    """{option: value} of the options that change what a run plans
+    (_RESUME_KEY_OPTIONS): a resume must have the plan's."""
+    options = {}
+    for name in _RESUME_KEY_OPTIONS:
+        if name == "source":
+            options[name] = [os.path.abspath(source)
+                             for source in (getattr(args, "source", None) or [])]
+        elif name == "base":
+            options[name] = (os.path.abspath(args.base) if getattr(args, "base", None)
+                             else None)
+        else:
+            options[name] = getattr(args, name, None)
+    return options
+
+
+def _option_flag(name):
+    """The command-line flag of an option of _RESUME_KEY_OPTIONS."""
+    return {"source": "--source", "auto_update": "--no-auto-update",
+            "adopt_by_hash": "--adopt-by-hash"}.get(name, "--" + name.replace("_", "-"))
+
+
+def _resume_open(status):
+    """Whether the plan leaves work for this file: saved with its PlannedFile
+    (else only its rel)."""
+    return (status.status != ST_UP_TO_DATE or bool(status.undoes) or bool(status.replaces)
+            or bool(getattr(status, "from_original", None))
+            or bool(getattr(status, "reconvert", False)))
+
+
+def _resume_now():
+    """Now, for the age of a saved plan (tests patch it; a naive value is
+    local time)."""
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(moment):
+    """`moment` in UTC; a naive one is local time."""
+    return moment.astimezone(timezone.utc)
+
+
+def _plan_path(dest):
+    return os.path.join(os.path.abspath(dest), CATALOG_FOLDER, RESUME_FILE)
+
+
+def _plan_kind(plan_extra):
+    """The script whose plan it is: selective_backup or manifest_backup."""
+    return (plan_extra or {}).get("kind", "selective_backup")
+
+
+def _read_plan_header(path):
+    """The first line of a saved plan as a dict, or None for anything that is
+    not one (a file of another program, damaged, unreadable)."""
+    try:
+        with open(_io(path), "rb") as raw:
+            with gzip.GzipFile(fileobj=raw) as packed:
+                return json.loads(packed.readline(1 << 20))
+    except Exception:
+        return None
+
+
+def _save_plan(dest, catalog, statuses, planned, args, plan_extra, run_started, log):
+    """Save this run's plan for --resume (CATALOG_FOLDER\\RESUME_FILE) and bind
+    it to the catalog (meta resume_plan, resume_plan_sha256). Written as a
+    temp file, fsynced, its SHA-256 read back, then put in place -- only over a
+    file whose header says it is a plan of ours, never through a link. Returns
+    the plan id, or None (a WARNING: the run goes on, a stop then needs a full
+    run)."""
+    open_statuses = [status for status in statuses if _resume_open(status)]
+    if not open_statuses:
+        log.log("RESUME PLAN not saved: this run leaves nothing to do")
+        return None
+    problem = _store_problem(dest, RESUME_FILE)
+    if problem:
+        log.out(f"WARNING the plan for --resume is not saved: {problem}")
+        return None
+    backup_id = read_backup_id(dest)
+    if backup_id is None:
+        log.out("WARNING the plan for --resume is not saved: the backup ID cannot be read")
+        return None
+    path = _plan_path(dest)
+    if os.path.lexists(_io(path)):
+        old = _read_plan_header(path)
+        if not isinstance(old, dict) or old.get("tool") != _RESUME_TOOL:
+            log.out(f"WARNING {path} is not a plan photo-backup saved: it is left as it is, and "
+                    f"this run's plan is not saved (move that file away to have one)")
+            return None
+    started = time.monotonic()
+    plan_id = f"{run_started:%y%m%d_%H%M%S}-{uuid.uuid4().hex[:8]}"
+    open_bytes = sum(status.planned.size for status in open_statuses)
+    header = {
+        "tool": _RESUME_TOOL, "format": _RESUME_FORMAT, "plan_id": plan_id,
+        "kind": _plan_kind(plan_extra), "version": __version__, "backup_id": backup_id,
+        "dest": os.path.abspath(dest), "started": run_started.isoformat(timespec="seconds"),
+        # the age of the plan is counted in UTC: a clock put back for the
+        # winter does not make it "later than now" (N4 of the review)
+        "started_utc": _as_utc(run_started).isoformat(timespec="seconds"),
+        "saved": datetime.now().isoformat(timespec="seconds"), "log": log.path,
+        "options": _plan_options(args), "settings": _plan_settings(sys.modules[__name__]),
+        "extra": {key: value for key, value in (plan_extra or {}).items() if key != "kind"},
+        "sources": [[source, base] for source, base in planned.sources],
+        # what the plan could not read: a resume says it again and exits 1, as
+        # the run that planned did (M1 of the review)
+        "plan_errors": len(planned.errors),
+        "errors": [str(error)[:_RESUME_ERROR_CHARS]
+                   for error in planned.errors[:_RESUME_ERROR_LINES]],
+        "files": len(statuses), "open": len(open_statuses), "open_bytes": open_bytes,
+    }
+    trailer = {"end": True, "files": len(statuses), "open": len(open_statuses)}
+    tmp = path + TEMP_SUFFIX
+    try:
+        held = os.lstat(_io(tmp))
+    except FileNotFoundError:
+        held = None
+    except OSError as exc:
+        log.out(f"WARNING the plan for --resume is not saved: {tmp} cannot be asked ({exc})")
+        return None
+    if held is not None and (not stat_module.S_ISREG(held.st_mode)
+                             or getattr(held, "st_file_attributes", 0) & _REPARSE_POINT):
+        # a link, a junction or a folder at our temp name is not ours: never
+        # deleted, and nothing is written through it (N1 of the review)
+        log.out(f"WARNING the plan for --resume is not saved: {tmp} is not a temp file of "
+                f"ours (a link, a junction or a folder); it is left as it is")
+        return None
+    made = False
+    try:
+        if held is not None:
+            _delete_temp(tmp)       # a plain file: our temp of a run that stopped
+        with open(_io(tmp), "xb") as raw:
+            made = True
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as packed:
+                def write(item):
+                    packed.write((json.dumps(item, separators=(",", ":")) + "\n")
+                                 .encode("ascii"))
+                write(header)
+                for status in statuses:
+                    item = status.planned
+                    if _resume_open(status):
+                        write(["o", item.src, item.rel, item.size, item.mtime_ns,
+                               item.category, item.convert])
+                    else:
+                        write(["c", item.rel])
+                write(trailer)
+            raw.flush()
+            os.fsync(raw.fileno())
+        sha256 = _sha256_file(tmp)
+        size = os.path.getsize(_io(tmp))
+        os.replace(_io(tmp), _io(path))
+    except BaseException as exc:
+        if made:                    # only the temp this run created
+            _remove_temp(tmp)
+        if isinstance(exc, OSError):
+            log.out(f"WARNING the plan for --resume could not be saved ({exc}): a stop now "
+                    f"needs a full run")
+            return None
+        raise
+    try:
+        with _ctrl_c_after():
+            catalog.set_meta("resume_plan", plan_id)
+            catalog.set_meta("resume_plan_sha256", sha256)
+            catalog.commit()
+    except sqlite3.Error as exc:
+        log.out(f"WARNING the plan for --resume is saved but not recorded in the catalog "
+                f"({exc}): --resume will refuse it")
+        return None
+    log.log(f"RESUME PLAN saved {path}: {_num(len(statuses))} files, "
+            f"{_num(len(open_statuses))} left to do ({_gb(open_bytes)}), {size / 1e6:.1f} MB "
+            f"in {time.monotonic() - started:.1f} s (plan {plan_id})")
+    return plan_id
+
+
+def _damaged(path, line, why):
+    return _PlanRefused(f"The saved plan {path} is damaged (line {line}: {why}). Nothing was "
+                        f"changed. Run the backup without --resume: it reads the sources again "
+                        f"and saves a new plan.")
+
+
+def _read_saved_plan(dest):
+    """(header, open PlannedFiles, the rels of the closed ones, SHA-256 of the
+    file, its path). Proves the file is a whole plan of ours: its header, every
+    entry's shape and type, every rel safe and once, every src under the plan's
+    sources, the trailer's counts. Raises _PlanRefused."""
+    problem = _store_problem(dest, RESUME_FILE)
+    if problem:
+        raise _PlanRefused(f"--resume refused: {problem}. Nothing was changed.")
+    path = _plan_path(dest)
+    try:
+        present = os.path.lexists(_io(path))
+    except (OSError, ValueError):
+        present = False
+    if not present:
+        raise _PlanRefused(f"No saved plan for this backup: {path} is not there. A real run "
+                           f"without --resume saves one when it has something to copy or "
+                           f"convert (since v0.14.0-rc10). Nothing was changed.")
+    unreadable = ("The saved plan {path} cannot be read ({name}: {exc}). Nothing was changed. "
+                  "Run the backup without --resume: it reads the sources again and saves a "
+                  "new plan.")
+    try:
+        with open(_io(path), "rb") as handle:
+            data = handle.read()
+    except OSError as exc:
+        raise _PlanRefused(unreadable.format(path=path, name=type(exc).__name__, exc=exc))
+    sha256 = hashlib.sha256(data).hexdigest()
+    profiles = TIFF_JXL_PROFILES if isinstance(TIFF_JXL_PROFILES, dict) else {}
+    open_files, closed_rels, seen = [], [], set()
+    header, trailer = None, None
+    number = 0
+    try:
+        text = io.TextIOWrapper(gzip.GzipFile(fileobj=io.BytesIO(data)), encoding="ascii")
+        for number, line in enumerate(text, 1):
+            if trailer is not None:
+                raise _damaged(path, number, "a line after the end")
+            item = json.loads(line)
+            if number == 1:
+                header = item
+                why = _plan_header_problem(header)
+                if why:
+                    raise _damaged(path, number, f"the header {why}")
+                sources = [source for source, _base in header["sources"]]
+                continue
+            if isinstance(item, dict):
+                if (item.get("end") is not True or type(item.get("files")) is not int
+                        or type(item.get("open")) is not int):
+                    raise _damaged(path, number, "an entry that is not one")
+                trailer = item
+                continue
+            why = _plan_entry_problem(item, sources, profiles)
+            if why:
+                raise _damaged(path, number, why)
+            rel = item[1] if item[0] == "c" else item[2]
+            key = rel.casefold()
+            if key in seen:
+                raise _damaged(path, number, f"the path {rel!r} twice")
+            seen.add(key)
+            if item[0] == "c":
+                closed_rels.append(rel)
+            else:
+                open_files.append(PlannedFile(item[1], item[2], item[3], item[4], item[5],
+                                              item[6]))
+    except _PlanRefused:
+        raise
+    except Exception as exc:
+        # gzip, JSON, a value of the wrong type, a nesting too deep: any file
+        # that is not a plan of ours is a refusal, never a traceback (S2)
+        raise _PlanRefused(unreadable.format(path=path, name=type(exc).__name__, exc=exc))
+    if header is None:
+        raise _damaged(path, 1, "no header")
+    if trailer is None:
+        raise _damaged(path, number, "no end (the file was cut)")
+    files = len(open_files) + len(closed_rels)
+    if (trailer["files"] != files or trailer["open"] != len(open_files)
+            or header["files"] != files or header["open"] != len(open_files)):
+        raise _damaged(path, number, f"the counts ({trailer['files']} files, {trailer['open']} "
+                                     f"open) are not the entries ({files}, {len(open_files)})")
+    return header, open_files, closed_rels, sha256, path
+
+
+def _plan_header_problem(header):
+    """Why the first line of a saved plan is not its header, or None."""
+    if not isinstance(header, dict):
+        return "is not one"
+    if header.get("tool") != _RESUME_TOOL:
+        return "is not of photo-backup"
+    if header.get("format") != _RESUME_FORMAT or type(header.get("format")) is not int:
+        return f"has format {header.get('format')!r}, not {_RESUME_FORMAT}"
+    for key in ("plan_id", "kind", "version", "backup_id", "started"):
+        if not isinstance(header.get(key), str) or not header.get(key):
+            return f"has no {key}"
+    try:
+        started = datetime.fromisoformat(header["started"])
+        started_utc = datetime.fromisoformat(header["started_utc"])
+    except (KeyError, TypeError, ValueError):
+        return "has no time it started"
+    if started.tzinfo is not None or started_utc.utcoffset() != timedelta(0):
+        return "has no time it started"         # local time without a zone; UTC with its own
+    for key in ("options", "settings", "extra"):
+        if not isinstance(header.get(key), dict):
+            return f"has no {key}"
+    sources = header.get("sources")
+    if (not isinstance(sources, list) or not sources
+            or any(not isinstance(pair, list) or len(pair) != 2
+                   or not all(isinstance(part, str) and part and "\0" not in part
+                              for part in pair)
+                   for pair in sources)):
+        return "has no sources"
+    for key in ("files", "open", "plan_errors"):
+        if type(header.get(key)) is not int or header[key] < 0:
+            return f"has no count of {key}"
+    errors = header.get("errors")
+    if (not isinstance(errors, list) or not all(isinstance(text, str) for text in errors)
+            or len(errors) > header["plan_errors"] or len(errors) > _RESUME_ERROR_LINES
+            or (header["plan_errors"] > 0) != bool(errors)):
+        return "has no list of its read errors"
+    return None
+
+
+def _plan_entry_problem(item, sources, profiles):
+    """Why a line of a saved plan is not an entry of it, or None."""
+    if not isinstance(item, list) or not item:
+        return "an entry that is not one"
+    if item[0] == "c":
+        if len(item) != 2 or not isinstance(item[1], str) or "\0" in item[1]:
+            return "an entry that is not one"
+        why = _unsafe_rel(item[1])
+        return f"the path {item[1]!r} has {why}" if why else None
+    if item[0] != "o" or len(item) != 7:
+        return "an entry that is not one"
+    _kind, src, rel, size, mtime_ns, category, convert = item
+    # every value its type first: a list or a dict is no key of a dict (S2),
+    # a NUL is no path Windows opens
+    if (not isinstance(src, str) or not src or not isinstance(rel, str)
+            or "\0" in src or "\0" in rel):
+        return "an entry that is not one"
+    if type(size) is not int or type(mtime_ns) is not int or size < 0:
+        return "an entry that is not one"
+    why = _unsafe_rel(rel)
+    if why:
+        return f"the path {rel!r} has {why}"
+    if not isinstance(category, str) or category not in _CATEGORY_LABELS:
+        return f"the category {category!r}"
+    if convert is not None:
+        if not isinstance(convert, str) or (convert != JPEG_CONVERT and convert not in profiles):
+            return f"the conversion {convert!r}"
+        if not rel.casefold().endswith(".jxl"):
+            return f"a conversion whose path {rel!r} is no .jxl"
+    if not any(_is_under(src, source) for source in sources):
+        return f"the source file {src!r} is under none of the plan's sources"
+    return None
+
+
+def _catalog_resume_meta(dest):
+    """The catalog's resume rows: {resume_plan, resume_plan_sha256,
+    resume_done, resume_done_at} (None for a row it does not have). Read only."""
+    keys = ("resume_plan", "resume_plan_sha256", "resume_done", "resume_done_at")
+    try:
+        catalog = _Catalog(dest, create=False, readonly=True)
+    except FileNotFoundError:
+        raise _PlanRefused(f"--resume refused: there is no backup catalog at {dest}. Nothing "
+                           f"was changed.")
+    except RuntimeError as exc:
+        raise _PlanRefused(str(exc))
+    try:
+        return {key: catalog.meta(key) for key in keys}
+    except sqlite3.Error as exc:
+        raise _PlanRefused(f"cannot read catalog {catalog.path}: {exc}")
+    finally:
+        catalog.close()
+
+
+def _resume_mismatch(header, sha256, meta, args, dest, plan_extra):
+    """Why the saved plan is not this run's to go on with, or None, or
+    _RESUME_NOTHING when it was finished. In this order: kind, backup ID, the
+    catalog's binding, used, version, age, --adopt-by-hash, the manifest's
+    identity, the options, the settings."""
+    kind = _plan_kind(plan_extra)
+    started = datetime.fromisoformat(header["started"])
+    if header["kind"] != kind:
+        return (f"the saved plan was made by {header['kind']}.py, not {kind}.py: resume it "
+                f"with {header['kind']}.py --resume")
+    found = read_backup_id(dest)
+    if found != header["backup_id"]:
+        return (f"the saved plan is of the backup {header['backup_id'][:8]}, and this "
+                f"destination holds {found[:8] if found else 'no backup ID'}")
+    if meta.get("resume_plan") != header["plan_id"] or meta.get("resume_plan_sha256") != sha256:
+        return (f"the saved plan (of {started:%Y-%m-%d %H:%M}) is not the one this backup's "
+                f"catalog recorded last: a later run saved another, or the file was changed "
+                f"or copied here")
+    if meta.get("resume_done") == header["plan_id"]:
+        return _RESUME_NOTHING
+    if header["version"] != __version__:
+        return f"the saved plan was made by version {header['version']}; this is {__version__}"
+    # in UTC: a clock put back an hour for the winter is no "later than now" (N4)
+    age = _as_utc(_resume_now()) - datetime.fromisoformat(header["started_utc"])
+    if age > timedelta(days=RESUME_MAX_DAYS):
+        return (f"the saved plan is from {started:%Y-%m-%d %H:%M}, older than "
+                f"RESUME_MAX_DAYS = {RESUME_MAX_DAYS} days")
+    if age < -timedelta(minutes=5):
+        return "the saved plan's time is later than now (the clock changed?)"
+    if header["options"].get("adopt_by_hash"):
+        return ("the plan was made with --adopt-by-hash: such a run is not resumed (its "
+                "adoptions read both files in the run that plans)")
+    saved_extra = header["extra"]
+    now_extra = {key: value for key, value in (plan_extra or {}).items() if key != "kind"}
+    reasons = []
+    for key in sorted((set(saved_extra) | set(now_extra)) - {"kind", "manifest"}):
+        saved, now = saved_extra.get(key), now_extra.get(key)
+        if key == "manifest_settings":
+            names = _changed_names(saved if isinstance(saved, dict) else {},
+                                   now if isinstance(now, dict) else {})
+            if names:
+                reasons.append("settings of manifest_backup.py changed: " + names)
+        elif _canonical_text(saved) != _canonical_text(now):
+            if key == "manifest_sha256":
+                reasons.append(f"the manifest changed since the plan "
+                               f"({now_extra.get('manifest', saved_extra.get('manifest', ''))})")
+            elif key == "modes_sha256":
+                reasons.append("the modes table changed since the plan")
+            else:
+                reasons.append(f"{key} differs")
+    if reasons:
+        return "; ".join(reasons)
+    current = _plan_options(args)
+    differ = [f"{_option_flag(name)}: the plan {header['options'].get(name)!r}, now "
+              f"{current[name]!r}" for name in _RESUME_KEY_OPTIONS
+              if _canonical_text(header["options"].get(name)) != _canonical_text(current[name])]
+    if differ:
+        return "; ".join(differ)
+    names = _changed_names(header["settings"], _plan_settings(sys.modules[__name__]))
+    if names:
+        return "settings of selective_backup.py changed: " + names
+    return None
+
+
+def _changed_names(saved, now):
+    """The names whose text differs, is missing or is new, sorted: at most 8,
+    then 'and N more'; '' when none."""
+    names = sorted(name for name in set(saved) | set(now) if saved.get(name) != now.get(name))
+    if len(names) > 8:
+        return ", ".join(names[:8]) + f" and {len(names) - 8} more"
+    return ", ".join(names)
+
+
+@dataclass
+class _Resume:
+    header: dict
+    path: str
+    sha256: str
+    plan: Plan
+    all_keys: set
+    left: list          # (PlannedFile, why): changed or gone since the plan
+    started: datetime
+    open_count: int
+    open_bytes: int
+
+
+def _resume_load(args, dest, plan_extra, log):
+    """The saved plan this --resume goes on with, checked: the file
+    (_read_saved_plan), the catalog's binding and everything that must be the
+    plan's (_resume_mismatch), then each open file's source
+    (_resume_source_check). Raises _PlanRefused (exit 2, nothing changed)."""
+    if RESUME_MAX_DAYS == 0:
+        raise _PlanRefused("--resume refused: RESUME_MAX_DAYS = 0 turns resuming off. Nothing "
+                           "was changed.")
+    began = time.monotonic()
+    header, open_files, closed_rels, sha256, path = _read_saved_plan(dest)
+    read_at = time.monotonic()
+    meta = _catalog_resume_meta(dest)
+    catalog_at = time.monotonic()
+    started = datetime.fromisoformat(header["started"])
+    why = _resume_mismatch(header, sha256, meta, args, dest, plan_extra)
+    if why == _RESUME_NOTHING:
+        raise _PlanRefused(f"Nothing to resume: the plan of {started:%Y-%m-%d %H:%M} was "
+                           f"finished ({meta.get('resume_done_at') or 'by a later run'}). "
+                           f"Nothing was changed. A run without --resume looks for new and "
+                           f"changed files.")
+    if why:
+        raise _PlanRefused(f"--resume refused: {why}. Nothing was changed. Run the backup "
+                           f"without --resume: it reads the sources again and saves a new plan.")
+    saved_dest = header.get("dest")
+    if (isinstance(saved_dest, str)
+            and os.path.normcase(saved_dest) != os.path.normcase(os.path.abspath(dest))):
+        log.log(f"RESUME the plan was saved for {saved_dest}; the backup is now at {dest} "
+                f"(the same backup ID)")
+    checking = time.monotonic()
+    kept, left = _resume_source_check(open_files, log,
+                                      [source for source, _base in header["sources"]])
+    sources_at = time.monotonic()
+    all_keys = ({item.rel.casefold() for item in open_files}
+                | {rel.casefold() for rel in closed_rels})
+    # what the run that planned could not read is still not backed up: said
+    # again, counted in the summary, exit 1 as that run (M1 of the review)
+    errors = list(header["errors"])
+    if errors:
+        more = header["plan_errors"] - len(errors)
+        log.log(f"RESUME the run that saved this plan could not read "
+                f"{_num(header['plan_errors'])} folders/files: they are NOT backed up until "
+                f"a full run reads them (its log: {header.get('log')})"
+                + (f"; the first {_num(len(errors))} below, and {_num(more)} more in its log"
+                   if more else ""))
+    plan = Plan(files=kept, stats=Stats(), unexported_folders=[], unmatched=[], errors=errors,
+                warnings=[], sources=[tuple(pair) for pair in header["sources"]],
+                errors_not_listed=header["plan_errors"] - len(errors))
+    log.log(f"RESUME the plan {header['plan_id']} of {header['started']} ({path}): "
+            f"{_num(header['files'])} files, {_num(header['open'])} left to do; read in "
+            f"{read_at - began:.1f} s, catalog {catalog_at - read_at:.1f} s, sources "
+            f"{sources_at - checking:.1f} s ({_num(len(left))} left for the next full run)")
+    return _Resume(header=header, path=path, sha256=sha256, plan=plan, all_keys=all_keys,
+                   left=left, started=started, open_count=len(open_files),
+                   open_bytes=sum(item.size for item in open_files))
+
+
+def _resume_source_check(files, log, sources=None):
+    """(kept, left): each open file of a saved plan whose source still has the
+    plan's size and date -- from one listing of its folder (the planner's own
+    evidence), `os.lstat` on a miss -- and the others, with why (changed, gone,
+    unreadable, a link now, its folder gone or behind a link now): left for the
+    next full run. `sources`: the plan's source folders; a folder between one
+    and the file that is a link or a junction now is not read through (the
+    planner never follows one; N5 of the review). Never opens a source file,
+    never writes."""
+    kept, left = [], []
+    by_folder = collections.defaultdict(list)
+    for planned in files:
+        by_folder[os.path.dirname(planned.src)].append(planned)
+    links = {}                          # folded folder -> "absent" | "link" | "folder"
+    for folder, these in by_folder.items():
+        link = _source_folder_link(folder, sources or [], links)
+        listed = None if link else _list_dest_folder(folder)
+        for planned in these:
+            why = None
+            if link:
+                why = f"behind a link or junction now ({link})"
+            elif listed is None:
+                why = "its folder is gone from the source"
+            else:
+                hit = listed.get(os.path.basename(planned.src))
+                if hit is None:
+                    try:
+                        stat = os.lstat(_io(planned.src))
+                    except FileNotFoundError:
+                        why = "gone from the source"
+                    except OSError as exc:
+                        why = f"cannot be read ({exc.strerror or exc})"
+                    else:
+                        if (getattr(stat, "st_file_attributes", 0) & _REPARSE_POINT
+                                or stat_module.S_ISLNK(stat.st_mode)):
+                            why = "a link or junction now"
+                        elif not stat_module.S_ISREG(stat.st_mode):
+                            why = "not a file now"
+                        else:
+                            hit = (stat.st_size, stat.st_mtime_ns)
+                if why is None and hit != (planned.size, planned.mtime_ns):
+                    why = "changed since the plan"
+            if why is None:
+                kept.append(planned)
+            else:
+                left.append((planned, why))
+                log.log(f"RESUME LEFT {planned.rel}: {why}")
+    return kept, left
+
+
+def _source_folder_link(folder, sources, cache):
+    """The folder between the deepest of `sources` that holds `folder` and
+    `folder` itself (both included below the source) that is a link, a junction
+    or another reparse point now, or None. The source as typed is followed, as
+    the planner does. One lstat per folder (`cache`)."""
+    roots = [root for root in sources if _is_under(folder, root)]
+    if not roots:
+        return None
+    root = os.path.abspath(max(roots, key=lambda root: len(os.path.abspath(root))))
+    rel = os.path.relpath(os.path.abspath(folder), root)
+    if rel == os.curdir:
+        return None
+    return _dest_link(root, rel, cache)
+
+
+def _resume_bound(catalog, resume):
+    """Why the catalog (open to write) no longer binds the plan this resume
+    checked -- another run in between --, or None."""
+    plan_id = resume.header["plan_id"]
+    if (catalog.meta("resume_plan") != plan_id
+            or catalog.meta("resume_plan_sha256") != resume.sha256
+            or catalog.meta("resume_done") == plan_id):
+        return "the backup's catalog changed since the plan was checked (another run of this backup?)"
+    return None
+
+
+def _mark_plan_done(catalog, log, plan_id=None):
+    """A run that finished its copy: the plan it saved or resumed (`plan_id`)
+    is used (a --resume of it says there is nothing to resume). True when this
+    run marked it. Only that plan, and only while the catalog still records it:
+    a run of another scope, or one that saved no plan, knows nothing of what
+    another run's plan left (S1 of the review: it said "finished" of a plan
+    whose TIFF were never made). A plan left pending costs a resume that finds
+    little to do; every file is proven again there."""
+    pending = catalog.meta("resume_plan")
+    if plan_id and pending == plan_id and catalog.meta("resume_done") != pending:
+        with _ctrl_c_after():
+            catalog.set_meta("resume_done", pending)
+            catalog.set_meta("resume_done_at", datetime.now().isoformat(timespec="seconds"))
+            catalog.commit()
+        log.log(f"RESUME PLAN {pending} done: a --resume of it says there is nothing to resume")
+        return True
+    return False
+
+
+def _resume_summary(resume):
+    """(head, block) of the summary of a resume: the line instead of the
+    sessions' and the block instead of "Not copied"."""
+    head = (f"Resume:       the plan of {resume.started:%Y-%m-%d %H:%M} "
+            f"({_num(resume.open_count)} files it left to do); the sources were not listed again")
+    block = ["", _summary_header("From the saved plan"),
+             _summary_row("left to do when it was saved", resume.open_count, resume.open_bytes),
+             _summary_row("left for the next full run: changed or gone since", len(resume.left),
+                          sum(planned.size for planned, _why in resume.left),
+                          "RESUME LEFT in the log" if resume.left else "")]
+    if resume.header["plan_errors"]:
+        block.append(_summary_row("read errors when it was planned (NOT backed up)",
+                                  resume.header["plan_errors"], None, "see Errors below"))
+    block += ["  A full run (without --resume) is still needed for new files, orphans, moves",
+              "  and what is set aside past its days."]
+    return head, block
+
+
+def _resume_hint(kind):
+    return ("To go on later without reading the sources again: the same command with --resume"
+            + (" (menu: [7] Manifest -> [4] Continue the last backup)"
+               if kind == "manifest_backup" else "") + ".")
+
+
+def _run_backup(args, log, stamp, plan_fn=None, mirror=None, plan_extra=None):
     """Plan, summarise, check the space, ask, then copy. `mirror` (a
     mirror_backup.MirrorJob) makes it a mirror: the job reviews what would
     leave the backup, prints its own block after the summary, may free space
     after a typed confirmation, confirms, removes before the copy and decides
-    the old copy of each changed file. None = a normal backup, unchanged."""
+    the old copy of each changed file. None = a normal backup, unchanged.
+
+    `args.resume` (rc10): the plan the last real run saved (`_resume_load`)
+    instead of `plan_fn`; what needs a fresh listing or deletes is not done
+    (see the resume section). A normal real run saves its plan before the copy
+    (`_save_plan`); a run that finishes its copy marks the plan it saved or
+    resumed used (`_mark_plan_done`; never another run's, never the mirror).
+    `plan_extra`: what the caller adds to the plan's
+    identity (manifest_backup: its kind, the manifest's and modes' SHA-256, its
+    settings)."""
     _STOPPING.clear()                   # a run starts with no Ctrl+C pressed
     dest = os.path.abspath(args.dest)
+    run_started = datetime.now()
+    timing_started = time.monotonic()
+    resuming = bool(getattr(args, "resume", False))
+    kind = _plan_kind(plan_extra)
+    if resuming and mirror is not None:
+        message = ("--resume: the mirror never resumes (it removes files only after a review "
+                   "of a fresh listing). Nothing was changed.")
+        print(message, file=sys.stderr)
+        log.log(f"ERROR {message}")
+        return 2
     if args.expect_backup_id:
         found = read_backup_id(dest)
         if found != args.expect_backup_id:
@@ -6916,7 +7682,18 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                   file=sys.stderr)
             log.log("ERROR expected backup ID does not match")
             return 2
-    planned = (plan_fn or plan)(args)
+    resume = None
+    if resuming:
+        try:
+            resume = _resume_load(args, dest, plan_extra, log)
+        except _PlanRefused as exc:
+            print(str(exc), file=sys.stderr)
+            log.log(f"ERROR {exc}")
+            return 2
+        planned = resume.plan
+    else:
+        planned = (plan_fn or plan)(args)
+    planned_at = time.monotonic()
     for error in planned.errors:
         log.log(error)
     for warning in planned.warnings:
@@ -6964,6 +7741,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             return 2
         finally:
             read_only_catalog.close()
+    catalog_at = time.monotonic()
     # the state of every planned file (a TIFF kept as JXL: from its group, which
     # only the catalog knows -- so the catalog is read first)
     listings = {} if mirror is not None else None
@@ -6972,8 +7750,9 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     statuses = _file_statuses(planned.files, dest, listings, groups, rows_by_key)
     # the manifest is the state: a plain copy planned for a file whose JXL group
     # is in the catalog takes that group away once it is in place (261126)
-    statuses = _undo_groups(statuses, groups, rows_by_key, log)
-    if mirror is None:
+    statuses = _undo_groups(statuses, groups, rows_by_key, log,
+                            planned_keys=resume.all_keys if resume is not None else None)
+    if mirror is None and resume is None:
         # rc9: such a plain TIFF copy comes back from originals\ by a rename when
         # the TIFF kept there is the source as it is now (the mirror copies)
         statuses = _put_back_planned(statuses, groups, originals, dest, log)
@@ -7009,6 +7788,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     adopt_report = {}
     if getattr(args, "adopt_by_hash", False):
         statuses = _adopt_by_hash(statuses, set(rows_by_key), dest, log, adopt_report)
+    status_at = time.monotonic()
     to_copy = [status for status in statuses if _will_copy(status, args)]
     needed =sum(status.planned.size for status in to_copy)
     dest_error = None
@@ -7042,6 +7822,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                          "take that link or junction out of the backup (the backup never "
                          "writes one), then run the mirror again")
         return 2
+    links_at = time.monotonic()
     # what the backup holds set aside, for how long (261126, keep-days): the
     # stores this run owns (it deletes in them by age, or when space is short)
     # and the others it only shows -- the same disk
@@ -7052,7 +7833,9 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     log.log(f"SET ASIDE: the folders listed in {time.monotonic() - listing_started:.1f} s "
             f"({_num(sum(run.files for scan in scans for run in scan.runs))} files)")
     owned_scans = [scan for scan in scans if scan.owned]
-    expired = [(scan, run) for scan in owned_scans for run in _expired_runs(scan)]
+    # a resume never deletes what is set aside: nothing expires in it (rc10)
+    expired = ([] if resume is not None
+               else [(scan, run) for scan in owned_scans for run in _expired_runs(scan)])
     at_once = {}
     zero_runs = []              # (scan, run) already kept in a store of 0 days: typed (SF1)
     if mirror is None:
@@ -7064,15 +7847,19 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             to_copy = [status for status in statuses if _will_copy(status, args)]
             needed = sum(status.planned.size for status in to_copy)
         counts = _set_aside_counts(statuses, args)
-        at_once = {scan.store.kind: counts[scan.store.kind] for scan in owned_scans
-                   if scan.store.days == 0 and counts.get(scan.store.kind)}
-        zero_runs = [(scan, run) for scan in owned_scans
-                     for run in _zero_day_runs(scan, [run for scan_, run in expired
-                                                      if scan_ is scan])]
+        # a resume: what leaves goes to its store even with 0 days (the next full
+        # run deletes it after the typed number), and nothing kept there is deleted
+        at_once = ({} if resume is not None else
+                   {scan.store.kind: counts[scan.store.kind] for scan in owned_scans
+                    if scan.store.days == 0 and counts.get(scan.store.kind)})
+        zero_runs = ([] if resume is not None else
+                     [(scan, run) for scan in owned_scans
+                      for run in _zero_day_runs(scan, [run for scan_, run in expired
+                                                       if scan_ is scan])])
         # a normal backup frees what expires in this run before it copies
         freed_by_age = sum(run.nbytes for _scan, run in expired)
         fits = dest_error is None and (needed == 0 or needed <= free + freed_by_age - margin)
-    if rows and args.detect_moves:
+    if rows and args.detect_moves and resume is None:
         candidates = _find_move_candidates(statuses, rows, dest, planned.sources)
     prefixes = _source_prefixes(planned)
     tentative_used = set()
@@ -7085,7 +7872,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     orphan_states = {}
     tentative_orphans = (_find_orphans(rows, statuses, prefixes, tentative_used, planned.sources,
                                        orphan_states)
-                         if rows else [])
+                         if rows and resume is None else [])
     extra_lines = []
     lists = [(os.path.basename(log_paths["plan"]), "every planned file and what happens to it")]
     possible = [status for status, _matches in candidates.values()]
@@ -7209,7 +7996,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     unreadable = [row for reason, row in tentative_orphans if reason == "source_unreadable"]
     elsewhere = [row for reason, row in tentative_orphans if reason == "other_source"]
     orphan_lines = []
-    if rows:
+    if rows and resume is None:
         orphan_lines.append(_summary_row("source gone", len(gone), sum(row.size for row in gone)))
         orphan_lines.append(_summary_row("no longer selected", len(unselected),
                                          sum(row.size for row in unselected)))
@@ -7252,9 +8039,24 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             orphan_lines.append(
                 f"  --move-orphans: {_num(len(gone))} files would be moved to "
                 f"{os.path.join(dest, CATALOG_FOLDER, ORPHANS_FOLDER, stamp)}")
+    left_csv = None
+    if resume is not None and resume.left:
+        left_csv = log.csv("_resume_left.csv", ["why", "size", "mtime", "src", "rel"],
+                           [(why, item.size, _csv_date(item.mtime_ns), item.src, item.rel)
+                            for item, why in resume.left])
+        lists.insert(len(lists) - 1, (os.path.basename(left_csv),
+                                      "the files left for the next full run (changed or gone "
+                                      "since the plan)"))
+    log.log(f"TIMING before the copy: "
+            f"{'the saved plan and its sources checked' if resume is not None else 'the plan (the sources listed)'} "
+            f"{planned_at - timing_started:.0f} s, the catalog read {catalog_at - planned_at:.0f} s, "
+            f"the backup's state {status_at - catalog_at:.0f} s, the link check "
+            f"{links_at - status_at:.0f} s, the rest {time.monotonic() - links_at:.0f} s")
     for line in _summary_lines(args, planned, statuses, needed, free, margin, fits, log_paths,
                                dest_error, extra_lines, freed, catalog_note, orphan_lines,
-                               lists, space_block, replace_label):
+                               lists, space_block, replace_label,
+                               resume_text=_resume_summary(resume) if resume is not None
+                               else None):
         log.out(line)
     # the mirror's own block comes last: it is what is on the screen when the
     # question is asked
@@ -7274,13 +8076,14 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     if len(listed) != len(statuses):
         log.log(f"_plan.csv: {_num(len(statuses) - len(listed))} UP_TO_DATE files not listed "
                 f"(PLAN_CSV_UP_TO_DATE; a --dry-run lists every file)")
-    log.csv("_unexported.csv", ["folder", "files", "bytes", "c1_bytes", "nx_bytes", "copied"],
-            [(folder.path, folder.files, folder.nbytes, folder.c1_nbytes, folder.nx_nbytes,
-              "yes" if folder.copied else "no")
-             for folder in planned.unexported_folders])
-    log.csv("_unmatched.csv", ["session", "export_file"],
-            [(session, path) for session, path in planned.unmatched])
-    log.csv("_inside.csv", ["session", "subfolder", "files", "bytes"], planned.inside)
+    if resume is None:                  # a resume did not list: it knows none of these
+        log.csv("_unexported.csv", ["folder", "files", "bytes", "c1_bytes", "nx_bytes", "copied"],
+                [(folder.path, folder.files, folder.nbytes, folder.c1_nbytes, folder.nx_nbytes,
+                  "yes" if folder.copied else "no")
+                 for folder in planned.unexported_folders])
+        log.csv("_unmatched.csv", ["session", "export_file"],
+                [(session, path) for session, path in planned.unmatched])
+        log.csv("_inside.csv", ["session", "subfolder", "files", "bytes"], planned.inside)
     cumulative = 0
     by_folder_csv = []
     for folder, count, nbytes in folder_rows:
@@ -7288,8 +8091,9 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
         by_folder_csv.append((folder, count, nbytes, cumulative))
     log.csv("_by_folder.csv", ["folder", "files", "bytes", "cumulative_bytes"],
             by_folder_csv)
-    log.csv("_orphans.csv", ["reason", "rel", "size", "source_path", "copied_at"],
-            _orphan_csv_rows(tentative_orphans))
+    if resume is None:
+        log.csv("_orphans.csv", ["reason", "rel", "size", "source_path", "copied_at"],
+                _orphan_csv_rows(tentative_orphans))
     for status in statuses:
         if status.status == ST_CHANGED and not _will_copy(status, args):
             log.log(f"SKIP CHANGED {status.planned.rel}")
@@ -7319,7 +8123,7 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
         # deleted for good only by a person who chose it and typed the number
         missing = needed - (free + freed - margin)
         drive = os.path.splitdrive(dest)[0] or dest
-        options = _room_options(owned_scans, missing)
+        options = [] if resume is not None else _room_options(owned_scans, missing)
         for line in _room_lines(options, missing, free + freed, drive,
                                 "the mirror" if mirror is not None else "the backup"):
             log.out(line)
@@ -7340,7 +8144,12 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
         held = "; ".join(f"{_room_label(scan)} {_gb(sum(run.nbytes for run in scan.runs))}"
                          for scan in owned_scans if scan.runs)
         why = todo = None
-        if not options:
+        if not options and resume is not None:
+            why = (f"there is not enough space on {drive} ({_gb(missing)} missing), and a resume "
+                   f"never deletes what is set aside")
+            todo = ("run the backup without --resume (it can delete what is set aside past its "
+                    "days, or what you choose), or make room on " + drive)
+        elif not options:
             why = (f"there is not enough space on {drive} ({_gb(missing)} missing), and nothing "
                    f"set aside in the backup can make room")
             todo = f"make room on {drive} or choose a smaller mode"
@@ -7398,6 +8207,8 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             written.append(ORPHANS_FOLDER)
         if KEEP_TOOLS_IN_BACKUP:
             written.append(TOOLS_FOLDER)
+        if SAVE_RESUME_PLAN and resume is None:
+            written.append(RESUME_FILE)
         store_stop = next((problem for problem in (_store_problem(dest, folder)
                                                    for folder in written) if problem), None)
     # 0 days: what this run sets aside (at most: at_once) and what is already
@@ -7437,7 +8248,9 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
         log.log("dry run: nothing copied")
         return read_errors
     if store_stop:
-        message = f"{store_stop}. Make it a plain folder again (or move it away), then run again."
+        # the plan file is a file, the stores are folders (N2 of the review)
+        what = ("file" if store_stop.startswith(_plan_path(dest) + " ") else "folder")
+        message = f"{store_stop}. Make it a plain {what} again (or move it away), then run again."
         print(message, file=sys.stderr)
         log.log(f"ERROR {message}")
         return 2
@@ -7492,6 +8305,8 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     done = done_bytes = error_count = 0
     moved = moved_bytes = move_errors = 0
     interrupted = False
+    plan_id = None                      # the plan this run saved for --resume (rc10)
+    plan_finished = False               # ... and whether this run used one up
     stop_info = {}
     mirror_problems = False
     convert_info = {}
@@ -7504,6 +8319,18 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
     # did not free enough (MF2 of the review 261126)
     fit_counted_on_deleting = bool(room_runs) or (needed > 0 and needed > free - margin)
     try:
+        if resume is not None:
+            # the plan is still the catalog's, asked on the connection that writes
+            # (another run of this backup between the check and now = stop)
+            changed = _resume_bound(catalog, resume)
+            if changed:
+                # the catalog was opened to write (a journal rolled back, the
+                # writer recorded): nothing was copied, moved or deleted (N3)
+                message = (f"--resume refused: {changed}. Nothing was copied. Run the backup "
+                           f"without --resume: it reads the sources again and saves a new plan.")
+                print(message, file=sys.stderr)
+                log.log(f"ERROR {message}")
+                return 2
         if mirror is None and (expired or room_runs):
             # 261126: the run folders of versions\ and originals\ past their
             # days, and what a person chose to delete to make room -- right
@@ -7563,10 +8390,13 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             return 130
         # --move-orphans and the mirror ask every source again, right now
         fresh = args.move_orphans or mirror is not None
-        orphans = _find_orphans(catalog.all_rows(), statuses, prefixes, set(), planned.sources,
-                                None if fresh else orphan_states)
-        log.csv("_orphans.csv", ["reason", "rel", "size", "source_path", "copied_at"],
-                _orphan_csv_rows(orphans))
+        if resume is None:
+            orphans = _find_orphans(catalog.all_rows(), statuses, prefixes, set(),
+                                    planned.sources, None if fresh else orphan_states)
+            log.csv("_orphans.csv", ["reason", "rel", "size", "source_path", "copied_at"],
+                    _orphan_csv_rows(orphans))
+        else:
+            orphans = []                # a resume does not look for orphans (a full run does)
         if mirror is not None:
             mirror.remove(dest, stamp, catalog, orphans, log)
             if mirror.interrupted:
@@ -7597,6 +8427,17 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                 else:
                     mirror._stop(why, todo)
                 return 2
+        if mirror is None and resume is None and SAVE_RESUME_PLAN:
+            # the statuses are final and the backup ID exists: what this run
+            # leaves to do, for a --resume after a stop (rc10)
+            try:
+                plan_id = _save_plan(dest, catalog, statuses, planned, args, plan_extra,
+                                     run_started, log)
+            except KeyboardInterrupt:
+                _say_stopping(log)
+                log.log("INTERRUPTED while saving the plan for --resume")
+                interrupted = True
+                return 130
         if mirror is not None:
             old_copy, keep_old_file = mirror.old_copy, mirror.keep_old_file
         else:
@@ -7604,11 +8445,17 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             keep_old_file = keeper
         done, done_bytes, error_count, interrupted = _copy_all(
             args, statuses, dest, stamp, catalog, log, stop_info, old_copy, keep_old_file,
-            convert_info)
-        if not interrupted and not planned.errors and not stop_info and not_converted:
+            convert_info, planned_keys=resume.all_keys if resume is not None else None)
+        if (not interrupted and not planned.errors and not stop_info and not_converted
+                and resume is None):
             # rc9 (N7 of the rc6 review): the conversion failures of a file that is
             # not planned and whose source is proven gone are forgotten
             _forget_gone_not_converted(not_converted, statuses, rows_by_key, catalog, log)
+        own_plan = resume.header["plan_id"] if resume is not None else plan_id
+        if not interrupted and not stop_info and own_plan:
+            # the copy finished: the plan this run saved or went on with is
+            # used up -- never another run's (S1 of the review)
+            plan_finished = _mark_plan_done(catalog, log, own_plan)
         log.log(f"moved {moved} files / {_gb(moved_bytes)}")
         log.out(f"copied {done} files / {_gb(done_bytes)}; {error_count} errors")
         if any(convert_info.get(name) for name in ("converted", "failed", "retired")):
@@ -7665,6 +8512,14 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
             log.out(f"Conversion off: {_num(convert_info['as_is'])} TIFF/JPEG kept as they are "
                     f"({_gb(convert_info['bytes_as_is'])} copied); a run without --no-convert "
                     f"converts them")
+        if resume is not None:
+            if resume.left:
+                log.out(f"Left for the next full run: {_num(len(resume.left))} files changed or "
+                        f"gone since the plan (RESUME LEFT in the log, "
+                        f"{os.path.basename(left_csv)})")
+            if plan_finished:
+                log.out(f"Resume: the plan of {resume.started:%Y-%m-%d %H:%M} is done. A full "
+                        f"run (without --resume) looks for new files, orphans and moves.")
         if error_count or move_errors:
             log.out(f"ERRORS: {_num(error_count + move_errors)} files were NOT copied -> {log.path}")
         if stop_info:
@@ -7678,6 +8533,8 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
                 log.out(f"CATALOG: {_num(stop_info['unrecorded'])} copied files have no row "
                         f"in the catalog (it could not be written); they keep their final "
                         f"names and the next run adopts them by their size and date")
+            if plan_id or resume is not None:
+                log.out(_resume_hint(kind))
         if mirror is not None:
             mirror.convert_info = convert_info
             # every error that makes the exit 1 is in its box (review 261126, S5)
@@ -7711,6 +8568,9 @@ def _run_backup(args, log, stamp, plan_fn=None, mirror=None):
         if interrupted or (mirror is not None and getattr(mirror, "interrupted", False)):
             # only now, with the catalog closed: the disk may go (v0.14.0-rc5)
             log.log("STOPPED by Ctrl+C")
+            if plan_id or resume is not None:
+                # before it: "the disk can be removed" stays the last line (S3)
+                _tell(_resume_hint(kind))
             _tell(STOPPED_SAYING)
     return 1 if (error_count or move_errors or adopt_errors or planned.errors or stop_info
                  or mirror_problems or convert_info.get("failed")
@@ -8380,6 +9240,12 @@ def _build_parser():
                         help="with --dest only: what the backup holds set aside (old versions, "
                              "TIFF originals, the mirror's trash), when each is deleted and what "
                              "deleting it would free; reads only the destination")
+    parser.add_argument("--resume", action="store_true",
+                        help="go on with the plan the last real run of this backup saved "
+                             "(RESUME_FILE), without listing the sources again: only the copies "
+                             "and conversions it left, each file checked first. The other options "
+                             "must be the plan's; no orphans, moves or deletions (a full run does "
+                             "them); refused, exit 2, when the plan does not match")
     parser.add_argument("--dry-run", action="store_true",
                         help="plan and log, copy nothing")
     parser.add_argument("--verify", choices=("quick", "full"), default=None,
@@ -8401,7 +9267,7 @@ def main(argv=None):
         args = parser.parse_args(argv)
         if args.reconvert_older and args.no_convert:
             parser.error("--reconvert-older cannot be combined with --no-convert")
-        if args.space_report and (args.source or args.verify or args.dry_run):
+        if args.space_report and (args.source or args.verify or args.dry_run or args.resume):
             parser.error("--space-report takes only --dest (it reads the destination, nothing "
                          "else)")
         if not args.space_report and not args.source:

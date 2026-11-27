@@ -220,7 +220,9 @@ def test_n5_the_plan_names_a_file_not_converted_again_as_it_is(env, monkeypatch,
 
 def test_p0_the_log_says_where_the_conversion_time_went(env, photobackup_log_dir):
     assert backup(env, "--tiff", "jxl") == 0
-    line = [line for line in latest_log(photobackup_log_dir).splitlines() if "TIMING" in line]
+    # rc10 added a "TIMING before the copy:" line: only the conversions' one here
+    line = [line for line in latest_log(photobackup_log_dir).splitlines()
+            if "TIMING conversions" in line]
     assert len(line) == 1
     for part in ("TIMING conversions: 3 files", "the writer: waiting for a conversion",
                  "putting the JXL in place", "the workers (sum): reading the sources",

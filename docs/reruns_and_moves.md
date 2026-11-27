@@ -35,6 +35,72 @@ copy and remembers the size, mtime and sha256 of every copied file — the size
 and mtime the source had at the moment it was copied (a file saved by your
 editor while the backup runs is recorded as copied, not as planned).
 
+## Pause and resume a long run
+
+*(v0.14.0-rc10)* A long run can be stopped and continued later without reading
+the sources again.
+
+- **Pause**: Ctrl+C, as always (a safe point in seconds). A closed window,
+  `taskkill /F` or a power cut also leave a run that can be continued.
+- **Go on**: the same command with `--resume`:
+
+  ```console
+  python manifest_backup.py --manifest backup_manifest.csv --dest "H:\BACKUP" --resume
+  ```
+
+  The same for `selective_backup.py`; in the menu, `[7] Manifest` →
+  `[4] Continue the last backup`. The sources are not listed again (on a
+  426,000-file manifest: 7 min 40 s saved).
+- **What is saved**: every real run with something to copy or convert saves its
+  plan, right before copying, in `_photo_backup\resume_plan.jsonl.gz`
+  (`RESUME_FILE`; `SAVE_RESUME_PLAN = False` turns it off; about 5-10 MB for
+  426,000 files, estimated from a synthetic plan): the options, the settings, the
+  fingerprint of the manifest and of the modes table, the backup ID, the version,
+  what the run could not read, and per file what was planned with the source's
+  size and date. The catalog records which plan is the last one. The run that
+  saved it, or a resume of it, marks it used when its copy finishes; any other
+  run (another scope, the mirror) leaves it as it is.
+- **What a resume does**: only the copies and conversions that plan left. Each
+  file's source is checked first: the same size and date as planned, else it is
+  left for the next full run (`RESUME LEFT` in the log, `_resume_left.csv`; not an
+  error); a source folder that became a link or a junction since is not read
+  through. What is done is read from the backup and its catalog, never from the
+  saved plan. Everything else works as in a normal run: old copies to `versions\`,
+  the JXL proofs, the space check, the question. Folders or files the run that
+  saved the plan could not read are said again (`Errors:` in the summary, exit 1,
+  as that run): they are not backed up until a full run reads them.
+- **What it never does**: list the sources, look for new files, orphans or moves,
+  put a TIFF back from `originals\`, adopt by hash, delete anything set aside
+  (run folders past their days, room on demand, `0` days: what leaves goes to its
+  folder, and the next full run deletes it). A full run is still needed for those.
+  The mirror never resumes, and leaves the plan as it is.
+
+**When it refuses** (exit 2, nothing changed; the message says why). What to do,
+every time: run without `--resume` (it reads the sources again and saves a new
+plan).
+
+| reason | |
+|---|---|
+| no saved plan | a run before rc10, `SAVE_RESUME_PLAN = False`, or a run that left nothing to do |
+| nothing to resume | the plan was finished (by the run that saved it, or a resume of it) |
+| not the plan the catalog recorded last, or damaged | a later run saved another; the file was changed, cut or copied here |
+| another backup | the backup ID is not the plan's |
+| another version | the plan was made by another version of photo-backup |
+| too old | older than `RESUME_MAX_DAYS` days (default 7; `0` = no resume at all) |
+| made by the other script | resume a manifest run with `manifest_backup.py`, a plain one with `selective_backup.py` |
+| another manifest or modes table | their bytes changed since the plan |
+| other options | each one named. The options that change the plan must be the same; `--jxlphoto`, `--work-dir`, `--verify-copy`, `--space-margin-gb`, the keep-days and `--yes` may differ |
+| other settings | each one named. How fast and where (`JXL_WORKERS`, `JXL_TIFF_WORKERS`, `JXL_WORK_DIR`, ...) may differ: pause, give the computer back with fewer workers, go on |
+| made with `--adopt-by-hash` | such a run is not resumed |
+| with `--move-orphans`, `--verify` or `--analyze` | a resume does none of them |
+
+**After a hard stop.** During the conversions the catalog is written after a JXL
+is put in place once `CONVERT_COMMIT_S` seconds (2) passed since the last write: a
+JXL put in place in those last seconds may have no row; the next run (full or
+resume) sets it aside in `versions\` and makes it again *(rc10; it was every 50
+files: 45 TIFF were made again on 27/11)*. A single conversion that takes longer
+has no write in between, and nothing to lose.
+
 ## What the backup sets aside, and for how long
 
 What leaves the backup's tree is one of three kinds. Each has a folder per run
